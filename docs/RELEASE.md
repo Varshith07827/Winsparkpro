@@ -206,7 +206,7 @@ Three cases prove the census logic rather than mere presence:
 | **Reliability** | | |
 | No duplicate messages | ✅ | Proven across all four crash points, both stores |
 | No lost messages | ✅ | Durable queue; `test_nothing_is_lost_across_a_restart` |
-| Retry policy | ✅ | Transport retried; verification failures deliberately not |
+| Retry policy | ⚠️ | Holds for queued sends; **the Send API path has no retry at all** — see §11 |
 | Per-chat ordering | ✅ | Sequence assigned at enqueue |
 | **Recovery** | | |
 | Crash before/during/after send | ✅ | Four enumerated scenarios, both stores |
@@ -224,9 +224,10 @@ Three cases prove the census logic rather than mere presence:
 | Unit + integration | ✅ | 297 tests |
 | Real MongoDB | ✅ | Storage suites run against both stores |
 | Real WhatsApp reads | ✅ | Live probes and benchmarks |
-| **Real WhatsApp send end-to-end** | ❌ | **Never exercised through the new queue → send → verify path** |
+| **Real WhatsApp send end-to-end** | ❌ | **Exercised 2026-08-07 and it FAILED — see §11.** ~141 attempts, 13 delivered |
 | **Documentation** | ✅ | Ten documents; see the README index |
 | **Deployment** | ⚠️ | No installer or packaging; run from source |
+| **Send API path** | ❌ | Bypasses the durable queue and the verifier entirely — §11 |
 | **Monitoring** | ✅ | Operations card, 19 metrics, session health |
 | **Observability** | ✅ | Correlation IDs, structured logs, `trace()`, all 13 metrics wired |
 
@@ -290,14 +291,79 @@ could ever be done about it.
 
 ## 10. Recommendation
 
-**Ready for supervised production use** on a dedicated machine, console
-session, with an operator watching the Operations card for the first days.
-
-**Not yet ready for unattended deployment.** Two gaps stand between here and
-that: the real-WhatsApp end-to-end send has not been exercised through the new
-pipeline, and 24-hour stability is unmeasured. Both are hours of work, not
-weeks — but neither should be assumed.
+**Not ready for production.** Superseded by §11: the first real end-to-end
+send test delivered 13 of ~141 messages. An earlier draft of this document
+recommended supervised production use; that recommendation was written before
+the send path had ever been exercised against a real chat, and it was wrong.
 
 If genuinely unattended, invisible operation is a hard requirement, the desktop
 path cannot deliver it and the WhatsApp Business Platform is the correct
 architecture — see [SENDING.md](SENDING.md), Option D.
+
+---
+
+## 11. End-to-end send failure (2026-08-07)
+
+The first real exercise of the send path. ~141 messages posted to the Send API
+for one chat; **13 arrived**. Recorded here in full because §10 previously
+called the system ready on the strength of tests that never touched this path.
+
+### Defect 1 — the Send API bypasses the queue and the verifier
+
+`DeliveryService.enqueue` is called from exactly two places, `pipeline.py:170`
+(webhook replies) and `relay.py:142`. The Send API path — `api/host.py:97` →
+`Engine.send_message` (`engine.py:862`) — calls `self._sender.send_async`
+**directly**. Consequences, all observed:
+
+* `data/outgoing.json` stayed `[]` through 141 sends; no `outgoing.*` event was
+  ever logged. The durable queue was not involved.
+* No verification ran. `api.send` is logged on *transport* success — the compose
+  box emptying — which is not proof the message appeared in the conversation.
+* No retry. A failure returns 500 to the caller and the message is gone.
+* No `UNVERIFIED` state, no per-chat ordering, no crash recovery on this path.
+
+The docstring on `Engine.send_message` claims the opposite: *"the same sender,
+the same action lock and the same verification as an automated reply."* The
+action lock is real; the verification is not. **The docstring is wrong and the
+hardening sprint's guarantees do not apply to API sends.**
+
+### Defect 2 — the compose fill is intermittently lost
+
+Reproduced away from the API, filling and clearing the box in a loop with no
+Enter pressed: **8/12, 9/15, 7/15, 5/14, 8/14 filled**. Roughly half of all
+attempts fail with `paste did not verify`, then fail again on the
+per-character fallback. This is the proximate cause of the send failures.
+
+Root cause **not identified.** Two hypotheses were tested and refuted:
+
+| Hypothesis | Test | Result |
+|---|---|---|
+| Foreground handover per send disturbs input | A/B, same fill path, only the take/restore differing | **Refuted** — 9/15 churn vs 7/15 held |
+| The contenteditable needs a physical click to place the DOM caret | UIA SetFocus vs real click vs SetFocus after a click | **Refuted** — all three pasted correctly |
+
+One hypothesis is **open and unproven**: `set_compose_text_sync` always tries
+rung 1 (`_try_value_pattern`) first, even though the capability probe has
+already recorded `value_pattern_write: false` for this build. Skipping it
+scored 8/14 against 5/14 — directionally better, but a 3-count gap at n=14 is
+not evidence, and ~50% of attempts still failed in the better arm. **The
+majority of the failure is still unexplained.**
+
+### Defect 3 — the capability probe is computed and never used
+
+`data/capabilities.json` records `value_pattern_write: false`, yet
+`sender.py:474` calls `_try_value_pattern` on every send regardless. The probe
+exists to stop exactly this, and nothing consults it.
+
+### Observation — the title hint matches four windows
+
+`find_window_sync("WhatsApp")` resolved correctly here, but four top-level
+windows match: WhatsApp Beta (the target), its WebView2 content host, a Chrome
+window, and **wadam's own Qt window**. Matching on title alone is fragile;
+the target should be pinned by process and window class.
+
+### Operational note
+
+A `for /L` loop of 100 curl requests kept running after the operator pressed
+`^C` and had to be killed by PID. Each iteration takes ~10 s because the sender
+waits for an idle desktop, so a cancelled burst keeps sending for minutes. The
+API should expose a way to cancel queued work for a chat.
