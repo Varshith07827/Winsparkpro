@@ -280,6 +280,68 @@ class StoredMessage:
         return _build(cls, document)
 
 
+class OutgoingStatus:
+    """The life of a queued outgoing message.
+
+    Separate from `MessageStatus` on purpose. That one describes an *incoming*
+    message's journey through the webhook; this describes an *outgoing* one's
+    journey to the screen, and the two failure vocabularies are different —
+    "the endpoint 5xx'd" and "the bubble never appeared" want different
+    responses from an operator."""
+
+    QUEUED = "queued"           # persisted, nothing attempted
+    SENDING = "sending"         # a worker has it; the outcome is unknown
+    VERIFYING = "verifying"     # left the compose box, delivery unconfirmed
+    DELIVERED = "delivered"     # a new outgoing bubble was found in the chat
+    UNVERIFIED = "unverified"   # transport succeeded, delivery unproven
+    FAILED = "failed"           # gave up after the retry policy
+    CANCELLED = "cancelled"     # its chat was deleted underneath it
+
+    #: States a restart must pick back up.
+    RESUMABLE = (QUEUED,)
+    #: In-flight when the process died — ambiguous, needs verifying not resending.
+    AMBIGUOUS = (SENDING, VERIFYING)
+    FINAL = (DELIVERED, UNVERIFIED, FAILED, CANCELLED)
+
+
+@dataclass
+class OutgoingMessage:
+    """One message waiting to reach a chat.
+
+    Persisted before anything is attempted, so the queue survives a crash. The
+    per-chat `sequence` preserves ordering: two replies to the same
+    conversation must arrive in the order they were produced, whatever the
+    worker does in between."""
+
+    outgoing_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    chat_id: str = ""
+    chat_name: str = ""
+    text: str = ""
+    origin: str = ""                 # "webhook_reply" | "api" | "relay"
+    status: str = OutgoingStatus.QUEUED
+    sequence: int = 0                # per chat, ascending
+    attempts: int = 0
+    max_attempts: int = 3
+    error: str = ""
+    verification: str = ""           # Verification.* once attempted
+    external_ref: str = ""           # a relay message id, when there was one
+    source_message_key: str = ""     # the incoming message this answers
+    created_at: datetime = field(default_factory=utcnow)
+    updated_at: datetime = field(default_factory=utcnow)
+    delivered_at: Optional[datetime] = None
+
+    @property
+    def exhausted(self) -> bool:
+        return self.attempts >= self.max_attempts
+
+    def to_document(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_document(cls, document: dict[str, Any]) -> "OutgoingMessage":
+        return _build(cls, document)
+
+
 @dataclass
 class WebhookRecord:
     """One webhook invocation: what was sent, what came back, how many attempts

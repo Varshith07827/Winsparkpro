@@ -111,6 +111,7 @@ class FakeMongo:
         self.chat_configs = FakeCollection()
         self.messages = FakeCollection()
         self.webhooks = FakeCollection()
+        self.outgoing = FakeCollection()
         self.automation_logs = FakeCollection()
         self.application_state = FakeCollection()
         self.poll_state = FakeCollection()

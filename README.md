@@ -80,6 +80,7 @@ can reach (a local `mongod` or an Atlas cluster).
 | [SEND_API.md](docs/SEND_API.md) | The inbound HTTP API for sending messages |
 | [RELAY.md](docs/RELAY.md) | Polling your webhook for outbound messages (winSpark's model) |
 | [SENDING.md](docs/SENDING.md) | Option A in detail; options B, C and D analysed |
+| [OPERATIONS.md](docs/OPERATIONS.md) | Architecture, lifecycles, health, supported environments, deployment |
 | [HEADLESS.md](docs/HEADLESS.md) | Input-simulation audit, what WhatsApp's UIA provider really does, RDP |
 | [LIMITATIONS.md](docs/LIMITATIONS.md) | Known limitations and future enhancements |
 | [MIGRATION.md](docs/MIGRATION.md) | What came from winSpark, what was removed, how to move over |

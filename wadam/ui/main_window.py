@@ -210,14 +210,21 @@ class MainWindow(QMainWindow):
             f"cycle {snapshot.cycle_count} · {snapshot.last_cycle_ms}ms · "
             f"every {constants.POLL_INTERVAL_SECONDS}s"
         )
-        self._status_queue.setText(
-            f"queue {snapshot.queued_jobs}" if snapshot.queued_jobs else "queue empty"
-        )
+        # Two different queues, and conflating them hides the important one:
+        # `queued_jobs` is chats waiting to be read, `queue_depth` is messages
+        # waiting to be delivered.
+        parts = []
+        if snapshot.queued_jobs:
+            parts.append(f"{snapshot.queued_jobs} to read")
+        if snapshot.queue_depth:
+            parts.append(f"{snapshot.queue_depth} to send")
+        self._status_queue.setText(" · ".join(parts) if parts else "queue empty")
         self._refresh_api_status()
         self._set_status(self._status_mongo, f"MongoDB {snapshot.mongo_status}", snapshot.mongo_ok)
         self._set_status(self._status_json, f"JSON {snapshot.json_status}", snapshot.json_ok)
 
         self._config.set_session_health(snapshot.session_rows, snapshot.send_blocked_reason)
+        self._config.set_operations(snapshot.metrics, snapshot.capability_summary)
         self._config.set_storage_status(
             snapshot.mongo_status, snapshot.mongo_ok, snapshot.json_status, snapshot.json_ok
         )

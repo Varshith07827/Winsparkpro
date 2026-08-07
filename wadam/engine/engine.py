@@ -45,21 +45,26 @@ from wadam.domain.models import (
     AutomationLog,
     ChatConfig,
     MessageStatus,
+    OutgoingStatus,
     PollState,
     StoredMessage,
     message_key_for,
     outgoing_key_for,
     utcnow,
 )
+from wadam.engine.delivery import DeliveryService
 from wadam.engine.discovery import ChatDiscovery
 from wadam.engine.pipeline import MessagePipeline
+from wadam.engine.metrics import Metrics, MetricsSnapshot
 from wadam.engine.relay import RelayService
 from wadam.engine.webhook import RelayMessage, WebhookClient, WebhookOutcome
 from wadam.storage.repository import Repository
 from wadam.whatsapp.reader import WhatsAppMessage, WhatsAppReader
+from wadam.whatsapp import capabilities as win_caps
 from wadam.whatsapp import session as win_session
 from wadam.whatsapp.sender import WhatsAppSender
 from wadam.whatsapp.sta_thread import StaAutomationThread
+from wadam.whatsapp.verifier import SendVerifier
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +91,9 @@ class EngineSnapshot:
     # Windows session / desktop / UIA preconditions, refreshed each cycle.
     session_rows: list = field(default_factory=list)   # (label, value, health)
     send_blocked_reason: str = ""
+    metrics: Optional[MetricsSnapshot] = None
+    queue_depth: int = 0
+    capability_summary: str = ""
 
 
 @dataclass(frozen=True)
@@ -124,8 +132,16 @@ class AutomationEngine:
             max_retries=settings.webhook_max_retries,
         )
         self._discovery = ChatDiscovery(repository, settings)
-        self._pipeline = MessagePipeline(repository, self._webhook, self._sender, asyncio.to_thread)
-        self._relay = RelayService(repository, self._webhook, asyncio.to_thread)
+        self.metrics = Metrics()
+        # Verification reads the conversation back; it goes through the same
+        # opener the worker uses so it sees exactly what WhatsApp is showing.
+        self._verifier = SendVerifier(self._read_for_verification)
+        self._delivery = DeliveryService(repository, self._sender, self._verifier,
+                                         asyncio.to_thread, self.metrics)
+        self._pipeline = MessagePipeline(repository, self._webhook, self._sender,
+                                         asyncio.to_thread, self._delivery)
+        self._relay = RelayService(repository, self._webhook, asyncio.to_thread,
+                                   self._delivery)
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._ready = concurrent.futures.Future()
@@ -139,6 +155,13 @@ class AutomationEngine:
         # When each chat's webhook was last GETted, by chat id (monotonic).
         self._relay_polled_at: dict[str, float] = {}
         self._session_state = win_session.probe(settings.whatsapp_window_title)
+        self._capability_summary = "not probed yet"
+        self._capabilities = None
+        self._capability_store = win_caps.CapabilityStore(
+            settings.json_backup_folder / "capabilities.json")
+        # Session changes arrive as events; the polled probe stays as the
+        # authority, this just stops it being up to a cycle out of date.
+        self._session_watcher = win_session.SessionWatcher(self._on_session_change)
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -150,6 +173,7 @@ class AutomationEngine:
         if not self._ready.done():
             self._ready.set_result(True)
 
+        self._session_watcher.start()
         worker = asyncio.create_task(self._worker(), name="wadam-worker")
         # The relay is its own task, not part of the cycle: it is network I/O
         # against someone else's server, and a slow endpoint must not be able to
@@ -196,7 +220,22 @@ class AutomationEngine:
                     await task
                 except (asyncio.CancelledError, Exception):  # noqa: BLE001
                     pass
+            self._session_watcher.stop()
             self._sta.dispose()
+
+    def _on_session_change(self, event_name: str, resumes: bool) -> None:
+        """Called from the watcher's message pump — a different thread.
+
+        Only touches plain attributes and re-probes, both of which are safe
+        off-loop; anything needing the event loop is scheduled onto it."""
+        self._session_state = win_session.probe(self._settings.whatsapp_window_title)
+        self._repo.log("INFO" if resumes else "WARNING", "session.changed",
+                       message=f"Windows session event: {event_name} — sending "
+                               f"{'may resume' if resumes else 'is held'}.")
+        if not resumes:
+            self.metrics.record_session_hold()
+        if self._loop is not None and self._loop.is_running():
+            self._loop.call_soon_threadsafe(self.publish)
 
     def wait_until_ready(self, timeout: float = 10.0) -> bool:
         try:
@@ -264,6 +303,15 @@ class AutomationEngine:
                 )
                 interrupted += 1
 
+        # Outgoing messages that were mid-flight when the process stopped are
+        # verified against the chat, never re-sent blind.
+        for queued in await asyncio.to_thread(
+                self._repo.outgoing_in_state, OutgoingStatus.AMBIGUOUS):
+            try:
+                await self._delivery.resume_ambiguous(queued)
+            except Exception:  # noqa: BLE001
+                logger.exception("Could not resume an in-flight outgoing message")
+
         await asyncio.to_thread(self._repo.flush_json, True)
         self._repo.log("INFO", "recovery.complete",
                        message=f"Restored {resumed} in-flight message(s); "
@@ -280,6 +328,17 @@ class AutomationEngine:
                                message="WhatsApp Desktop is not running — waiting for it.")
                 return
             self._hwnd = hwnd
+            # What this WhatsApp build can actually be driven with. Cached
+            # against the package version, so an update re-probes by itself.
+            try:
+                self._capabilities = await asyncio.to_thread(
+                    self._capability_store.refresh_if_needed, hwnd)
+                self._capability_summary = self._capabilities.summary()
+                self._repo.log("INFO", "capabilities.probed",
+                               message=self._capability_summary)
+            except Exception as ex:  # noqa: BLE001 - never block startup on a probe
+                logger.warning("capability probe failed: %s", ex)
+                self._capability_summary = f"probe failed: {ex}"
             rows = await self._reader.read_chat_rows_deep_async(hwnd)
             result = await asyncio.to_thread(self._discovery.sync, rows)
             self._repo.log("INFO", "startup.scan",
@@ -294,7 +353,12 @@ class AutomationEngine:
     async def _cycle(self) -> None:
         hwnd = self._hwnd
         if hwnd is None or not await self._reader.window_is_alive_async(hwnd):
+            previous = self._hwnd
             hwnd = await self._reader.find_window_async()
+            if hwnd is not None and previous is not None and hwnd != previous:
+                self.metrics.record_reconnect()
+                self._repo.log("INFO", "whatsapp.reconnected",
+                               message=f"WhatsApp window changed {previous} -> {hwnd}")
             self._hwnd = hwnd
         if hwnd is None:
             return
@@ -397,7 +461,7 @@ class AutomationEngine:
                     # waited, and the endpoint may have offered it twice.
                     send, reason = self._relay.should_send(chat, job.relay)
                     if send:
-                        await self._relay.deliver(chat, job.relay, self._sender)
+                        await self._relay.enqueue(chat, job.relay)
                     else:
                         self._relay.note_skipped(chat, job.relay, reason)
             except asyncio.CancelledError:
@@ -412,6 +476,12 @@ class AutomationEngine:
                     self._queued_chats.discard(job.chat_id)
                 self._queue.task_done()
                 self._busy_with = ""
+                # Anything the job produced is now in the durable queue; drain
+                # it here so producing and delivering stay separate concerns.
+                try:
+                    await self._drain_outgoing()
+                except Exception:  # noqa: BLE001
+                    logger.exception("Draining the outgoing queue failed")
                 self.publish()
 
     async def _scan_chat(self, chat: ChatConfig) -> None:
@@ -426,6 +496,50 @@ class AutomationEngine:
         pending = await self._ingest(chat, messages)
         for message in pending:
             await self._pipeline.process(chat, message)
+
+    async def _read_for_verification(self, chat_name: str):
+        """Read the open conversation for the verifier.
+
+        Uses the plain reader rather than the opener: by the time verification
+        runs, the send has just left this chat open, so no switching is needed
+        and none should happen — re-opening would be another interruption for
+        no gain."""
+        hwnd = self._hwnd
+        if hwnd is None:
+            return None
+        active = await self._reader.get_active_conversation_name_async(hwnd)
+        if not active:
+            return None
+        from wadam.whatsapp.name_rules import chat_names_match
+
+        if active.strip().lower() != chat_name.strip().lower()                 and not chat_names_match(chat_name, active):
+            return None          # a different chat is open — cannot verify from here
+        return await self._reader.read_recent_messages_async(hwnd, constants.MESSAGE_READ_LIMIT)
+
+    # -- outgoing queue ----------------------------------------------------
+
+    async def _drain_outgoing(self) -> None:
+        """Deliver everything the queue owes, oldest first.
+
+        Runs on the worker, so sends stay serialized against chat scans and
+        against each other — the ordering guarantee comes from the queue's
+        per-chat sequence, and the safety from there being exactly one drainer."""
+        for message in await asyncio.to_thread(self._repo.pending_outgoing):
+            if self._stop.is_set():
+                return
+            if message.status in OutgoingStatus.AMBIGUOUS:
+                continue      # handled at startup, never mid-run
+            self._busy_with = message.chat_name
+            self.publish()
+            try:
+                await self._delivery.deliver(message)
+            except Exception as ex:  # noqa: BLE001 - one bad message must not stall the queue
+                logger.exception("Delivering a queued message failed")
+                self._repo.log("ERROR", "outgoing.error", chat_id=message.chat_id,
+                               chat_name=message.chat_name, error=str(ex),
+                               message="Unexpected failure while delivering.")
+            finally:
+                self._busy_with = ""
 
     # -- relay -------------------------------------------------------------
 
@@ -600,6 +714,9 @@ class AutomationEngine:
             last_error=self._last_error,
             session_rows=list(self._session_state.summary()),
             send_blocked_reason=self._session_state.send_blocked_reason,
+            metrics=self.metrics.snapshot(self._repo.queue_depth()),
+            queue_depth=self._repo.queue_depth(),
+            capability_summary=self._capability_summary,
         )
         try:
             self._on_snapshot(snapshot)
@@ -679,6 +796,10 @@ class AutomationEngine:
         self.publish()
 
     async def delete_chat(self, chat_id: str) -> None:
+        cancelled = await asyncio.to_thread(self._repo.cancel_outgoing_for_chat, chat_id)
+        if cancelled:
+            self._repo.log("INFO", "outgoing.cancelled", chat_id=chat_id,
+                           message=f"Cancelled {cancelled} queued message(s) for a deleted chat.")
         await asyncio.to_thread(self._repo.delete_chat, chat_id)
         self.publish()
 

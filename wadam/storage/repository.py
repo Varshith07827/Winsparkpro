@@ -38,6 +38,8 @@ from wadam.domain.models import (
     AutomationLog,
     ChatConfig,
     MessageStatus,
+    OutgoingMessage,
+    OutgoingStatus,
     PollState,
     StoredMessage,
     WebhookRecord,
@@ -61,6 +63,7 @@ class Repository:
         self._message_keys: set[str] = set()
         self._webhooks: deque[WebhookRecord] = deque(maxlen=constants.JSON_WEBHOOK_LIMIT)
         self._logs: deque[AutomationLog] = deque(maxlen=constants.JSON_LOG_LIMIT)
+        self._outgoing: dict[str, OutgoingMessage] = {}
         self._app_state = ApplicationState(version=constants.APP_VERSION)
         self._poll_state = PollState()
         self._autosave = AutosaveTimer(self.flush_json, settings.json_autosave_interval or 15.0)
@@ -119,6 +122,10 @@ class Repository:
             for document in (self._mongo.automation_logs.find({})
                              .sort("created_at", -1).limit(constants.JSON_LOG_LIMIT)):
                 self._logs.appendleft(AutomationLog.from_document(strip_object_id(document)))
+            for document in self._mongo.outgoing.find({}):
+                queued = OutgoingMessage.from_document(strip_object_id(document))
+                if queued.outgoing_id:
+                    self._outgoing[queued.outgoing_id] = queued
             state = self._mongo.application_state.find_one({"_id": constants.SINGLETON_ID})
             if state:
                 self._app_state = ApplicationState.from_document(strip_object_id(state))
@@ -235,9 +242,11 @@ class Repository:
                 (w for w in self._webhooks if w.chat_id != chat_id),
                 maxlen=constants.JSON_WEBHOOK_LIMIT,
             )
+            self._outgoing = {k: v for k, v in self._outgoing.items() if v.chat_id != chat_id}
         try:
             self._mongo.chat_configs.delete_one({"chat_id": chat_id})
             self._mongo.messages.delete_many({"chat_id": chat_id})
+            self._mongo.outgoing.delete_many({"chat_id": chat_id})
             self._mongo.webhooks.delete_many({"chat_id": chat_id})
             self._mongo.note_success()
         except Exception as ex:  # noqa: BLE001
@@ -400,6 +409,79 @@ class Repository:
             with self._lock:
                 return sum(1 for m in self._messages if m.chat_id == chat_id)
 
+    # -- outgoing queue ----------------------------------------------------
+
+    def enqueue_outgoing(self, message: OutgoingMessage) -> OutgoingMessage:
+        """Persist a message BEFORE anything is attempted.
+
+        This is what makes the queue survive a crash: by the time a worker
+        touches it, the intent to send is already on disk in both stores. The
+        per-chat sequence is assigned here so ordering is decided at enqueue
+        time, not by whatever order workers happen to pick things up."""
+        with self._lock:
+            message.sequence = self._next_sequence(message.chat_id)
+            self._outgoing[message.outgoing_id] = message
+        try:
+            self._mongo.outgoing.insert_one(message.to_document())
+            self._mongo.note_success()
+        except Exception as ex:  # noqa: BLE001
+            self._mongo.note_failure(ex)
+            logger.error("Could not persist an outgoing message: %s", ex)
+        self._mark_outgoing_dirty()
+        return message
+
+    def _next_sequence(self, chat_id: str) -> int:
+        existing = [m.sequence for m in self._outgoing.values() if m.chat_id == chat_id]
+        return (max(existing) + 1) if existing else 1
+
+    def update_outgoing(self, message: OutgoingMessage) -> None:
+        message.updated_at = utcnow()
+        with self._lock:
+            self._outgoing[message.outgoing_id] = message
+        try:
+            self._mongo.outgoing.update_one(
+                {"outgoing_id": message.outgoing_id}, {"$set": message.to_document()}, upsert=True)
+            self._mongo.note_success()
+        except Exception as ex:  # noqa: BLE001
+            self._mongo.note_failure(ex)
+        self._mark_outgoing_dirty()
+
+    def pending_outgoing(self) -> list[OutgoingMessage]:
+        """Everything still owed, oldest first within each chat.
+
+        Sorted by (chat sequence, creation) so a chat's messages keep their
+        order even though several chats are drained from one queue."""
+        with self._lock:
+            pending = [m for m in self._outgoing.values()
+                       if m.status not in OutgoingStatus.FINAL]
+        return sorted(pending, key=lambda m: (m.created_at or utcnow(), m.sequence))
+
+    def outgoing_in_state(self, states) -> list[OutgoingMessage]:
+        with self._lock:
+            return [m for m in self._outgoing.values() if m.status in states]
+
+    def queue_depth(self) -> int:
+        with self._lock:
+            return sum(1 for m in self._outgoing.values()
+                       if m.status not in OutgoingStatus.FINAL)
+
+    def cancel_outgoing_for_chat(self, chat_id: str) -> int:
+        """A deleted chat cannot be sent to. Cancelled, not silently dropped."""
+        cancelled = 0
+        for message in self.outgoing_in_state(
+                OutgoingStatus.RESUMABLE + OutgoingStatus.AMBIGUOUS):
+            if message.chat_id == chat_id:
+                message.status = OutgoingStatus.CANCELLED
+                message.error = "the chat was deleted while this was queued"
+                self.update_outgoing(message)
+                cancelled += 1
+        return cancelled
+
+    def _mark_outgoing_dirty(self) -> None:
+        with self._lock:
+            payload = [m.to_document() for m in self._outgoing.values()]
+        self._backup.set_section(constants.JSON_OUTGOING, payload)
+
     # -- webhooks ----------------------------------------------------------
 
     def save_webhook(self, record: WebhookRecord) -> None:
@@ -541,6 +623,7 @@ class Repository:
 
     def _rebuild_all_sections(self) -> None:
         self._mark_chats_dirty()
+        self._mark_outgoing_dirty()
         self._mark_messages_dirty()
         self._mark_logs_dirty()
         self._mark_state_dirty()

@@ -83,10 +83,12 @@ class RelayPoll:
 
 
 class RelayService:
-    def __init__(self, repository: Repository, webhook: WebhookClient, to_thread) -> None:
+    def __init__(self, repository: Repository, webhook: WebhookClient, to_thread,
+                 delivery=None) -> None:
         self._repo = repository
         self._webhook = webhook
         self._to_thread = to_thread
+        self._delivery = delivery
 
     # -- polling -----------------------------------------------------------
 
@@ -127,6 +129,23 @@ class RelayService:
         return True, ""
 
     # -- sending -----------------------------------------------------------
+
+    async def enqueue(self, chat: ChatConfig, message: RelayMessage) -> bool:
+        """Hand a polled message to the outgoing queue.
+
+        The duplicate guard is updated here, at enqueue time rather than after
+        delivery: the endpoint has already handed the message over, so the
+        decision "have we taken this one?" is settled now. Delivery outcomes are
+        the queue's concern."""
+        if self._delivery is None:
+            return False
+        await self._delivery.enqueue(chat, message.text, origin="relay",
+                                     external_ref=message.external_id)
+        chat.last_relay_text = message.text
+        chat.last_relay_utc = utcnow()
+        chat.last_relay_status = "queued for delivery"
+        await self._to_thread(self._repo.save_chat, chat)
+        return True
 
     async def deliver(self, chat: ChatConfig, message: RelayMessage, sender) -> bool:
         """Persist, send, verify, persist. The same order and the same

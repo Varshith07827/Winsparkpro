@@ -33,6 +33,7 @@ import ctypes
 import logging
 import os
 from ctypes import wintypes
+from datetime import timezone
 from dataclasses import dataclass, field
 logger = logging.getLogger(__name__)
 
@@ -270,3 +271,154 @@ def probe(window_title_hint: str = "WhatsApp") -> SessionState:
         user_idle_seconds=user_idle_seconds(),
         notes=tuple(notes),
     )
+
+
+# ---------------------------------------------------------------------------
+# Session change notifications
+# ---------------------------------------------------------------------------
+
+WM_WTSSESSION_CHANGE = 0x02B1
+NOTIFY_FOR_THIS_SESSION = 0
+
+#: wParam values, from WinUser.h. Only the ones that change whether input can
+#: be delivered are acted on; the rest are logged for the record.
+SESSION_EVENTS = {
+    0x1: "console connect",
+    0x2: "console disconnect",
+    0x3: "remote connect",
+    0x4: "remote disconnect",
+    0x5: "session logon",
+    0x6: "session logoff",
+    0x7: "session lock",
+    0x8: "session unlock",
+    0x9: "session remote control",
+}
+
+#: Events after which sending may work again.
+RESUMES = {0x1, 0x3, 0x5, 0x8}
+#: Events after which it definitely will not.
+SUSPENDS = {0x2, 0x4, 0x6, 0x7}
+
+
+class SessionWatcher:
+    """Turns lock/unlock/connect/disconnect into events instead of polling.
+
+    `probe()` answers "can we send *right now?*", but only when something asks.
+    Between polls the answer can be wrong for up to a cycle — long enough to
+    start a send into a session that has just been locked, where the keystrokes
+    go nowhere and the compose box never clears.
+
+    `WTSRegisterSessionNotification` fixes that by telling us the moment it
+    changes. It needs a window to deliver `WM_WTSSESSION_CHANGE` to, so this
+    creates a message-only window (`HWND_MESSAGE` — never visible, never in the
+    taskbar, no z-order) on its own thread with its own message pump.
+
+    Failure here is not fatal: if registration fails, the polled probe is still
+    correct, just later. That is why every step is guarded and the watcher
+    reports `active` rather than raising."""
+
+    def __init__(self, on_change=None) -> None:
+        self._on_change = on_change
+        self._thread = None
+        self._hwnd = 0
+        self._stop = False
+        self.active = False
+        self.last_event = ""
+        self.last_event_at = None
+
+    def start(self) -> bool:
+        if not _WIN32 or self._thread is not None:
+            return self.active
+        import threading
+
+        self._thread = threading.Thread(target=self._run, name="wadam-session", daemon=True)
+        self._thread.start()
+        # Give the pump a moment to register so `active` is meaningful to the
+        # caller that just started it.
+        import time as _time
+
+        for _ in range(20):
+            if self.active:
+                break
+            _time.sleep(0.05)
+        return self.active
+
+    def stop(self) -> None:
+        self._stop = True
+        try:
+            if self._hwnd:
+                import win32con
+
+                win32gui.PostMessage(self._hwnd, win32con.WM_CLOSE, 0, 0)
+        except Exception:  # noqa: BLE001
+            pass
+        if self._thread is not None:
+            self._thread.join(timeout=3)
+            self._thread = None
+
+    def _run(self) -> None:
+        try:
+            import win32con
+            import win32gui
+        except ImportError:  # pragma: no cover
+            return
+        try:
+            wtsapi32 = ctypes.windll.wtsapi32
+
+            def on_message(hwnd, message, wparam, lparam):
+                if message == WM_WTSSESSION_CHANGE:
+                    self._handle(int(wparam))
+                elif message == win32con.WM_CLOSE:
+                    win32gui.DestroyWindow(hwnd)
+                elif message == win32con.WM_DESTROY:
+                    win32gui.PostQuitMessage(0)
+                return 0
+
+            wndclass = win32gui.WNDCLASS()
+            wndclass.lpszClassName = "WadamSessionWatcher"
+            wndclass.lpfnWndProc = {
+                WM_WTSSESSION_CHANGE: on_message,
+                win32con.WM_CLOSE: on_message,
+                win32con.WM_DESTROY: on_message,
+            }
+            atom = win32gui.RegisterClass(wndclass)
+            # HWND_MESSAGE: a message-only window. It exists solely to receive
+            # WM_WTSSESSION_CHANGE and is invisible in every sense.
+            self._hwnd = win32gui.CreateWindowEx(
+                0, atom, "wadam-session", 0, 0, 0, 0, 0,
+                win32con.HWND_MESSAGE, 0, 0, None)
+            if not wtsapi32.WTSRegisterSessionNotification(self._hwnd, NOTIFY_FOR_THIS_SESSION):
+                logger.warning("WTSRegisterSessionNotification failed (err %d) — "
+                               "falling back to polling for session state",
+                               ctypes.get_last_error())
+                return
+            self.active = True
+            logger.info("session notifications registered")
+            win32gui.PumpMessages()
+        except Exception:  # noqa: BLE001 - polling remains correct without this
+            logger.warning("session watcher could not start; polling still applies",
+                           exc_info=True)
+        finally:
+            self.active = False
+            try:
+                ctypes.windll.wtsapi32.WTSUnRegisterSessionNotification(self._hwnd)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _handle(self, wparam: int) -> None:
+        from datetime import datetime as _dt
+
+        name = SESSION_EVENTS.get(wparam, f"unknown ({wparam})")
+        self.last_event = name
+        self.last_event_at = _dt.now(timezone.utc)
+        if wparam in SUSPENDS:
+            logger.info("session event: %s — sending is held until it returns", name)
+        elif wparam in RESUMES:
+            logger.info("session event: %s — sending may resume", name)
+        else:
+            logger.debug("session event: %s", name)
+        if self._on_change is not None:
+            try:
+                self._on_change(name, wparam in RESUMES)
+            except Exception:  # noqa: BLE001 - a listener must not kill the pump
+                logger.exception("session change listener failed")

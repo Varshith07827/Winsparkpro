@@ -1,7 +1,7 @@
 # Test report
 
 ```
-215 passed
+245 passed
 ```
 
 Environment: Windows 11 Pro 26200 · Python 3.13.14 · PySide6 6.11.1 ·
@@ -33,7 +33,8 @@ remain in the source.
 | `test_send_api.py` | 51 | Contact IDs, ambiguity refusal, auth, HTTP over a real socket |
 | `test_relay.py` | 43 | Response shapes, the two dedup rules, record accuracy, live GETs |
 | `test_mongo_integration.py` | 12 | Real MongoDB: indexes, uniqueness, restart, pruning |
-| **Total** | **215** | |
+| `test_delivery.py` | 16 | Verification arithmetic, queue durability, restart, metrics |
+| **Total** | **245** | |
 
 `test_mongo_integration.py` skips itself when no server is reachable, so the
 suite still passes on a machine without MongoDB. Point it elsewhere with

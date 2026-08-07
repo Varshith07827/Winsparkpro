@@ -157,6 +157,7 @@ class ChatConfigPanel(QWidget):
         self._body_layout.addWidget(self._build_contact_id_card())
         self._body_layout.addWidget(self._build_activity_card())
         self._body_layout.addWidget(self._build_health_card())
+        self._body_layout.addWidget(self._build_operations_card())
         self._body_layout.addWidget(self._build_storage_card())
         self._body_layout.addLayout(self._build_actions())
         self._body_layout.addStretch(1)
@@ -373,6 +374,54 @@ class ChatConfigPanel(QWidget):
                 value.style().unpolish(value); value.style().polish(value)
         self._health_note.setText(blocked_reason)
         self._health_note.setVisible(bool(blocked_reason))
+
+    def _build_operations_card(self) -> QWidget:
+        """Counters and averages. The question an operator asks first is "is it
+        working, and if not, which stage stopped?" — so the rows follow the
+        pipeline in order: read, queued, sent, verified, failed."""
+        card = _Card("Operations")
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(20)
+        grid.setVerticalSpacing(6)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(3, 1)
+        self._ops_rows: list[tuple[QLabel, QLabel]] = []
+        # Two columns of pairs — nineteen metrics in one column is a wall.
+        for index in range(10):
+            for column in (0, 2):
+                label = QLabel("")
+                label.setObjectName("fieldLabel")
+                value = QLabel("")
+                value.setObjectName("fieldValue")
+                grid.addWidget(label, index, column)
+                grid.addWidget(value, index, column + 1)
+                self._ops_rows.append((label, value))
+        card.add_layout(grid)
+
+        self._capability_line = QLabel("")
+        self._capability_line.setWordWrap(True)
+        self._capability_line.setObjectName("fieldValueMuted")
+        card.add(self._capability_line)
+        return card
+
+    def set_operations(self, metrics, capability_summary: str = "") -> None:
+        rows = list(metrics.rows()) if metrics is not None else []
+        # Interleave so the pairs read down the left column then the right.
+        half = (len(rows) + 1) // 2
+        ordered: list = []
+        for index in range(half):
+            ordered.append(rows[index] if index < len(rows) else None)
+            right = index + half
+            ordered.append(rows[right] if right < len(rows) else None)
+
+        for (label, value), row in zip(self._ops_rows, ordered + [None] * len(self._ops_rows)):
+            name, text = row if row else ("", "")
+            if label.text() != name:
+                label.setText(name)
+            if value.text() != text:
+                value.setText(text)
+        if self._capability_line.text() != capability_summary:
+            self._capability_line.setText(capability_summary)
 
     def _build_storage_card(self) -> QWidget:
         card = _Card("Storage")

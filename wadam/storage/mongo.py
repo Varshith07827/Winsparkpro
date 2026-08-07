@@ -172,6 +172,10 @@ class MongoStore:
         return self._collection(constants.COLLECTION_WEBHOOKS)
 
     @property
+    def outgoing(self):
+        return self._collection(constants.COLLECTION_OUTGOING)
+
+    @property
     def automation_logs(self):
         return self._collection(constants.COLLECTION_AUTOMATION_LOGS)
 
@@ -198,6 +202,9 @@ class MongoStore:
             self.messages.create_index(
                 [("chat_id", 1), ("origin", 1), ("external_ref", 1)], sparse=True)
             self.webhooks.create_index("webhook_id", unique=True)
+            self.outgoing.create_index("outgoing_id", unique=True)
+            # The queue is read as "what is pending, oldest first, per chat".
+            self.outgoing.create_index([("status", 1), ("chat_id", 1), ("sequence", 1)])
             self.webhooks.create_index([("chat_id", 1), ("created_at", -1)])
             self.automation_logs.create_index([("created_at", -1)])
             self.automation_logs.create_index("chat_id")

@@ -63,10 +63,15 @@ logger = logging.getLogger(__name__)
 
 class MessagePipeline:
     def __init__(self, repository: Repository, webhook: WebhookClient, sender: WhatsAppSender,
-                 to_thread) -> None:
+                 to_thread, delivery=None) -> None:
         self._repo = repository
         self._webhook = webhook
         self._sender = sender
+        # When present, replies are QUEUED rather than sent inline. Producing a
+        # reply and delivering it are different jobs with different failure
+        # modes: a webhook that answered is a success even if WhatsApp is
+        # locked, and the reply should wait rather than be lost.
+        self._delivery = delivery
         # Injected rather than imported so every blocking repository call in
         # here is visibly off the event loop.
         self._to_thread = to_thread
@@ -158,6 +163,17 @@ class MessagePipeline:
 
     async def _send_reply(self, chat: ChatConfig, message: StoredMessage, reply: str,
                           webhook_status: str) -> None:
+        if self._delivery is not None:
+            await self._delivery.enqueue(chat, reply, origin="webhook_reply",
+                                         source_message_key=message.message_key)
+            # The reply is durably queued; delivery and verification are the
+            # queue's job now. The incoming message's own journey ends here.
+            await self._finish(chat, message, status=MessageStatus.REPLIED,
+                               webhook_status=webhook_status)
+            self._log(chat, "INFO", "reply.queued", message,
+                      f"Reply queued for delivery: {reply[:120]}")
+            return
+
         result = await self._sender.send_async(chat.chat_name, reply)
 
         if not result.ok:
