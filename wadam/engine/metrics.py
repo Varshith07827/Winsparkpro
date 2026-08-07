@@ -56,6 +56,7 @@ class MetricsSnapshot:
     cursor_restores: int = 0
 
     queue_depth: int = 0
+    needs_review: int = 0
     avg_read_ms: float = 0.0
     avg_send_ms: float = 0.0
     avg_verify_ms: float = 0.0
@@ -79,6 +80,7 @@ class MetricsSnapshot:
             ("Retries", str(self.retries)),
             ("Delivery rate", success),
             ("Queue depth", str(self.queue_depth)),
+            ("Needs review", str(self.needs_review)),
             ("Webhook calls", f"{self.webhook_calls} ({self.webhook_failures} failed)"),
             ("Relay polls", f"{self.relay_polls} ({self.relay_messages} messages)"),
             ("WhatsApp reconnects", str(self.reconnects)),
@@ -175,7 +177,7 @@ class Metrics:
 
     # -- reporting ---------------------------------------------------------
 
-    def snapshot(self, queue_depth: int = 0) -> MetricsSnapshot:
+    def snapshot(self, queue_depth: int = 0, needs_review: int = 0) -> MetricsSnapshot:
         with self._lock:
             counts = dict(self._counts)
             read, send = _mean(self._read_ms), _mean(self._send_ms)
@@ -199,6 +201,7 @@ class Metrics:
             focus_restores=counts.get("focus_restores", 0),
             cursor_restores=counts.get("cursor_restores", 0),
             queue_depth=queue_depth,
+            needs_review=needs_review,
             avg_read_ms=read, avg_send_ms=send,
             avg_verify_ms=verify, avg_webhook_ms=webhook,
         )

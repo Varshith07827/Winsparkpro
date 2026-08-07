@@ -344,3 +344,43 @@ def test_metrics_averages_use_a_window_not_all_time():
         metrics.record_sent(1000)
     # The window is 50, so the recent slow sends dominate entirely.
     assert metrics.snapshot().avg_send_ms == pytest.approx(1000, rel=0.01)
+
+
+def test_needs_review_is_a_first_class_state(repo: Repository):
+    """UNVERIFIED is not an error bucket — it is a queue an operator works.
+
+    The system deliberately refuses to guess about these, so the only thing
+    standing between an undelivered message and nobody noticing is that the
+    count is visible."""
+    chat = make_chat(repo)
+    state = FakeChat()
+    service = build(repo, state, FakeSender(state, ok=True, actually_delivers=False))
+
+    asyncio.run(service.deliver(asyncio.run(service.enqueue(chat, "vanished", origin="api"))))
+
+    review = repo.needs_review()
+    assert [m.text for m in review] == ["vanished"]
+    assert review[0].status == OutgoingStatus.UNVERIFIED
+    # Out of the working queue, but not out of sight.
+    assert repo.queue_depth() == 0
+
+    metrics = Metrics()
+    snapshot = metrics.snapshot(repo.queue_depth(), len(review))
+    assert dict(snapshot.rows())["Needs review"] == "1"
+
+
+def test_every_metric_is_actually_populated():
+    """A counter nobody increments reads zero forever and quietly lies about
+    the system's health. Six of thirteen were dead when the soak exposed it —
+    this keeps them wired."""
+    import pathlib
+    import re
+
+    source = pathlib.Path("wadam/engine/metrics.py").read_text(encoding="utf-8")
+    defined = {m.group(1) for m in re.finditer(r"def (record_\w+)", source)}
+    called = {
+        name for name in defined
+        for path in pathlib.Path("wadam").rglob("*.py")
+        if path.name != "metrics.py" and f".{name}(" in path.read_text(encoding="utf-8")
+    }
+    assert defined - called == set(), f"metrics defined but never recorded: {defined - called}"

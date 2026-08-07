@@ -124,22 +124,23 @@ class AutomationEngine:
 
         self._sta = StaAutomationThread()
         self._reader = WhatsAppReader(self._sta, settings.whatsapp_window_title)
+        self.metrics = Metrics()
         self._sender = WhatsAppSender(self._reader, self._sta,
-                                      use_clipboard=settings.sender_use_clipboard)
+                                      use_clipboard=settings.sender_use_clipboard,
+                                      metrics=self.metrics)
         self._webhook = WebhookClient(
             api_key=settings.webhook_api_key,
             timeout=settings.webhook_timeout,
             max_retries=settings.webhook_max_retries,
         )
         self._discovery = ChatDiscovery(repository, settings)
-        self.metrics = Metrics()
         # Verification reads the conversation back; it goes through the same
         # opener the worker uses so it sees exactly what WhatsApp is showing.
         self._verifier = SendVerifier(self._read_for_verification)
         self._delivery = DeliveryService(repository, self._sender, self._verifier,
                                          asyncio.to_thread, self.metrics)
         self._pipeline = MessagePipeline(repository, self._webhook, self._sender,
-                                         asyncio.to_thread, self._delivery)
+                                         asyncio.to_thread, self._delivery, self.metrics)
         self._relay = RelayService(repository, self._webhook, asyncio.to_thread,
                                    self._delivery)
 
@@ -378,9 +379,12 @@ class AutomationEngine:
         if active_name:
             active = self._find_chat_by_name(active_name)
             if active is not None and (active.automation_enabled or active.chat_id in changed_ids):
+                read_started = time.monotonic()
                 messages = await self._reader.read_recent_messages_async(
                     hwnd, constants.MESSAGE_READ_LIMIT
                 )
+                self.metrics.record_read(len(messages),
+                                         (time.monotonic() - read_started) * 1000)
                 pending = await self._ingest(active, messages)
                 for message in pending:
                     self._enqueue(_Job("process", active.chat_id, message))
@@ -488,9 +492,11 @@ class AutomationEngine:
         """Open a chat, read it, persist what's new, and run anything that
         needs running. This is the only path that switches the user's open
         conversation."""
+        read_started = time.monotonic()
         _hwnd, messages = await self._sender.open_and_read_async(
             chat.chat_name, constants.MESSAGE_READ_LIMIT
         )
+        self.metrics.record_read(len(messages), (time.monotonic() - read_started) * 1000)
         if not messages:
             return
         pending = await self._ingest(chat, messages)
@@ -584,6 +590,7 @@ class AutomationEngine:
                 pass
 
     async def _handle_relay_poll(self, chat: ChatConfig, poll) -> None:
+        self.metrics.record_relay_poll(len(poll.messages) if poll.ok else 0)
         if not poll.ok:
             await self._relay.record_poll(chat, poll)
             self._repo.log("WARNING", "relay.poll_failed", chat_id=chat.chat_id,
@@ -714,7 +721,8 @@ class AutomationEngine:
             last_error=self._last_error,
             session_rows=list(self._session_state.summary()),
             send_blocked_reason=self._session_state.send_blocked_reason,
-            metrics=self.metrics.snapshot(self._repo.queue_depth()),
+            metrics=self.metrics.snapshot(self._repo.queue_depth(),
+                                          len(self._repo.needs_review())),
             queue_depth=self._repo.queue_depth(),
             capability_summary=self._capability_summary,
         )

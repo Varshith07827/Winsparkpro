@@ -69,6 +69,7 @@ class DeliveryService:
         await self._to_thread(self._repo.flush_json, True)
         self._repo.log("INFO", "outgoing.queued", chat_id=chat.chat_id,
                        chat_name=chat.chat_name, direction="out",
+                       correlation_id=message.outgoing_id,
                        message=f"Queued ({origin}): {text[:100]}")
         if self._metrics:
             self._metrics.record_queued()
@@ -129,12 +130,14 @@ class DeliveryService:
         if verification.ok:
             self._repo.log("INFO", "outgoing.recovered", chat_id=chat.chat_id,
                            chat_name=chat.chat_name, direction="out",
+                           correlation_id=message.outgoing_id,
                            message=f"Was already delivered before the restart: "
                                    f"{message.text[:80]}")
             return await self._delivered(chat, message, None, verification)
 
         self._repo.log("INFO", "outgoing.resuming", chat_id=chat.chat_id,
                        chat_name=chat.chat_name, direction="out",
+                       correlation_id=message.outgoing_id,
                        message=f"Not found in the chat after a restart — sending: "
                                f"{message.text[:80]}")
         message.status = OutgoingStatus.QUEUED
@@ -166,6 +169,7 @@ class DeliveryService:
         strategy = getattr(result, "strategy", "recovered")
         self._repo.log("INFO", "outgoing.delivered", chat_id=chat.chat_id,
                        chat_name=chat.chat_name, direction="out",
+                       correlation_id=message.outgoing_id,
                        response=verification.bubble_time,
                        retry_count=max(0, message.attempts - 1),
                        message=f"Delivered via {strategy} — {verification.describe()}: "
@@ -189,6 +193,7 @@ class DeliveryService:
         await self._to_thread(self._repo.flush_json, True)
         self._repo.log("WARNING", "outgoing.unverified", chat_id=chat.chat_id,
                        chat_name=chat.chat_name, direction="out",
+                       correlation_id=message.outgoing_id,
                        error=verification.reason,
                        message=f"Sent but not confirmed in the chat — NOT retried, to "
                                f"avoid a duplicate: {message.text[:80]}")
@@ -204,6 +209,7 @@ class DeliveryService:
             message.status = OutgoingStatus.FAILED
             self._repo.log("ERROR", "outgoing.failed", chat_id=chat.chat_id,
                            chat_name=chat.chat_name, direction="out",
+                           correlation_id=message.outgoing_id,
                            error=result.detail, retry_count=message.attempts,
                            message=f"Giving up after {message.attempts} attempt(s): "
                                    f"{message.text[:80]}")
@@ -211,6 +217,7 @@ class DeliveryService:
             message.status = OutgoingStatus.QUEUED
             self._repo.log("WARNING", "outgoing.retry", chat_id=chat.chat_id,
                            chat_name=chat.chat_name, direction="out",
+                           correlation_id=message.outgoing_id,
                            error=result.detail, retry_count=message.attempts,
                            message=f"Attempt {message.attempts} did not leave the compose "
                                    f"box — requeued: {message.text[:80]}")
@@ -220,4 +227,6 @@ class DeliveryService:
         await self._to_thread(self._repo.flush_json, True)
         if self._metrics:
             self._metrics.record_send_failure()
+            if message.status == OutgoingStatus.QUEUED:
+                self._metrics.record_retry()
         return message

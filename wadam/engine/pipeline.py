@@ -63,7 +63,7 @@ logger = logging.getLogger(__name__)
 
 class MessagePipeline:
     def __init__(self, repository: Repository, webhook: WebhookClient, sender: WhatsAppSender,
-                 to_thread, delivery=None) -> None:
+                 to_thread, delivery=None, metrics=None) -> None:
         self._repo = repository
         self._webhook = webhook
         self._sender = sender
@@ -72,6 +72,7 @@ class MessagePipeline:
         # modes: a webhook that answered is a success even if WhatsApp is
         # locked, and the reply should wait rather than be lost.
         self._delivery = delivery
+        self._metrics = metrics
         # Injected rather than imported so every blocking repository call in
         # here is visibly off the event loop.
         self._to_thread = to_thread
@@ -141,6 +142,8 @@ class MessagePipeline:
             duration_ms=outcome.duration_ms,
         )
         await self._to_thread(self._repo.save_webhook, record)
+        if self._metrics:
+            self._metrics.record_webhook(outcome.ok, outcome.duration_ms)
 
         message.webhook_id = record.webhook_id
         chat.last_webhook_utc = utcnow()
@@ -258,6 +261,7 @@ class MessagePipeline:
              text: str, retry_count: int = 0) -> None:
         self._repo.log(
             level, event, chat_id=chat.chat_id, chat_name=chat.chat_name, message=text,
-            direction=message.direction, webhook_url=chat.webhook_url,
+            direction=message.direction, correlation_id=message.message_key,
+            webhook_url=chat.webhook_url,
             response=message.reply_text, retry_count=retry_count, error=message.error,
         )

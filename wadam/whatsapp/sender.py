@@ -92,6 +92,12 @@ except ImportError:  # pragma: no cover - exercised only off-Windows
 
 # How long the desktop must have been untouched before a send takes the
 # foreground, and how long it will wait for that before going ahead regardless.
+#: Set by WhatsAppSender so the module-level click helper can report the one
+#: physical mouse action left in the application. A plain hook rather than
+#: threading metrics through every helper — the alternative was five signatures
+#: changed to carry one counter.
+_metrics_hook = None
+
 QUIET_IDLE_SECONDS = 1.5
 MAX_DEFER_SECONDS = 20.0
 
@@ -864,6 +870,8 @@ def _click_item(item) -> bool:
         if origin is not None:
             try:
                 win32api.SetCursorPos(origin)
+                if _metrics_hook is not None:
+                    _metrics_hook.record_cursor_restore()
             except Exception:  # noqa: BLE001
                 logger.debug("could not restore the cursor position", exc_info=True)
 
@@ -1002,7 +1010,7 @@ class WhatsAppSender:
     """The UI Automation transport. Implements `wadam.whatsapp.transport.Transport`."""
 
     def __init__(self, reader: WhatsAppReader, sta: StaAutomationThread,
-                 use_clipboard: bool = True) -> None:
+                 use_clipboard: bool = True, metrics=None) -> None:
         self._reader = reader
         self._sta = sta  # must be the same STA thread the reader uses
         # Pasting borrows the clipboard for ~200ms and puts text contents back.
@@ -1011,6 +1019,9 @@ class WhatsAppSender:
         # historically the path that drops keystrokes, but it leaves the
         # clipboard alone entirely.
         self._use_clipboard = use_clipboard
+        self._metrics = metrics
+        global _metrics_hook
+        _metrics_hook = metrics
 
     def capabilities(self) -> TransportCapabilities:
         return TransportCapabilities(
@@ -1106,6 +1117,8 @@ class WhatsAppSender:
                 result = await self._send_locked(chat_name, message_text)
             finally:
                 restored = await self._sta.invoke_async(lambda: restore_foreground(previous))
+            if self._metrics:
+                self._metrics.record_focus_restore(restored)
             return replace(
                 result,
                 duration_ms=int((time.monotonic() - started) * 1000),

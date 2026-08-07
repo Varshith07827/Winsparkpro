@@ -460,6 +460,15 @@ class Repository:
         with self._lock:
             return [m for m in self._outgoing.values() if m.status in states]
 
+    def needs_review(self) -> list:
+        """Messages that left the compose box but were never found in the chat.
+
+        A first-class state, not an error bucket. The system deliberately does
+        not guess about these — retrying risks a duplicate — so they are
+        surfaced for a person to resolve. An operator who never looks at this
+        number is the one failure mode the design cannot cover."""
+        return self.outgoing_in_state((OutgoingStatus.UNVERIFIED,))
+
     def queue_depth(self) -> int:
         with self._lock:
             return sum(1 for m in self._outgoing.values()
@@ -504,10 +513,12 @@ class Repository:
 
     def log(self, level: str, event: str, chat_id: str = "", chat_name: str = "",
             message: str = "", direction: str = "", webhook_url: str = "",
-            response: str = "", retry_count: int = 0, error: str = "") -> AutomationLog:
+            response: str = "", retry_count: int = 0, error: str = "",
+            correlation_id: str = "") -> AutomationLog:
         entry = AutomationLog(
             level=level.upper(), event=event, chat_id=chat_id, chat_name=chat_name,
-            message=message, direction=direction, webhook_url=webhook_url,
+            message=message, direction=direction, correlation_id=correlation_id,
+            webhook_url=webhook_url,
             response=(response or "")[:500], retry_count=retry_count, error=(error or "")[:500],
         )
         with self._lock:
@@ -520,6 +531,17 @@ class Repository:
             self._mongo.note_failure(ex)
         self._mark_logs_dirty()
         return entry
+
+    def trace(self, correlation_id: str) -> list[AutomationLog]:
+        """Every log line about one message, oldest first.
+
+        The thing an operator actually wants when a reply did not arrive: the
+        whole story of that one message, not everything that happened to the
+        chat around it."""
+        if not correlation_id:
+            return []
+        with self._lock:
+            return [e for e in self._logs if e.correlation_id == correlation_id]
 
     def recent_logs(self, limit: int = 200, chat_id: str = "") -> list[AutomationLog]:
         with self._lock:

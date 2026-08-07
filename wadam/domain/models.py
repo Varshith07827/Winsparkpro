@@ -389,6 +389,11 @@ class AutomationLog:
     chat_name: str = ""
     message: str = ""
     direction: str = ""       # "in" | "out" | ""
+    # Ties every line about one message together: the incoming message_key, or
+    # the outgoing_id once it is queued. Without it a log can say a chat had
+    # trouble but not WHICH message — and "which one" is the first question
+    # anybody asks when a reply goes missing.
+    correlation_id: str = ""
     webhook_url: str = ""
     response: str = ""
     retry_count: int = 0
