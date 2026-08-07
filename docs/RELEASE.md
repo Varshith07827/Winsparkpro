@@ -224,7 +224,7 @@ Three cases prove the census logic rather than mere presence:
 | Unit + integration | ✅ | 297 tests |
 | Real MongoDB | ✅ | Storage suites run against both stores |
 | Real WhatsApp reads | ✅ | Live probes and benchmarks |
-| **Real WhatsApp send end-to-end** | ❌ | **Exercised 2026-08-07 and it FAILED — see §11.** ~141 attempts, 13 delivered |
+| **Real WhatsApp send end-to-end** | ❌ | **Exercised 2026-08-07 and it FAILED — see §11.** ~114 attempts, 14 delivered |
 | **Documentation** | ✅ | Ten documents; see the README index |
 | **Deployment** | ⚠️ | No installer or packaging; run from source |
 | **Send API path** | ❌ | Bypasses the durable queue and the verifier entirely — §11 |
@@ -304,8 +304,8 @@ architecture — see [SENDING.md](SENDING.md), Option D.
 
 ## 11. End-to-end send failure (2026-08-07)
 
-The first real exercise of the send path. ~141 messages posted to the Send API
-for one chat; **13 arrived**. Recorded here in full because §10 previously
+The first real exercise of the send path. ~114 messages posted to the Send API
+for one chat across two runs; **14 arrived**. Recorded here in full because §10 previously
 called the system ready on the strength of tests that never touched this path.
 
 ### Defect 1 — the Send API bypasses the queue and the verifier
@@ -340,6 +340,15 @@ Root cause **not identified.** Two hypotheses were tested and refuted:
 |---|---|---|
 | Foreground handover per send disturbs input | A/B, same fill path, only the take/restore differing | **Refuted** — 9/15 churn vs 7/15 held |
 | The contenteditable needs a physical click to place the DOM caret | UIA SetFocus vs real click vs SetFocus after a click | **Refuted** — all three pasted correctly |
+| A physical mouse click into the box before filling ("mouse hijack") | Interleaved A/B, cursor restored after each click | **Does not fix it** — 8/14 with the click vs 6/14 without |
+| The 3 s poll loop's ~2 s conversation read races the send | Stopped the app entirely, re-ran the same fill loop | **Refuted** — fills went to **0/14**, worse, not better |
+| Keystrokes need the WebView2 content window foregrounded, not the WinUI shell | Foregrounded hwnd of the `Chrome_WidgetWin_1` content host | **Refuted** — 0/10, foreground confirmed correct each time |
+
+The fill rate is **environment-dependent in a way none of these explain**: it sat
+near 50% while the app was running and dropped to 0% with the app stopped, with
+`GetForegroundWindow` confirming WhatsApp in front on every failing attempt.
+That dependency is itself unexplained and makes every percentage above a
+measurement of an uncontrolled system, not of the variable under test.
 
 One hypothesis is **open and unproven**: `set_compose_text_sync` always tries
 rung 1 (`_try_value_pattern`) first, even though the capability probe has
@@ -360,6 +369,19 @@ exists to stop exactly this, and nothing consults it.
 windows match: WhatsApp Beta (the target), its WebView2 content host, a Chrome
 window, and **wadam's own Qt window**. Matching on title alone is fragile;
 the target should be pinned by process and window class.
+
+### A false-negative scare that was not one
+
+An earlier reading of this data appeared to show messages logged as
+`send_failed` sitting in the chat — which would have meant the app reports
+failure for delivered messages, the worst possible defect for a retry policy.
+It was an artifact: the burst was run twice with identical text, so
+`Hello Varshith #1` was present from the *first* run while the second genuinely
+failed. Matching on message text alone cannot tell those apart. **No
+false-negative was demonstrated**; 15 outgoing messages are readable in the
+chat against 14 logged as sent, which is consistent. Recorded because the
+verifier's census logic exists precisely because identical text is
+indistinguishable, and the analysis fell into the trap the code avoids.
 
 ### Operational note
 
