@@ -1,0 +1,306 @@
+"""UI behaviour, driven headlessly through Qt's offscreen platform.
+
+These are not screenshot tests. They assert the things that were wrong or could
+silently go wrong: which chat's webhook is in the field, whether search filters
+without a refresh, whether a rebuild every three seconds destroys the user's
+selection, and whether an invalid URL is caught before it reaches the engine.
+"""
+
+from __future__ import annotations
+
+import os
+
+import pytest
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from PySide6.QtWidgets import QApplication  # noqa: E402
+
+from wadam.domain.models import ChatConfig, chat_id_for  # noqa: E402
+from wadam.ui import theme  # noqa: E402
+from wadam.ui.chat_list import ChatListPanel  # noqa: E402
+from wadam.ui.config_panel import ChatConfigPanel, validate_webhook_url  # noqa: E402
+from wadam.ui.widgets import CHAT_ROLE  # noqa: E402
+
+
+@pytest.fixture(scope="session")
+def app():
+    instance = QApplication.instance() or QApplication([])
+    instance.setStyleSheet(theme.apply("dark"))
+    return instance
+
+
+def chat(name: str, webhook: str = "", automation: bool = False, **kwargs) -> ChatConfig:
+    return ChatConfig(chat_id=chat_id_for(name), chat_name=name, webhook_url=webhook,
+                      automation_enabled=automation, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# The webhook field
+# ---------------------------------------------------------------------------
+
+
+def test_selecting_a_chat_shows_that_chats_webhook(app):
+    """The regression that started this: switching chats kept showing the
+    previous chat's URL, because the dirty-check compared the field against the
+    chat that had just been selected rather than the one being left."""
+    panel = ChatConfigPanel()
+    alice = chat("Alice", webhook="https://x.test/alice")
+    bob = chat("Bob", webhook="https://x.test/bob")
+    carol = chat("Carol")  # no webhook at all
+
+    panel.set_chat(alice)
+    assert panel._webhook.text() == "https://x.test/alice"
+
+    panel.set_chat(bob)
+    assert panel._webhook.text() == "https://x.test/bob"
+
+    panel.set_chat(carol)
+    assert panel._webhook.text() == "", "a chat with no webhook must show an empty field"
+
+    panel.set_chat(alice)
+    assert panel._webhook.text() == "https://x.test/alice"
+
+
+def test_the_field_survives_the_once_a_second_refresh(app):
+    """Re-rendering the SAME chat must not overwrite what is being typed."""
+    panel = ChatConfigPanel()
+    alice = chat("Alice", webhook="https://x.test/alice")
+    panel.set_chat(alice)
+
+    panel._webhook.setText("https://x.test/typing-in-progress")
+    for _ in range(5):           # five refresh ticks
+        panel.set_chat(alice)
+    assert panel._webhook.text() == "https://x.test/typing-in-progress"
+
+    # …but switching away and back discards it, because that text belonged to
+    # a chat the user has left.
+    panel.set_chat(chat("Bob"))
+    panel.set_chat(alice)
+    assert panel._webhook.text() == "https://x.test/alice"
+
+
+def test_an_untouched_field_follows_a_change_made_elsewhere(app):
+    panel = ChatConfigPanel()
+    alice = chat("Alice", webhook="https://x.test/alice")
+    panel.set_chat(alice)
+
+    alice.webhook_url = "https://x.test/changed-by-the-engine"
+    panel.set_chat(alice)
+    assert panel._webhook.text() == "https://x.test/changed-by-the-engine"
+
+
+def test_saving_emits_the_chat_it_is_looking_at(app):
+    panel = ChatConfigPanel()
+    saved: list[tuple[str, str]] = []
+    panel.webhook_saved.connect(lambda cid, url: saved.append((cid, url)))
+
+    bob = chat("Bob")
+    panel.set_chat(chat("Alice", webhook="https://x.test/alice"))
+    panel.set_chat(bob)
+    panel._webhook.setText("https://x.test/bob")
+    panel._save_webhook()
+
+    assert saved == [(bob.chat_id, "https://x.test/bob")]
+
+
+# ---------------------------------------------------------------------------
+# Validation and feedback
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("url", [
+    "", "https://example.com/hook", "http://127.0.0.1:8000/x?a=1",
+])
+def test_valid_urls_are_accepted(url):
+    ok, problem = validate_webhook_url(url)
+    assert ok, problem
+
+
+@pytest.mark.parametrize("url,fragment", [
+    ("example.com/hook", "http://"),      # the commonest typo
+    ("htp://example.com", "http://"),
+    ("ftp://example.com/x", "http://"),
+    ("https://", "no host"),
+    ("https://exa mple.com/x", "space"),
+])
+def test_invalid_urls_are_rejected_with_a_reason(url, fragment):
+    ok, problem = validate_webhook_url(url)
+    assert not ok
+    assert fragment in problem
+
+
+def test_an_invalid_url_never_reaches_the_engine(app):
+    panel = ChatConfigPanel()
+    saved: list = []
+    panel.webhook_saved.connect(lambda *a: saved.append(a))
+    panel.set_chat(chat("Alice"))
+
+    panel._webhook.setText("not-a-url")
+    panel._save_webhook()
+
+    assert saved == []
+    assert "http://" in panel._feedback.text()
+
+
+def test_saving_reports_success_then_failure(app):
+    panel = ChatConfigPanel()
+    panel.set_chat(chat("Alice"))
+    panel._webhook.setText("https://x.test/hook")
+    panel._save_webhook()
+    assert "Saved" in panel._feedback.text()
+
+    panel.report_save_failed("MongoDB is unreachable")
+    assert "Not saved" in panel._feedback.text()
+
+
+def test_the_chat_id_is_shown_for_copying(app):
+    panel = ChatConfigPanel()
+    alice = chat("Alice")
+    panel.set_chat(alice)
+    assert panel._storage_values["chat_id"].text() == alice.chat_id
+
+
+# ---------------------------------------------------------------------------
+# The chat list
+# ---------------------------------------------------------------------------
+
+
+def make_list(app, chats) -> ChatListPanel:
+    panel = ChatListPanel()
+    panel.set_chats(chats, whatsapp_found=True)
+    return panel
+
+
+def visible_names(panel: ChatListPanel) -> list[str]:
+    return [panel._list.item(i).data(CHAT_ROLE).chat_name for i in range(panel._list.count())]
+
+
+def test_search_filters_instantly_with_no_refresh(app):
+    panel = make_list(app, [chat("Alice"), chat("Bob"), chat("Alicia"), chat("Team chat")])
+
+    panel._search.setText("ali")           # textChanged fires the filter itself
+    # Compared as a set: the list is ordered by recency, not alphabetically.
+    assert set(visible_names(panel)) == {"Alice", "Alicia"}
+
+    panel._search.setText("")
+    assert len(visible_names(panel)) == 4
+
+
+def test_search_also_matches_the_message_preview(app):
+    panel = make_list(app, [
+        chat("Alice", last_message_preview="see you at six"),
+        chat("Bob", last_message_preview="thanks"),
+    ])
+    panel._search.setText("six")
+    assert visible_names(panel) == ["Alice"]
+
+
+def test_pinned_and_unread_chats_sort_first(app):
+    panel = make_list(app, [
+        chat("Zoe"),
+        chat("Pinned one", is_pinned=True),
+        chat("Unread one", unread_count=4),
+    ])
+    assert visible_names(panel)[:2] == ["Pinned one", "Unread one"]
+
+
+def test_an_unchanged_snapshot_does_not_rebuild_the_list(app):
+    """Rebuilding every three seconds would reset the scroll position and
+    flicker the selection under the user."""
+    chats = [chat("Alice"), chat("Bob")]
+    panel = make_list(app, chats)
+    panel.select_chat(chats[0].chat_id)
+    first_item = panel._list.item(0)
+
+    panel.set_chats(chats, whatsapp_found=True)
+    assert panel._list.item(0) is first_item, "the list was rebuilt for no reason"
+
+    chats[1].unread_count = 2
+    panel.set_chats(chats, whatsapp_found=True)
+    assert panel._list.item(0) is not first_item, "a real change must redraw"
+
+
+def test_selection_survives_a_rebuild(app):
+    chats = [chat("Alice"), chat("Bob")]
+    panel = make_list(app, chats)
+    panel.select_chat(chats[1].chat_id)
+
+    chats[0].last_message_preview = "something new"
+    panel.set_chats(chats, whatsapp_found=True)
+
+    current = panel._list.currentItem()
+    assert current is not None
+    assert current.data(CHAT_ROLE).chat_id == chats[1].chat_id
+
+
+def test_selecting_a_row_announces_the_chat_id(app):
+    chats = [chat("Alice"), chat("Bob")]
+    panel = make_list(app, chats)
+    announced: list[str] = []
+    panel.chat_selected.connect(announced.append)
+
+    # Against the row's own data rather than the input order — the list sorts
+    # by recency, so row 1 is not necessarily chats[1].
+    expected = panel._list.item(1).data(CHAT_ROLE).chat_id
+    panel._list.setCurrentRow(1)
+    assert announced == [expected]
+
+
+def test_the_rail_cannot_be_collapsed(app):
+    panel = ChatListPanel()
+    assert panel.minimumWidth() >= 320
+    assert panel.maximumWidth() <= 560
+
+
+def test_the_status_dot_reflects_the_connection(app):
+    panel = make_list(app, [chat("Alice")])
+    assert theme.ACCENT in panel._status_dot.styleSheet()
+    assert "WhatsApp connected" in panel._profile_meta.text()
+
+    panel.set_chats([chat("Alice")], whatsapp_found=False)
+    assert theme.DANGER in panel._status_dot.styleSheet()
+    assert "waiting for WhatsApp" in panel._profile_meta.text()
+
+
+def test_ctrl_f_focuses_search(app):
+    panel = make_list(app, [chat("Alice")])
+    panel.focus_search()
+    assert panel._search.hasFocus() or panel.focusWidget() is panel._search
+
+
+# ---------------------------------------------------------------------------
+# Theming
+# ---------------------------------------------------------------------------
+
+
+def test_both_themes_produce_a_complete_stylesheet():
+    for scheme in ("dark", "light"):
+        sheet = theme.apply(scheme)
+        assert theme.current_scheme == scheme
+        assert "{{" not in sheet and "}}" not in sheet, "an unformatted brace escaped"
+        # Every colour placeholder resolved to a real value.
+        assert "None" not in sheet
+        assert theme.TEXT and theme.ACCENT and theme.PANEL_BG
+    theme.apply("dark")
+
+
+def test_light_and_dark_actually_differ():
+    dark = theme.apply("dark")
+    dark_text = theme.TEXT
+    light = theme.apply("light")
+    assert theme.TEXT != dark_text
+    assert dark != light
+    theme.apply("dark")
+
+
+def test_a_chats_avatar_colour_is_stable():
+    # The same contact keeps the same colour between runs and across themes,
+    # because it is derived from the name rather than from paint order.
+    first = theme.avatar_color("Aarav Sharma")
+    theme.apply("light")
+    assert theme.avatar_color("Aarav Sharma") == first
+    theme.apply("dark")
+    assert theme.initials("Aarav Sharma") == "AS"
+    assert theme.initials("Papa") == "PA"
+    assert theme.initials("") == "#"

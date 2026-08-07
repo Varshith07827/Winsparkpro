@@ -1,0 +1,2 @@
+# Test + lint dependencies (on top of requirements.txt).
+pytest>=8.0

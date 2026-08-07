@@ -1,0 +1,1 @@
+"""WhatsApp Desktop Automation Manager."""

@@ -1,0 +1,1036 @@
+"""Sending a message — **Option A: Windows UI Automation**.
+
+This is the one supported transport. The sender locates the WhatsApp window,
+the conversation row, the message input and the Send button, and drives them
+through UI Automation patterns. Options B, C and D from the design are
+documented in `docs/SENDING.md`; only A is implemented.
+
+**"UI Automation patterns only, avoid simulated typing wherever possible"** is
+taken literally, and each step is a ladder that starts at the purest UIA
+mechanism and only descends when that mechanism demonstrably fails:
+
+    Opening a chat   Invoke / SelectionItem / LegacyIAccessible  ← pure UIA, no
+                     ↓                                             foreground
+                     verified coordinate click (viewport-checked)
+                     ↓
+                     search box → result row
+
+    Filling input    ValuePattern.SetValue                       ← pure UIA
+                     ↓
+                     clipboard paste (Ctrl+V)                    ← Option C
+                     ↓
+                     per-character Unicode input                 ← last resort
+
+    Sending          InvokePattern on the Send button            ← pure UIA
+                     ↓
+                     Enter keystroke
+
+The descents are not hypothetical. `ValuePattern.SetValue` **silently no-ops**
+on WhatsApp's compose box: it is a contenteditable div, the call reports
+success, and the text never appears. `ValuePattern.Value` reads back a static
+"\\n" regardless of content, so verification has to go through
+`TextPattern.DocumentRange.GetText()`. The ladder keeps the pure path first so
+it starts working the day WhatsApp implements it, without anyone editing this
+file.
+
+Three more behaviours, each earned by a real failure rather than reasoned about:
+
+* **A realized row is not a visible row.** `GridPattern` realizes rows below
+  the viewport with real screen coordinates thousands of pixels down (measured:
+  a 52,927px-tall grid for a 512-chat list on a 1,200px screen). Clicking one
+  clamps the cursor to the screen edge and opens the bottom-most *visible* chat
+  instead. So a coordinate click only happens when the click point is genuinely
+  inside the window, and the resulting conversation is always verified.
+* **Foreground has to be forced and confirmed.** Coordinate clicks and
+  keystrokes go to whatever window the OS considers foreground, not to whatever
+  element UIA points at. Windows refuses `SetForegroundWindow` from a
+  background thread; a phantom ALT tap first makes it succeed.
+* **An empty compose box is the proof of send.** WhatsApp clears the input when
+  a message is actually delivered. "Typed and clicked Send" is not evidence of
+  anything — a send that leaves text in the box is reported as a failure and
+  retried.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import re
+import time
+from dataclasses import dataclass
+from typing import Optional
+
+from wadam.whatsapp.name_rules import chat_names_match, is_system_or_list_view_title
+from wadam.whatsapp.reader import (
+    RECENTS_GRID,
+    SEARCH_RESULTS_GRID,
+    ChatRow,
+    WhatsAppReader,
+    find_chat_grid,
+    get_active_conversation_name_sync,
+    iter_grid_row_controls,
+    read_chat_rows_sync,
+)
+from wadam.whatsapp.row_parser import parse_chat_row
+from wadam.whatsapp.sta_thread import StaAutomationThread
+
+logger = logging.getLogger(__name__)
+
+try:
+    import uiautomation as auto
+    import win32api
+    import win32clipboard
+    import win32con
+    import win32gui
+
+    _UIA_AVAILABLE = True
+except ImportError:  # pragma: no cover - exercised only off-Windows
+    _UIA_AVAILABLE = False
+
+
+class WhatsAppUnavailableError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class SendResult:
+    ok: bool
+    detail: str = ""
+    strategy: str = ""       # which rung of the ladder actually delivered it
+    verified: bool = False   # the compose box was confirmed empty afterwards
+
+    @classmethod
+    def succeeded(cls, strategy: str) -> "SendResult":
+        return cls(ok=True, detail="sent", strategy=strategy, verified=True)
+
+    @classmethod
+    def failed(cls, detail: str, strategy: str = "") -> "SendResult":
+        return cls(ok=False, detail=detail, strategy=strategy)
+
+
+def _require_uia() -> None:
+    if not _UIA_AVAILABLE:
+        raise WhatsAppUnavailableError(
+            "uiautomation + pywin32 are required, and are only available on Windows."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Foreground
+# ---------------------------------------------------------------------------
+
+
+def ensure_foreground(hwnd: int, attempts: int = 5, settle: float = 0.2) -> bool:
+    """Bring `hwnd` to the real OS foreground and CONFIRM it.
+
+    A safety gate, not a nicety: everything that follows a failed foreground
+    change lands on whatever window happens to be on top instead. Callers must
+    abort on False rather than clicking blind."""
+    if not _UIA_AVAILABLE:
+        return False
+    for attempt in range(attempts):
+        if win32gui.GetForegroundWindow() == hwnd:
+            return True
+        try:
+            _force_foreground(hwnd, aggressive=attempt >= 2)
+        except Exception:  # noqa: BLE001 - best effort; verified below
+            pass
+        time.sleep(settle)
+    return win32gui.GetForegroundWindow() == hwnd
+
+
+def _force_foreground(hwnd: int, aggressive: bool = False) -> None:
+    """One attempt at a foreground change, escalating if asked.
+
+    The decisive step is the phantom ALT tap: it makes Windows treat the
+    following `SetForegroundWindow` as user-initiated and lifts the
+    anti-focus-stealing lock that otherwise refuses it from a background thread.
+    Verified on Windows 11 where both a bare `SetForegroundWindow` and the
+    `AttachThreadInput` technique failed — and `AttachThreadInput` combined with
+    the ALT tap actively *prevented* the change, so it is deliberately absent.
+
+    `aggressive` adds a z-order TOPMOST/NOTOPMOST toggle and then a
+    minimize/restore bounce, for machines with a stricter focus-lock policy."""
+    if win32gui.IsIconic(hwnd):
+        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+    if win32gui.GetForegroundWindow() == hwnd:
+        return
+
+    win32api.keybd_event(win32con.VK_MENU, 0, 0, 0)
+    win32api.keybd_event(win32con.VK_MENU, 0, win32con.KEYEVENTF_KEYUP, 0)
+    try:
+        win32gui.SetForegroundWindow(hwnd)
+    except Exception:  # noqa: BLE001 - Windows may still decline; verified by caller
+        pass
+    win32gui.BringWindowToTop(hwnd)
+    if not aggressive or win32gui.GetForegroundWindow() == hwnd:
+        return
+
+    try:
+        flags = win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_SHOWWINDOW
+        win32gui.SetWindowPos(hwnd, win32con.HWND_TOPMOST, 0, 0, 0, 0, flags)
+        win32gui.SetWindowPos(hwnd, win32con.HWND_NOTOPMOST, 0, 0, 0, 0, flags)
+        win32gui.SetForegroundWindow(hwnd)
+    except Exception:  # noqa: BLE001
+        pass
+    if win32gui.GetForegroundWindow() == hwnd:
+        return
+
+    try:
+        win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
+        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        win32gui.SetForegroundWindow(hwnd)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Compose box
+# ---------------------------------------------------------------------------
+
+
+def _find_compose_element(window_handle: int):
+    root = auto.ControlFromHandle(window_handle)
+    if root is None:
+        return None
+    compose = auto.Control(
+        searchFromControl=root, searchDepth=40, ControlType=auto.ControlType.EditControl,
+        RegexName=r"^Type a message",
+    )
+    return compose if compose.Exists(1, 0.2) else None
+
+
+def _read_compose_text(compose) -> str:
+    """The compose box is a contenteditable div: its `ValuePattern.Value` is
+    stale and disconnected (it reads back a static "\\n" whatever the content).
+    `TextPattern.DocumentRange.GetText()` reads it correctly. An empty box also
+    reads as "\\n", so callers must compare against stripped text."""
+    text_pattern = compose.GetPattern(auto.PatternId.TextPattern)
+    if text_pattern is None:
+        return ""
+    return text_pattern.DocumentRange.GetText(-1) or ""
+
+
+def _normalize_compose_text(text: str) -> str:
+    """Make intended text and its compose-box readback comparable.
+
+    Two tolerances, each from a real retry loop:
+
+    * Whitespace collapses to single spaces — the contenteditable does not
+      necessarily store a typed newline as "\\n", so a multi-line reply never
+      verified exactly and was re-sent on every retry.
+    * Emoji-ish characters are ignored on both sides — the box can read an emoji
+      back as U+FFFC (the object-replacement placeholder) or not at all, so a
+      reply containing one failed verification with the text sitting right
+      there. The worst case of ignoring them is a send whose emoji went missing;
+      the alternative was never sending at all."""
+    _ignored = ("￼", "︎", "️")
+    kept = "".join(ch for ch in (text or "") if ord(ch) <= 0xFFFF and ch not in _ignored)
+    return " ".join(kept.split())
+
+
+def _compose_matches(compose, text: str, attempts: int = 5, delay: float = 0.3) -> bool:
+    """Does the box hold `text` yet? Polled, because WhatsApp's React render
+    lags the input and the lag grows with message length — one fixed check
+    passed for short messages and failed for exactly the long ones that
+    matter."""
+    want = _normalize_compose_text(text)
+    for _ in range(max(1, attempts)):
+        time.sleep(delay)
+        if _normalize_compose_text(_read_compose_text(compose)) == want:
+            return True
+    return False
+
+
+def _compose_is_blank(compose) -> bool:
+    """Is the box empty, ignoring what WhatsApp leaves behind?
+
+    Deliberately not `.strip()`: an emptied box reads back as the
+    object-replacement placeholder or a stray variation selector where an emoji
+    used to be, none of which `.strip()` removes. Emptiness is proof-of-send, so
+    a box that never looks empty means every send is reported failed.
+
+    Real emoji are NOT ignored here, unlike in `_normalize_compose_text`: an
+    emoji still in the box means the message is still there."""
+    text = _read_compose_text(compose) or ""
+    leftovers = "￼︎️​‍"
+    return not text.strip(leftovers + " \t\r\n").strip()
+
+
+def _clear_compose(compose) -> None:
+    compose.SetFocus()
+    compose.Click(simulateMove=False)
+    auto.SendKeys("{Ctrl}a", waitTime=0.15)
+    auto.SendKeys("{Delete}", waitTime=0.15)
+    time.sleep(0.2)  # let the clear render before anything reads or types
+
+
+def _try_value_pattern(compose, text: str) -> bool:
+    """Rung 1 — pure UI Automation. Known to no-op on current WhatsApp builds
+    (the call succeeds, the text never appears), which is exactly why the result
+    is verified through TextPattern rather than trusted."""
+    try:
+        pattern = compose.GetPattern(auto.PatternId.ValuePattern)
+        if pattern is None:
+            return False
+        compose.SetFocus()
+        pattern.SetValue(text)
+    except Exception:  # noqa: BLE001
+        return False
+    return _compose_matches(compose, text, attempts=2, delay=0.2)
+
+
+def _read_clipboard_text() -> Optional[str]:
+    for _ in range(5):
+        try:
+            win32clipboard.OpenClipboard()
+        except Exception:  # noqa: BLE001 - another process holds it; back off
+            time.sleep(0.05)
+            continue
+        try:
+            if not win32clipboard.IsClipboardFormatAvailable(win32con.CF_UNICODETEXT):
+                return None
+            return win32clipboard.GetClipboardData(win32con.CF_UNICODETEXT)
+        except Exception:  # noqa: BLE001
+            return None
+        finally:
+            win32clipboard.CloseClipboard()
+    return None
+
+
+def _write_clipboard_text(text: str) -> bool:
+    for _ in range(5):
+        try:
+            win32clipboard.OpenClipboard()
+        except Exception:  # noqa: BLE001
+            time.sleep(0.05)
+            continue
+        try:
+            win32clipboard.EmptyClipboard()
+            win32clipboard.SetClipboardData(win32con.CF_UNICODETEXT, text)
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+        finally:
+            win32clipboard.CloseClipboard()
+    return False
+
+
+def _paste_text(compose, text: str) -> bool:
+    """Rung 2 — clipboard-assisted insertion (design Option C, used here as the
+    fallback it was described as).
+
+    A paste inserts the text verbatim in one action, where per-character typing
+    costs 30ms a character, can drop keystrokes, and turns a newline into a
+    keystroke WhatsApp's compose box doesn't reliably render as a line break.
+
+    The user's own clipboard text is restored afterwards. Non-text clipboard
+    contents (an image, say) cannot be preserved this way and are lost — the
+    trade for being able to insert long text at all. Never raises; returning
+    False just moves to the next rung."""
+    try:
+        previous = _read_clipboard_text()
+        if not _write_clipboard_text(text):
+            return False
+        try:
+            auto.SendKeys("{Ctrl}v", waitTime=0.2)
+            # Polled rather than a single read: a false "paste failed" is
+            # expensive, because the caller then types the message a SECOND time
+            # on top of a paste that actually worked.
+            return _compose_matches(compose, text)
+        finally:
+            if previous is not None:
+                _write_clipboard_text(previous)
+    except Exception:  # noqa: BLE001
+        logger.warning("Pasting into the compose box failed", exc_info=True)
+        return False
+
+
+def _send_unicode_text(text: str, interval: float = 0.03) -> None:
+    """Rung 3 — per-character Unicode input, correctly handling characters above
+    U+FFFF.
+
+    `uiautomation.SendKeys` sends each character as a single 16-bit
+    KEYEVENTF_UNICODE scan code, which silently truncates an astral character
+    like "💖" (U+1F496) to its low 16 bits — confirmed live: it arrived as
+    "\\uf496", a string that matches nothing. Windows represents such characters
+    as a UTF-16 surrogate pair, two 16-bit units each sent as its own event;
+    that's what this does.
+
+    The 30ms interval is measured, not guessed: at 10ms some applications drop
+    keystrokes ("the quick brown fox 12345" arrived in Notepad as "the quick
+    brown oox 55555"); at 30ms the same phrase arrived exactly, repeatedly."""
+    _require_uia()
+    for char in text:
+        codepoint = ord(char)
+        if codepoint > 0xFFFF:
+            codepoint -= 0x10000
+            units = (0xD800 + (codepoint >> 10), 0xDC00 + (codepoint & 0x3FF))
+        else:
+            units = (codepoint,)
+        for unit in units:
+            flag = auto.KeyboardEventFlag.KeyUnicode
+            auto.SendInput(
+                auto.KeyboardInput(0, unit, flag | auto.KeyboardEventFlag.KeyDown),
+                auto.KeyboardInput(0, unit, flag | auto.KeyboardEventFlag.KeyUp),
+            )
+        time.sleep(interval)
+
+
+def set_compose_text_sync(window_handle: int, text: str) -> tuple[bool, str]:
+    """Put `text` into the compose box, climbing down the ladder until one rung
+    verifies. Returns (ok, strategy)."""
+    _require_uia()
+    compose = _find_compose_element(window_handle)
+    if compose is None:
+        return False, ""
+
+    # Rung 1 needs no foreground at all — try it before disturbing the desktop.
+    if text and _try_value_pattern(compose, text):
+        return True, "uia-value-pattern"
+
+    if not ensure_foreground(window_handle):
+        logger.warning("WhatsApp is not in the foreground; not typing (input would go elsewhere)")
+        return False, ""
+
+    try:
+        # Already correct (a retry after a send that didn't take)? Leave it —
+        # re-inserting risks losing it or doubling it up.
+        if text and _normalize_compose_text(_read_compose_text(compose)) == _normalize_compose_text(text):
+            return True, "already-present"
+
+        compose.SetFocus()
+        compose.Click(simulateMove=False)
+
+        if not _compose_is_blank(compose):
+            _clear_compose(compose)
+
+        if not text:
+            return True, "cleared"
+
+        if _paste_text(compose, text):
+            return True, "clipboard-paste"
+
+        logger.warning("compose: paste did not verify — falling back to per-character input")
+        # The paste may have landed partially, or fully with a readback too slow
+        # to confirm. Typing now would append to it and leave the message
+        # doubled, so the fallback starts from an empty box.
+        if not _compose_is_blank(compose):
+            _clear_compose(compose)
+        _send_unicode_text(text)
+        if _compose_matches(compose, text):
+            return True, "unicode-input"
+        return False, ""
+    except Exception:  # noqa: BLE001
+        logger.warning("Failed to set compose box text", exc_info=True)
+        return False, ""
+
+
+def _find_send_button(window_handle: int):
+    """WhatsApp's Send button, which appears beside the compose box once it has
+    text. A ButtonControl named exactly "Send" exposing InvokePattern. Anchored
+    to `^Send$` so it can't match "Send document" in the attach menu."""
+    root = auto.ControlFromHandle(window_handle)
+    if root is None:
+        return None
+    button = auto.Control(
+        searchFromControl=root, searchDepth=40,
+        ControlType=auto.ControlType.ButtonControl, RegexName=r"^Send$",
+    )
+    return button if button.Exists(1, 0.2) else None
+
+
+def invoke_send_button_sync(window_handle: int) -> bool:
+    """Send by INVOKING the Send button — the reliable path, and the pure-UIA
+    one. Invoke is delivered straight to the control, so it doesn't depend on
+    the OS foreground window, on the caret sitting inside the contenteditable,
+    or on a keystroke arriving at all: the three things that made Enter
+    silently no-op, leaving a message typed but unsent."""
+    _require_uia()
+    button = _find_send_button(window_handle)
+    if button is None:
+        logger.warning("send: no Send button found — falling back to Enter")
+        return False
+    try:
+        pattern = button.GetPattern(auto.PatternId.InvokePattern)
+        if pattern is None:
+            return False
+        pattern.Invoke()
+        return True
+    except Exception:  # noqa: BLE001
+        logger.warning("Failed to invoke the Send button", exc_info=True)
+        return False
+
+
+def press_enter_sync(window_handle: int) -> bool:
+    """Fallback send: place the caret in the box and press Enter. `SetFocus`
+    alone is not enough — a physical click is what actually puts the caret
+    inside the contenteditable so WhatsApp treats Enter as "send"."""
+    _require_uia()
+    compose = _find_compose_element(window_handle)
+    if compose is None:
+        return False
+    if not ensure_foreground(window_handle):
+        logger.warning("WhatsApp is not in the foreground; not pressing Enter")
+        return False
+    try:
+        compose.SetFocus()
+        compose.Click(simulateMove=False)
+        time.sleep(0.1)
+        auto.SendKeys("{Enter}", waitTime=0.15)
+        return True
+    except Exception:  # noqa: BLE001
+        logger.warning("Failed to press Enter in the compose box", exc_info=True)
+        return False
+
+
+def compose_is_empty_sync(window_handle: int) -> bool:
+    _require_uia()
+    compose = _find_compose_element(window_handle)
+    if compose is None:
+        return False
+    try:
+        return _compose_is_blank(compose)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def read_compose_text_sync(window_handle: int) -> str:
+    _require_uia()
+    compose = _find_compose_element(window_handle)
+    if compose is None:
+        return ""
+    try:
+        return _read_compose_text(compose)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# Search box
+# ---------------------------------------------------------------------------
+
+
+# WhatsApp's chat search matches on the name TEXT, and typing an emoji into it
+# can filter to nothing — so "Papa 💜" is searched as "Papa" and results are
+# still matched against the full original name.
+_EMOJI_RE = re.compile(
+    "[\U0001F000-\U0001FAFF\U00002600-\U000027BF\U00002190-\U000021FF"
+    "\U00002B00-\U00002BFF\U0000FE00-\U0000FE0F\U0000200D\U000024C2\U0000203C\U00002049]+"
+)
+
+
+def _search_query(name: str) -> str:
+    cleaned = re.sub(r"\s+", " ", _EMOJI_RE.sub("", name or "")).strip()
+    return cleaned or (name or "").strip()
+
+
+def _find_search_box(window_handle: int):
+    """WhatsApp's chat-search box. Empty, its accessible name is "Search or
+    start a new chat"; with a query typed the name becomes the query, so the
+    empty-state match alone isn't enough. The fallback takes the top-most edit
+    control that isn't the compose box or the locked-chats search."""
+    from wadam.whatsapp.reader import _safe_children, _safe_control_type, _safe_name
+
+    root = auto.ControlFromHandle(window_handle)
+    if root is None:
+        return None
+
+    box = auto.Control(
+        searchFromControl=root, searchDepth=40, ControlType=auto.ControlType.EditControl,
+        RegexName=r"^Search or start",
+    )
+    if box.Exists(2, 0.3):
+        return box
+
+    best = None
+    best_top = None
+
+    def walk(ctrl, depth=0):
+        nonlocal best, best_top
+        if depth > 40:
+            return
+        if _safe_control_type(ctrl) == "EditControl":
+            name = _safe_name(ctrl)
+            if not name.startswith("Type a message") and name != "Search locked chats":
+                try:
+                    top = ctrl.BoundingRectangle.top
+                except Exception:  # noqa: BLE001
+                    top = 0
+                if best_top is None or top < best_top:
+                    best_top, best = top, ctrl
+        for child in _safe_children(ctrl):
+            walk(child, depth + 1)
+
+    walk(root)
+    return best
+
+
+def _search_box_query(window_handle: int) -> str:
+    """What's currently typed in the search box. `ValuePattern.Value` holds the
+    query — the box's Name stays empty even with a query typed — which makes
+    this the reliable "is a search active?" signal, unlike the "Search results."
+    grid that recent builds don't expose at all while searching."""
+    _require_uia()
+    box = _find_search_box(window_handle)
+    if box is None:
+        return ""
+    try:
+        value_pattern = box.GetPattern(auto.PatternId.ValuePattern)
+        if value_pattern is not None:
+            return (value_pattern.Value or "").strip()
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
+def clear_search_sync(window_handle: int) -> None:
+    """Leave an active search so WhatsApp returns to the recents list.
+
+    Gated on the search box actually HAVING a query, so this never presses
+    Escape while a normal chat is open with an empty box (which would close the
+    chat)."""
+    _require_uia()
+    if not _search_box_query(window_handle):
+        return
+    if not ensure_foreground(window_handle):
+        return
+    box = _find_search_box(window_handle)
+    try:
+        if box is not None:
+            box.Click(simulateMove=False)
+        auto.SendKeys("{Ctrl}a", waitTime=0.1)
+        auto.SendKeys("{Delete}", waitTime=0.1)
+        auto.SendKeys("{Esc}", waitTime=0.1)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def search_and_read_rows_sync(window_handle: int, query: str) -> list[ChatRow]:
+    """Type `query` into the search box and read the results grid. Leaves the
+    search active so the caller can open the result (opening a chat clears the
+    search by itself)."""
+    _require_uia()
+    if not ensure_foreground(window_handle):
+        return []
+    box = _find_search_box(window_handle)
+    if box is None:
+        return []
+    search_text = _search_query(query)
+    try:
+        box.SetFocus()
+        box.Click(simulateMove=False)
+        auto.SendKeys("{Ctrl}a", waitTime=0.1)
+        auto.SendKeys("{Delete}", waitTime=0.1)
+        if search_text:
+            _send_unicode_text(search_text)
+            time.sleep(0.2)
+        time.sleep(1.2)  # let the filtered results populate
+    except Exception:  # noqa: BLE001
+        logger.warning("WhatsApp search typing failed", exc_info=True)
+        return []
+    return read_chat_rows_sync(window_handle, SEARCH_RESULTS_GRID)
+
+
+# ---------------------------------------------------------------------------
+# Opening a chat
+# ---------------------------------------------------------------------------
+
+
+def _digits(value: str) -> str:
+    return re.sub(r"\D", "", value or "")
+
+
+def _phone_key(value: str) -> str:
+    """A comparable key for a phone number: its last 10 digits, so
+    "+1 (555) 010-9423", "15550109423" and "5550109423" all match. Empty for anything that
+    isn't phone-number-like."""
+    digits = _digits(value)
+    if len(digits) < 7:
+        return ""
+    non_phone = re.sub(r"[\d+\-\s().]", "", value or "")
+    if len(non_phone) > 2:
+        return ""
+    return digits[-10:]
+
+
+def looks_like_phone_number(value: str) -> bool:
+    return _phone_key(value) != ""
+
+
+def match_chat_row(rows: list[ChatRow], chat_name: str) -> Optional[ChatRow]:
+    """Exact name first, then truncation-tolerant, then — for a phone number —
+    by digits."""
+    target = chat_name.strip().lower()
+    for row in rows:
+        if row.chat_name.strip().lower() == target:
+            return row
+    for row in rows:
+        if chat_names_match(chat_name, row.chat_name):
+            return row
+    key = _phone_key(chat_name)
+    if key:
+        for row in rows:
+            if _phone_key(row.chat_name) == key or key in _digits(row.raw_text):
+                return row
+    return None
+
+
+def _first_real_result(rows: list[ChatRow]) -> Optional[ChatRow]:
+    from wadam.whatsapp.reader import _is_search_section_header
+
+    for row in rows:
+        name = (row.chat_name or "").strip()
+        if name and not is_system_or_list_view_title(name) and not _is_search_section_header(name):
+            return row
+    return None
+
+
+def _row_matches_chat(row_raw_text: str, chat_name: str) -> bool:
+    if not chat_name:
+        return False
+    parsed = parse_chat_row(row_raw_text).get("chat_name", "")
+    return parsed.strip().lower() == chat_name.strip().lower() or chat_names_match(chat_name, parsed)
+
+
+def _find_row_item(chat_list, row_raw_text: str, chat_name: str):
+    for item in iter_grid_row_controls(chat_list):
+        name = (item.Name or "").strip()
+        if not name:
+            continue
+        if name == row_raw_text.strip() or _row_matches_chat(name, chat_name):
+            return item
+    return None
+
+
+def _activate_via_pattern(item) -> str:
+    """Open a chat row through UI Automation alone — no foreground change, no
+    mouse. Returns the pattern that worked, or "" if none did.
+
+    This is the preferred path and the reason the coordinate click below is a
+    fallback rather than the mechanism: a pattern activation cannot land on the
+    wrong row, and it works with WhatsApp behind other windows."""
+    for pattern_id, name, call in (
+        (auto.PatternId.InvokePattern, "invoke", lambda p: p.Invoke()),
+        (auto.PatternId.SelectionItemPattern, "selection-item", lambda p: p.Select()),
+        (auto.PatternId.LegacyIAccessiblePattern, "legacy-default-action",
+         lambda p: p.DoDefaultAction()),
+    ):
+        try:
+            pattern = item.GetPattern(pattern_id)
+            if pattern is None:
+                continue
+            call(pattern)
+            return name
+        except Exception:  # noqa: BLE001 - pattern present but unsupported here
+            continue
+    return ""
+
+
+def _click_point_inside(item, container, window_handle: int) -> bool:
+    """Whether clicking the item's centre would actually hit it.
+
+    The container grid's rectangle is NOT the viewport — Chromium reports the
+    full virtual scroll content. A realized-but-scrolled-away row has real
+    coordinates thousands of pixels below the window; clicking there clamps the
+    cursor to the screen edge and hits the bottom-most visible row instead. So
+    the test is against the intersection of the grid's rect and the window's
+    actual on-screen rect."""
+    try:
+        r = item.BoundingRectangle
+        c = container.BoundingRectangle
+        win_left, win_top, win_right, win_bottom = win32gui.GetWindowRect(window_handle)
+    except Exception:  # noqa: BLE001 - stale element / dead window
+        return False
+    if r.bottom - r.top < 8:
+        return False  # collapsed/zero-height row — nothing real to click
+
+    visible_left = max(c.left, win_left)
+    visible_top = max(c.top, win_top)
+    visible_right = min(c.right, win_right)
+    visible_bottom = min(c.bottom, win_bottom)
+    center_x = (r.left + r.right) // 2
+    center_y = (r.top + r.bottom) // 2
+    return visible_left <= center_x <= visible_right and (visible_top + 2) <= center_y <= (visible_bottom - 2)
+
+
+def _click_item(item) -> bool:
+    try:
+        item.Click(simulateMove=False)
+        return True
+    except Exception:  # noqa: BLE001
+        logger.warning("Failed to click chat row", exc_info=True)
+        return False
+
+
+def chat_already_open(window_handle: int, target: str) -> bool:
+    """Is `target` ALREADY the open conversation? A cheap accessibility read
+    with no foreground change, so an open/send can short-circuit instead of
+    trying (and possibly failing) to re-foreground the window."""
+    if not target:
+        return False
+    active = get_active_conversation_name_sync(window_handle)
+    if active and (active.strip().lower() == target.strip().lower() or chat_names_match(target, active)):
+        return True
+    return _conversation_header_matches(window_handle, target)
+
+
+def _opened_chat_matches(window_handle: int, target: str) -> bool:
+    """Confirm a click/invoke actually opened `target`, by reading which
+    conversation the compose box now belongs to — and, when there is no compose
+    box at all (announcement/read-only groups have none), by the conversation
+    header instead."""
+    if not target:
+        return True  # nothing to verify against — trust the activation
+    time.sleep(0.5)  # the compose placeholder swaps shortly after
+    active = get_active_conversation_name_sync(window_handle)
+    if active and (active.strip().lower() == target.strip().lower() or chat_names_match(target, active)):
+        return True
+    return _conversation_header_matches(window_handle, target)
+
+
+def _conversation_header_matches(window_handle: int, target: str) -> bool:
+    """Whether the open conversation's header carries `target` as its title. The
+    header glues the title to a status line, so a prefix match is accepted —
+    safe because the scan is confined to the header strip of the right panel."""
+    root = auto.ControlFromHandle(window_handle)
+    if root is None:
+        return False
+    try:
+        win_left, win_top, win_right, _bottom = win32gui.GetWindowRect(window_handle)
+    except Exception:  # noqa: BLE001
+        return False
+    header_bottom = win_top + 170
+    divider_x = win_left + (win_right - win_left) // 3  # right of the chat-list panel
+    wanted = target.strip().lower()
+    found: list[bool] = []
+
+    def walk(ctrl, depth: int = 0) -> None:
+        if found or depth > 40:
+            return
+        try:
+            control_type = ctrl.ControlTypeName
+        except Exception:  # noqa: BLE001 - stale element
+            return
+        if control_type in ("TextControl", "ButtonControl"):
+            try:
+                rect = ctrl.BoundingRectangle
+                name = (ctrl.Name or "").strip()
+            except Exception:  # noqa: BLE001
+                rect, name = None, ""
+            if rect is not None and name and rect.top < header_bottom and rect.left > divider_x:
+                low = name.lower()
+                if low == wanted or low.startswith(wanted + " ") or chat_names_match(target, name):
+                    found.append(True)
+                    return
+        try:
+            children = ctrl.GetChildren()
+        except Exception:  # noqa: BLE001
+            return
+        for child in children:
+            walk(child, depth + 1)
+
+    walk(root)
+    return bool(found)
+
+
+def open_chat_sync(window_handle: int, row_raw_text: str, chat_name: str = "") -> bool:
+    """Open `chat_name`'s conversation, verified.
+
+    Order: already open → UIA pattern activation → viewport-checked coordinate
+    click → search box. Every path that isn't "already open" is verified against
+    the now-active conversation, so a wrong activation can't masquerade as a
+    successful open."""
+    _require_uia()
+    target = chat_name.strip() or parse_chat_row(row_raw_text).get("chat_name", "")
+
+    if target and chat_already_open(window_handle, target):
+        return True
+
+    for grid_name in (RECENTS_GRID, SEARCH_RESULTS_GRID):
+        chat_list = find_chat_grid(window_handle, grid_name)
+        if chat_list is None:
+            continue
+        item = _find_row_item(chat_list, row_raw_text, chat_name)
+        if item is None:
+            continue
+        # Pure UIA first: no foreground change, no mouse, cannot hit the wrong
+        # row even when the sidebar is scrolled elsewhere.
+        pattern = _activate_via_pattern(item)
+        if pattern and _opened_chat_matches(window_handle, target):
+            logger.debug("opened %r via %s", target, pattern)
+            return True
+        if not ensure_foreground(window_handle):
+            logger.warning("WhatsApp is not in the foreground; not clicking the chat row")
+            return False
+        if not _click_point_inside(item, chat_list, window_handle):
+            break  # scrolled out of view — search brings it on screen
+        if _click_item(item) and _opened_chat_matches(window_handle, target):
+            return True
+        break  # activated but landed wrong — recover via search
+
+    if not target:
+        return False
+    search_and_read_rows_sync(window_handle, target)
+    grid = find_chat_grid(window_handle, SEARCH_RESULTS_GRID)
+    if grid is None:
+        return False
+    item = _find_row_item(grid, row_raw_text, target)
+    if item is None:
+        return False
+    pattern = _activate_via_pattern(item)
+    if pattern and _opened_chat_matches(window_handle, target):
+        return True
+    if not _click_point_inside(item, grid, window_handle):
+        return False
+    if not _click_item(item):
+        return False
+    return _opened_chat_matches(window_handle, target)
+
+
+# ---------------------------------------------------------------------------
+# The async surface
+# ---------------------------------------------------------------------------
+
+
+class WhatsAppSender:
+    def __init__(self, reader: WhatsAppReader, sta: StaAutomationThread) -> None:
+        self._reader = reader
+        self._sta = sta  # must be the same STA thread the reader uses
+
+    async def resolve_chat_row_async(self, chat_name: str):
+        """Find the chat: in the recents sidebar first, then — only if it isn't
+        visible there — via the search box, so the common case never disturbs
+        WhatsApp's UI. Returns (window_handle, ChatRow|None)."""
+        window_handle = await self._reader.find_window_async()
+        if window_handle is None:
+            return None, None
+
+        rows = await self._reader.read_chat_rows_async(window_handle)
+        match = match_chat_row(rows, chat_name)
+        if match is not None:
+            return window_handle, match
+
+        results = await self._sta.invoke_async(
+            lambda: search_and_read_rows_sync(window_handle, chat_name)
+        )
+        match = match_chat_row(results, chat_name)
+        if match is not None:
+            return window_handle, match
+
+        # A saved contact's search result shows the contact's NAME, not the
+        # number, so digit matching finds nothing. A search for a specific
+        # number is unambiguous, so take the top real result.
+        if looks_like_phone_number(chat_name):
+            top = _first_real_result(results)
+            if top is not None:
+                return window_handle, top
+
+        await self._sta.invoke_async(lambda: clear_search_sync(window_handle))
+        return window_handle, None
+
+    async def open_and_read_async(self, chat_name: str, limit: int = 25):
+        """Open a chat and read its recent messages. Holds the action lock for
+        the whole sequence — opening a chat is exactly the operation that, run
+        mid-send, made a message land in the wrong conversation."""
+        async with self._sta.action_lock:
+            window_handle, row = await self.resolve_chat_row_async(chat_name)
+            if window_handle is None or row is None:
+                return None, []
+            opened = await self._sta.invoke_async(
+                lambda: open_chat_sync(window_handle, row.raw_text, chat_name)
+            )
+            if not opened:
+                return window_handle, []
+            await asyncio.sleep(0.4)  # let the conversation render
+            messages = await self._reader.read_recent_messages_async(window_handle, limit)
+            return window_handle, messages
+
+    async def send_async(self, chat_name: str, message_text: str) -> SendResult:
+        """Send `message_text` to `chat_name`, verified.
+
+        The ENTIRE sequence runs under the action lock so nothing else can
+        change the open chat or steal foreground between open → fill → send."""
+        if not (message_text or "").strip():
+            return SendResult.failed("Nothing to send (the reply was empty).")
+        async with self._sta.action_lock:
+            return await self._send_locked(chat_name, message_text)
+
+    async def _send_locked(self, chat_name: str, message_text: str) -> SendResult:
+        window_handle, row = await self.resolve_chat_row_async(chat_name)
+        if window_handle is None:
+            return SendResult.failed("WhatsApp Desktop is not running.")
+        if row is None:
+            return SendResult.failed(f"Chat '{chat_name}' could not be found.")
+
+        opened = await self._sta.invoke_async(
+            lambda: open_chat_sync(window_handle, row.raw_text, chat_name)
+        )
+        if not opened:
+            return SendResult.failed(f"Could not open chat '{chat_name}'.")
+
+        await asyncio.sleep(0.3)  # let the compose box swap to the new conversation
+
+        active = await self._reader.get_active_conversation_name_async(window_handle)
+        if active is None and not await self._sta.invoke_async(
+            lambda: _conversation_header_matches(window_handle, chat_name)
+        ):
+            return SendResult.failed("Compose box not found after opening the chat.")
+
+        filled, strategy = await self._sta.invoke_async(
+            lambda: set_compose_text_sync(window_handle, message_text)
+        )
+        if not filled:
+            # Clear up after a PARTIAL fill too: returning straight out leaves
+            # whatever landed sitting in the box for the user to find, and the
+            # next attempt appends to it.
+            await self._sta.invoke_async(lambda: set_compose_text_sync(window_handle, ""))
+            return SendResult.failed("Could not put the message into the compose box.")
+
+        last_problem = ""
+        for attempt in range(3):
+            invoked = await self._sta.invoke_async(lambda: invoke_send_button_sync(window_handle))
+            how = "send-button-invoke"
+            if not invoked:
+                how = "enter-key"
+                invoked = await self._sta.invoke_async(lambda: press_enter_sync(window_handle))
+            if not invoked:
+                last_problem = "no Send button, and Enter could not be delivered"
+            else:
+                # WhatsApp clears the compose box when a message is actually
+                # delivered — that empty box is the proof. Polled, because the
+                # clear lags the click. "Still has text" is a genuine failure,
+                # not a soft success: reporting it as sent is how a typed-but-
+                # unsent message gets marked SENT and never retried.
+                for _ in range(10):
+                    await asyncio.sleep(0.25)
+                    if await self._sta.invoke_async(lambda: compose_is_empty_sync(window_handle)):
+                        return SendResult.succeeded(f"{strategy} + {how}")
+                leftover = await self._sta.invoke_async(
+                    lambda: read_compose_text_sync(window_handle)
+                )
+                # Codepoints, because "still had text" alone can't distinguish
+                # "it never sent" from "an invisible leftover makes an empty box
+                # look full" — and those need opposite fixes.
+                logger.warning(
+                    "send: box not empty after %s — %d chars, codepoints %s",
+                    how, len(leftover), [hex(ord(c)) for c in leftover[:12]],
+                )
+                last_problem = f"the compose box still had text after {how}"
+
+            if attempt < 2:
+                logger.warning("send attempt %d did not clear the box (%s) — retrying",
+                               attempt + 1, last_problem)
+                current = await self._sta.invoke_async(lambda: read_compose_text_sync(window_handle))
+                # Normalized, not exact: an exact compare never matched a
+                # multi-line message, so every attempt re-inserted the whole
+                # thing instead of just pressing Send again.
+                if _normalize_compose_text(current) != _normalize_compose_text(message_text):
+                    await self._sta.invoke_async(
+                        lambda: set_compose_text_sync(window_handle, message_text)
+                    )
+
+        # Leave nothing half-written in the chat for the user to find (or for
+        # the next message to be appended to).
+        await self._sta.invoke_async(lambda: set_compose_text_sync(window_handle, ""))
+        return SendResult.failed(f"Message was composed but not sent — {last_problem}.", strategy)

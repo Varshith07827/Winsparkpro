@@ -1,0 +1,29 @@
+# WhatsApp Desktop Automation Manager — runtime dependencies.
+#
+#   python -m venv .venv
+#   .venv\Scripts\activate
+#   python -m pip install -r requirements.txt
+
+# Windows UI Automation — the ONLY supported message transport (Option A).
+uiautomation>=2.0; sys_platform == "win32"
+pywin32>=306; sys_platform == "win32"
+
+# Window/process discovery (finding WhatsApp.exe).
+psutil>=5.9
+
+# Primary datastore. The [srv] extra pulls in dnspython, which pymongo REQUIRES
+# to resolve a mongodb+srv:// (Atlas) address — without it every Atlas
+# connection string fails no matter how correct it is.
+pymongo[srv]>=4.6
+
+# Verifies the TLS certificate Atlas presents on images whose OS trust store is
+# incomplete. Used when present, skipped when not.
+certifi
+
+# The desktop UI. 6.5 is the floor: QStyleHints.colorScheme(), which the
+# light/dark theme follows, arrived in that release.
+PySide6>=6.5
+
+# .env loading. The parser in wadam/config.py is used if this is absent, so a
+# missing optional dependency can never stop the application from starting.
+python-dotenv>=1.0

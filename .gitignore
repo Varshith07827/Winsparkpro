@@ -1,0 +1,14 @@
+# Configuration holds credentials — the example is committed, the real one is not.
+.env
+
+# The JSON mirror and diagnostic logs are runtime state, not source.
+data/
+*.log
+
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+build/
+dist/
+*.spec
