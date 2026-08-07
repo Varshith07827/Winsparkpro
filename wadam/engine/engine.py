@@ -116,7 +116,8 @@ class AutomationEngine:
 
         self._sta = StaAutomationThread()
         self._reader = WhatsAppReader(self._sta, settings.whatsapp_window_title)
-        self._sender = WhatsAppSender(self._reader, self._sta)
+        self._sender = WhatsAppSender(self._reader, self._sta,
+                                      use_clipboard=settings.sender_use_clipboard)
         self._webhook = WebhookClient(
             api_key=settings.webhook_api_key,
             timeout=settings.webhook_timeout,

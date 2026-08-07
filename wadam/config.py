@@ -84,6 +84,9 @@ class Settings:
     webhook_max_retries: int = 3
 
     whatsapp_window_title: str = "WhatsApp"
+    # Paste is faster and does not drop characters, but borrows the
+    # clipboard for a moment. Off = per-character input, clipboard untouched.
+    sender_use_clipboard: bool = True
     log_level: str = "INFO"
 
     # The relay: GET each automated chat's webhook and send what comes back.
@@ -124,6 +127,7 @@ class Settings:
             "webhook_max_retries": self.webhook_max_retries,
             "whatsapp_window_title": self.whatsapp_window_title,
             "log_level": self.log_level,
+            "sender_use_clipboard": self.sender_use_clipboard,
             "poll_interval_seconds": self.poll_interval_seconds,
             "relay_enabled": self.relay_enabled,
             "relay_poll_interval": self.relay_poll_interval,
@@ -201,7 +205,7 @@ def load_settings(env_path: Optional[Path] = None) -> Settings:
         "DEFAULT_WEBHOOK", "WEBHOOK_API_KEY", "WEBHOOK_TIMEOUT", "WEBHOOK_MAX_RETRIES",
         "WHATSAPP_WINDOW_TITLE", "LOG_LEVEL", "POLL_INTERVAL",
         "API_HOST", "API_PORT", "API_TOKEN", "API_SEND_TIMEOUT",
-        "RELAY_ENABLED", "RELAY_POLL_INTERVAL",
+        "RELAY_ENABLED", "RELAY_POLL_INTERVAL", "SENDER_USE_CLIPBOARD",
     ):
         if os.environ.get(key):
             values[key] = os.environ[key]
@@ -286,6 +290,9 @@ def load_settings(env_path: Optional[Path] = None) -> Settings:
                     f"can send WhatsApp messages as you."
                 )
 
+    raw_clipboard = (values.get("SENDER_USE_CLIPBOARD") or "").strip().lower()
+    sender_use_clipboard = raw_clipboard not in {"0", "false", "no", "off"}
+
     poll_raw = (values.get("POLL_INTERVAL") or "").strip()
     if poll_raw and poll_raw != str(POLL_INTERVAL_SECONDS):
         warnings.append(
@@ -307,6 +314,7 @@ def load_settings(env_path: Optional[Path] = None) -> Settings:
         webhook_max_retries=max_retries,
         whatsapp_window_title=(values.get("WHATSAPP_WINDOW_TITLE") or "WhatsApp").strip(),
         log_level=log_level,
+        sender_use_clipboard=sender_use_clipboard,
         relay_enabled=relay_enabled,
         relay_poll_interval=relay_poll_interval,
         api_host=api_host,

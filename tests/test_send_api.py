@@ -635,3 +635,68 @@ def test_a_hand_set_contact_id_is_never_overwritten(tmp_path: Path):
 
     assert repository.get_chat(chat_id_for("Aarav Sharma")).external_id == "7777"
     repository.stop()
+
+
+# ---------------------------------------------------------------------------
+# Transport contract + capability probing
+# ---------------------------------------------------------------------------
+
+
+def test_the_sender_satisfies_the_transport_protocol():
+    """The pipeline, relay and send API all talk to a Transport, not to
+    WhatsApp. If that ever stops being true, swapping in a Business Platform
+    transport becomes a rewrite instead of a class."""
+    from wadam.whatsapp.transport import Transport
+
+    assert hasattr(Transport, "send")
+    # A structural check rather than an isinstance one: WhatsAppSender needs a
+    # live STA thread to construct, and the point is the shape, not the object.
+    from wadam.whatsapp.sender import WhatsAppSender
+
+    assert callable(getattr(WhatsAppSender, "send_async"))
+    assert callable(getattr(WhatsAppSender, "capabilities"))
+
+
+def test_transport_capabilities_describe_the_cost_to_the_user():
+    from wadam.whatsapp.transport import TransportCapabilities
+
+    uia = TransportCapabilities(
+        name="Windows UI Automation", requires_foreground=True, moves_cursor=True,
+        uses_clipboard=True, requires_interactive_desktop=True,
+        requires_whatsapp_running=True)
+    text = uia.describe()
+    assert "foreground" in text and "cursor" in text
+
+    api = TransportCapabilities(
+        name="Business Platform", requires_foreground=False, moves_cursor=False,
+        uses_clipboard=False, requires_interactive_desktop=False,
+        requires_whatsapp_running=False)
+    assert "no user-visible effect" in api.describe()
+
+
+def test_capabilities_cache_is_keyed_on_the_whatsapp_version(tmp_path: Path):
+    """A WhatsApp update must invalidate the probe. Otherwise the day the
+    provider starts implementing ValuePattern, this application keeps typing
+    character by character forever."""
+    from wadam.whatsapp.capabilities import Capabilities, CapabilityStore
+
+    store = CapabilityStore(tmp_path / "caps.json")
+    store.save(Capabilities(whatsapp_version="2.2630.102.0", value_pattern_write=False))
+
+    reloaded = CapabilityStore(tmp_path / "caps.json").load()
+    assert reloaded is not None
+    assert reloaded.whatsapp_version == "2.2630.102.0"
+    assert reloaded.headless_send_possible is False
+
+    # A working ValuePattern is what "headless" means, by either route.
+    assert Capabilities(value_pattern_write=True).headless_send_possible is True
+    assert Capabilities(legacy_set_value=True).headless_send_possible is True
+
+
+def test_the_capability_summary_states_the_verdict_plainly():
+    from wadam.whatsapp.capabilities import Capabilities
+
+    blocked = Capabilities(whatsapp_version="2.2630.102.0")
+    assert "unavailable" in blocked.summary() and "discards" in blocked.summary()
+    working = Capabilities(whatsapp_version="9.9", value_pattern_write=True)
+    assert "AVAILABLE" in working.summary()

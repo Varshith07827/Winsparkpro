@@ -90,7 +90,41 @@ The compose box reports `ValuePattern.IsReadOnly = False` and
 `IsKeyboardFocusable = True`. The chat row reports
 `LegacyIAccessible.DefaultAction = "Double Click"`.
 
-### 2.2 What those patterns actually do
+### 2.2 Verified at the COM layer, not through the Python wrapper
+
+A fair objection to §2.3 below: `uiautomation` is a wrapper, and wrappers
+introduce their own bugs. So the same calls were repeated through **raw
+`IUIAutomation` COM via comtypes**, with HRESULTs inspected rather than
+swallowed:
+
+```
+IUIAutomation created via CLSID_CUIAutomation      ok
+element:  'Type a message to Varshith'             found by COM FindAll
+IUIAutomationValuePattern::SetValue("…")           returned S_OK, no COMError
+CurrentIsReadOnly                                  0  (writable)
+CurrentValue after the call                        '
+'   ← unchanged
+IUIAutomationLegacyIAccessiblePattern::SetValue    returned S_OK, no COMError
+CurrentValue after the call                        '
+'   ← unchanged
+```
+
+**The wrapper is exonerated.** The provider returns `S_OK` from a method it does
+not implement, on a control it reports as writable. Nothing in the Python layer
+is hiding an error, because there is no error to hide — which is worse, since
+there is nothing for a caller to detect.
+
+Two side observations from the COM walk, both relevant to reliability:
+
+* `FindAll` for edit controls returned **158 elements**, with
+  `'Type a message to Varshith'` appearing about fifteen times. WhatsApp
+  publishes its accessibility tree many times over — the same duplication the
+  message reader already deduplicates by screen position.
+* The window is `WhatsApp Beta`, package `5319275A.WhatsAppDesktop`
+  **2.2630.102.0** — an MSIX Store app hosting Chromium, not Electron. There is
+  no `--remote-debugging-port`, and nothing listens on 9222/9223.
+
+### 2.3 What those patterns actually do
 
 Every write/action pattern was invoked against the live window:
 
@@ -329,9 +363,11 @@ That one is a security boundary and should not be worked around.
 | Approach | Verdict |
 |---|---|
 | **UI Automation** (current) | Best available. Reading is complete and free; writing is limited by the provider |
-| **Legacy IAccessible / MSAA** | Tested. `SetValue` and `DoDefaultAction` both no-op — it is the same provider behind a different interface |
+| **Legacy IAccessible / MSAA** | Tested through the wrapper *and* raw COM. `SetValue` and `DoDefaultAction` both no-op — same provider, different interface |
+| **Raw UIAutomationCore COM (comtypes)** | Tested. Identical behaviour to the wrapper: `S_OK`, no effect. The limitation is not in the binding |
 | **`SendMessage` / `PostMessage`** | Tested, no effect. One HWND for all content; there is nothing to address |
-| **WinAppDriver** | Wraps the same UIA provider, so it inherits the same no-ops, and it is archived/unmaintained. Adds a service dependency for no capability gain |
+| **WinAppDriver** | Not installed on this machine, and would not help: it is a WebDriver front end over the *same* `IUIAutomation` provider proved above to no-op. Its `sendKeys` is `SendInput` — the identical focus requirement — and its `click` is a coordinate click. Archived by Microsoft. A service dependency for no capability gain |
+| **Inspect.exe / Accessibility Insights** | Neither is installed (no Windows SDK). Both are UIA **clients** — they call `IUIAutomation`, exactly what §2.2 does directly. The raw-COM run is equivalent evidence, gathered without the tooling |
 | **Chromium DevTools / CDP** | The only route that would *truly* be headless — it drives the DOM directly. Requires WhatsApp to start with a remote-debugging port, which it does not, and cannot be enabled from outside the process |
 | **UIA provider-side injection** | Would require code inside the WhatsApp process. Out of scope and fragile |
 | **Clipboard + keystroke** | Already the fallback. Faster and more reliable than typing, at the cost of briefly borrowing the clipboard |
@@ -341,6 +377,30 @@ That one is a security boundary and should not be worked around.
 it as inherently semi-interactive. If genuine unattended, invisible operation
 is a hard requirement, the Business Platform is the correct architecture and
 the desktop path should be treated as a stopgap.
+
+---
+
+## 6a. Benchmark — every text-insertion strategy, measured
+
+Timed against the live window. Duration includes the settle-and-read-back the
+sender performs, so these are end-to-end costs, not raw API times.
+
+| Strategy | Cursor | Focus | Time | Result |
+|---|---|---|---|---|
+| `ValuePattern.SetValue` | no | no | 1008 ms | **no-op** (returns S_OK) |
+| `LegacyIAccessible.SetValue` | no | no | 1001 ms | **no-op** (returns S_OK) |
+| `WM_SETTEXT` → Chromium HWND | no | no | 500 ms | **no effect** |
+| `SetFocus` + clipboard paste | **no** | yes | 1046 ms | **works** |
+| `SetFocus` + per-character Unicode | **no** | yes | 1806 ms | **works** |
+| Coordinate `Click` (chat switch only) | **yes**, restored | yes | ~100 ms | works |
+| `InvokePattern` on Send | no | — | — | pattern present; not exercised (sends a real message) |
+
+Cursor position was unchanged across the entire benchmark run.
+
+Reading the table: the two strategies that cost nothing do nothing, and the two
+that work both need focus. Paste is ~760 ms faster than typing and does not drop
+characters, which is why it is the default — at the cost of borrowing the
+clipboard, now switchable with `SENDER_USE_CLIPBOARD=false`.
 
 ---
 

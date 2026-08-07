@@ -72,6 +72,7 @@ from wadam.whatsapp.reader import (
     read_chat_rows_sync,
 )
 from wadam.whatsapp import session
+from wadam.whatsapp.transport import TransportCapabilities
 from wadam.whatsapp.row_parser import parse_chat_row
 from wadam.whatsapp.sta_thread import StaAutomationThread
 
@@ -454,7 +455,8 @@ def _send_unicode_text(text: str, interval: float = 0.03) -> None:
         time.sleep(interval)
 
 
-def set_compose_text_sync(window_handle: int, text: str) -> tuple[bool, str]:
+def set_compose_text_sync(window_handle: int, text: str,
+                          use_clipboard: bool = True) -> tuple[bool, str]:
     """Put `text` into the compose box, climbing down the ladder until one rung
     verifies. Returns (ok, strategy)."""
     _require_uia()
@@ -484,10 +486,11 @@ def set_compose_text_sync(window_handle: int, text: str) -> tuple[bool, str]:
         if not text:
             return True, "cleared"
 
-        if _paste_text(compose, text):
+        if use_clipboard and _paste_text(compose, text):
             return True, "clipboard-paste"
 
-        logger.warning("compose: paste did not verify — falling back to per-character input")
+        if use_clipboard:
+            logger.warning("compose: paste did not verify — falling back to per-character input")
         # The paste may have landed partially, or fully with a readback too slow
         # to confirm. Typing now would append to it and leave the message
         # doubled, so the fallback starts from an empty box.
@@ -996,9 +999,30 @@ def open_chat_sync(window_handle: int, row_raw_text: str, chat_name: str = "") -
 
 
 class WhatsAppSender:
-    def __init__(self, reader: WhatsAppReader, sta: StaAutomationThread) -> None:
+    """The UI Automation transport. Implements `wadam.whatsapp.transport.Transport`."""
+
+    def __init__(self, reader: WhatsAppReader, sta: StaAutomationThread,
+                 use_clipboard: bool = True) -> None:
         self._reader = reader
         self._sta = sta  # must be the same STA thread the reader uses
+        # Pasting borrows the clipboard for ~200ms and puts text contents back.
+        # Some people would rather it never touched the clipboard at all; with
+        # this off, text goes in character by character instead — slower, and
+        # historically the path that drops keystrokes, but it leaves the
+        # clipboard alone entirely.
+        self._use_clipboard = use_clipboard
+
+    def capabilities(self) -> TransportCapabilities:
+        return TransportCapabilities(
+            name="Windows UI Automation",
+            requires_foreground=True,
+            moves_cursor=True,          # only when switching conversations
+            uses_clipboard=self._use_clipboard,
+            requires_interactive_desktop=True,
+            requires_whatsapp_running=True,
+            notes=("Cursor moves only to switch conversations, and is restored. "
+                   "The foreground is taken for 1-3s per send and handed back."),
+        )
 
     async def resolve_chat_row_async(self, chat_name: str):
         """Find the chat: in the recents sidebar first, then — only if it isn't
@@ -1128,13 +1152,13 @@ class WhatsAppSender:
             return SendResult.failed("Compose box not found after opening the chat.")
 
         filled, strategy = await self._sta.invoke_async(
-            lambda: set_compose_text_sync(window_handle, message_text)
+            lambda: set_compose_text_sync(window_handle, message_text, self._use_clipboard)
         )
         if not filled:
             # Clear up after a PARTIAL fill too: returning straight out leaves
             # whatever landed sitting in the box for the user to find, and the
             # next attempt appends to it.
-            await self._sta.invoke_async(lambda: set_compose_text_sync(window_handle, ""))
+            await self._sta.invoke_async(lambda: set_compose_text_sync(window_handle, "", self._use_clipboard))
             return SendResult.failed("Could not put the message into the compose box.")
 
         last_problem = ""
@@ -1177,10 +1201,10 @@ class WhatsAppSender:
                 # thing instead of just pressing Send again.
                 if _normalize_compose_text(current) != _normalize_compose_text(message_text):
                     await self._sta.invoke_async(
-                        lambda: set_compose_text_sync(window_handle, message_text)
+                        lambda: set_compose_text_sync(window_handle, message_text, self._use_clipboard)
                     )
 
         # Leave nothing half-written in the chat for the user to find (or for
         # the next message to be appended to).
-        await self._sta.invoke_async(lambda: set_compose_text_sync(window_handle, ""))
+        await self._sta.invoke_async(lambda: set_compose_text_sync(window_handle, "", self._use_clipboard))
         return SendResult.failed(f"Message was composed but not sent — {last_problem}.", strategy)
