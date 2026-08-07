@@ -35,8 +35,9 @@ class _CycleHarness:
     depth and the last error, so binding it to a stand-in exercises the real
     method without a polling loop or an STA thread."""
 
-    def __init__(self, repository: Repository) -> None:
+    def __init__(self, repository: Repository, settings: Settings) -> None:
         self._repo = repository
+        self._settings = settings          # _record_cycle probes session health
         self._hwnd = 1234
         self._queue = _FakeQueue()
         self._last_error = ""
@@ -56,8 +57,8 @@ def repo(tmp_path: Path) -> Repository:
     repository.stop()
 
 
-def make_harness(repository: Repository) -> _CycleHarness:
-    harness = _CycleHarness(repository)
+def make_harness(repository: Repository, settings: Settings = None) -> _CycleHarness:
+    harness = _CycleHarness(repository, settings or Settings())
     harness._record_cycle = AutomationEngine._record_cycle.__get__(harness, _CycleHarness)
     return harness
 

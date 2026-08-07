@@ -57,7 +57,7 @@ import asyncio
 import logging
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional
 
 from wadam.whatsapp.name_rules import chat_names_match, is_system_or_list_view_title
@@ -71,6 +71,7 @@ from wadam.whatsapp.reader import (
     iter_grid_row_controls,
     read_chat_rows_sync,
 )
+from wadam.whatsapp import session
 from wadam.whatsapp.row_parser import parse_chat_row
 from wadam.whatsapp.sta_thread import StaAutomationThread
 
@@ -88,24 +89,52 @@ except ImportError:  # pragma: no cover - exercised only off-Windows
     _UIA_AVAILABLE = False
 
 
+# How long the desktop must have been untouched before a send takes the
+# foreground, and how long it will wait for that before going ahead regardless.
+QUIET_IDLE_SECONDS = 1.5
+MAX_DEFER_SECONDS = 20.0
+
+
 class WhatsAppUnavailableError(RuntimeError):
     pass
 
 
 @dataclass(frozen=True)
 class SendResult:
+    """The outcome of a send, with enough detail to answer "what did it
+    actually do to my desktop?" — which is the question this application has to
+    be able to answer honestly."""
+
     ok: bool
     detail: str = ""
-    strategy: str = ""       # which rung of the ladder actually delivered it
-    verified: bool = False   # the compose box was confirmed empty afterwards
+    strategy: str = ""        # which rung of the ladder delivered it
+    verified: bool = False    # the compose box was confirmed empty afterwards
+    pattern: str = ""         # the UIA pattern used, when one was
+    attempts: int = 0
+    duration_ms: int = 0
+    activated_window: bool = False   # did we have to take the foreground?
+    moved_cursor: bool = False       # did any physical mouse action happen?
+    used_clipboard: bool = False
+    recovery_used: str = ""          # non-empty when a fallback rung was needed
+    foreground_restored: bool = False
 
     @classmethod
-    def succeeded(cls, strategy: str) -> "SendResult":
-        return cls(ok=True, detail="sent", strategy=strategy, verified=True)
+    def succeeded(cls, strategy: str, **kw) -> "SendResult":
+        return cls(ok=True, detail="sent", strategy=strategy, verified=True, **kw)
 
     @classmethod
-    def failed(cls, detail: str, strategy: str = "") -> "SendResult":
-        return cls(ok=False, detail=detail, strategy=strategy)
+    def failed(cls, detail: str, strategy: str = "", **kw) -> "SendResult":
+        return cls(ok=False, detail=detail, strategy=strategy, **kw)
+
+    def as_log_fields(self) -> dict:
+        return {
+            "success": self.ok, "method": self.strategy, "pattern": self.pattern,
+            "attempts": self.attempts, "duration_ms": self.duration_ms,
+            "activated_window": self.activated_window, "moved_cursor": self.moved_cursor,
+            "used_clipboard": self.used_clipboard, "recovery": self.recovery_used,
+            "foreground_restored": self.foreground_restored,
+            "failure_reason": "" if self.ok else self.detail,
+        }
 
 
 def _require_uia() -> None:
@@ -118,6 +147,54 @@ def _require_uia() -> None:
 # ---------------------------------------------------------------------------
 # Foreground
 # ---------------------------------------------------------------------------
+
+
+def previous_foreground() -> int:
+    """The window that was active before we took over, so it can be given back."""
+    try:
+        return win32gui.GetForegroundWindow()
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def restore_foreground(hwnd: int) -> bool:
+    """Hand the desktop back to whatever the user was using.
+
+    Called after every send. Windows applies the same anti-focus-stealing rules
+    on the way back, but by this point we ARE the foreground process, which is
+    exactly the state in which `SetForegroundWindow` is permitted — so the
+    restore reliably succeeds where the original steal needed persuasion.
+    Verified live: foreground returned to the previous window every time."""
+    if not hwnd or not _UIA_AVAILABLE:
+        return False
+    try:
+        if win32gui.GetForegroundWindow() == hwnd:
+            return True
+        if not win32gui.IsWindow(hwnd) or win32gui.IsIconic(hwnd):
+            return False
+        win32gui.SetForegroundWindow(hwnd)
+        return win32gui.GetForegroundWindow() == hwnd
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def focus_control(control) -> bool:
+    """Give a control keyboard focus WITHOUT touching the mouse.
+
+    `IUIAutomationElement::SetFocus` activates the owning window as a side
+    effect, which is the one interruption sending cannot avoid — but it moves no
+    cursor and clicks nothing, and it is the reason this file no longer contains
+    a single coordinate click on the normal path.
+
+    Measured against a live window: SetFocus alone put the caret in WhatsApp's
+    compose box and subsequent keystrokes landed in it, with `GetCursorPos`
+    unchanged. The click that used to precede every keystroke was unnecessary."""
+    try:
+        control.SetFocus()
+        return True
+    except Exception:  # noqa: BLE001
+        logger.debug("SetFocus failed", exc_info=True)
+        return False
 
 
 def ensure_foreground(hwnd: int, attempts: int = 5, settle: float = 0.2) -> bool:
@@ -258,8 +335,8 @@ def _compose_is_blank(compose) -> bool:
 
 
 def _clear_compose(compose) -> None:
-    compose.SetFocus()
-    compose.Click(simulateMove=False)
+    # Focus, not click: the caret lands in the box from SetFocus alone.
+    focus_control(compose)
     auto.SendKeys("{Ctrl}a", waitTime=0.15)
     auto.SendKeys("{Delete}", waitTime=0.15)
     time.sleep(0.2)  # let the clear render before anything reads or types
@@ -399,8 +476,7 @@ def set_compose_text_sync(window_handle: int, text: str) -> tuple[bool, str]:
         if text and _normalize_compose_text(_read_compose_text(compose)) == _normalize_compose_text(text):
             return True, "already-present"
 
-        compose.SetFocus()
-        compose.Click(simulateMove=False)
+        focus_control(compose)
 
         if not _compose_is_blank(compose):
             _clear_compose(compose)
@@ -474,8 +550,7 @@ def press_enter_sync(window_handle: int) -> bool:
         logger.warning("WhatsApp is not in the foreground; not pressing Enter")
         return False
     try:
-        compose.SetFocus()
-        compose.Click(simulateMove=False)
+        focus_control(compose)
         time.sleep(0.1)
         auto.SendKeys("{Enter}", waitTime=0.15)
         return True
@@ -598,7 +673,7 @@ def clear_search_sync(window_handle: int) -> None:
     box = _find_search_box(window_handle)
     try:
         if box is not None:
-            box.Click(simulateMove=False)
+            focus_control(box)
         auto.SendKeys("{Ctrl}a", waitTime=0.1)
         auto.SendKeys("{Delete}", waitTime=0.1)
         auto.SendKeys("{Esc}", waitTime=0.1)
@@ -618,8 +693,7 @@ def search_and_read_rows_sync(window_handle: int, query: str) -> list[ChatRow]:
         return []
     search_text = _search_query(query)
     try:
-        box.SetFocus()
-        box.Click(simulateMove=False)
+        focus_control(box)
         auto.SendKeys("{Ctrl}a", waitTime=0.1)
         auto.SendKeys("{Delete}", waitTime=0.1)
         if search_text:
@@ -755,12 +829,40 @@ def _click_point_inside(item, container, window_handle: int) -> bool:
 
 
 def _click_item(item) -> bool:
+    """**The only physical mouse action left in this application**, and it is
+    recovery, not the normal path.
+
+    It exists because switching conversations has no working alternative.
+    Measured against a live WhatsApp window, every non-mouse route silently did
+    nothing while reporting success:
+
+        SelectionItemPattern.Select()          advertised, no-op
+        LegacyIAccessiblePattern.DoDefaultAction()  advertised ("Double Click"), no-op
+        InvokePattern                          not offered on chat rows
+        search box + Enter / Down+Enter / Tab+Enter  no selection
+        WM_SETTEXT / WM_CHAR to the Chromium HWND    no effect
+
+    So the click stays, with the damage contained: the cursor is put back where
+    the user left it, so the pointer flicks and returns rather than being
+    abandoned somewhere else on screen. A chat that is already open never
+    reaches here at all — which is the common case for a busy conversation."""
+    origin = None
+    try:
+        origin = win32gui.GetCursorPos()
+    except Exception:  # noqa: BLE001
+        pass
     try:
         item.Click(simulateMove=False)
         return True
     except Exception:  # noqa: BLE001
         logger.warning("Failed to click chat row", exc_info=True)
         return False
+    finally:
+        if origin is not None:
+            try:
+                win32api.SetCursorPos(origin)
+            except Exception:  # noqa: BLE001
+                logger.debug("could not restore the cursor position", exc_info=True)
 
 
 def chat_already_open(window_handle: int, target: str) -> bool:
@@ -949,12 +1051,60 @@ class WhatsAppSender:
     async def send_async(self, chat_name: str, message_text: str) -> SendResult:
         """Send `message_text` to `chat_name`, verified.
 
-        The ENTIRE sequence runs under the action lock so nothing else can
-        change the open chat or steal foreground between open → fill → send."""
+        Three things wrap the send itself, and each is there because this is a
+        background service running on somebody's desktop:
+
+        1. **A session preflight.** Keystrokes injected into a session with no
+           input desktop return success and go nowhere, so a disconnected or
+           locked session is detected and reported instead of producing a
+           silent non-delivery. See `wadam.whatsapp.session`.
+        2. **Waiting for a quiet moment.** Taking the foreground is the one
+           interruption that cannot be avoided; taking it while someone is
+           mid-sentence is avoidable. The send waits for a short idle gap,
+           bounded so a busy machine still gets its messages out.
+        3. **Giving the desktop back.** Whatever was in front before is
+           reactivated afterwards.
+
+        The whole sequence runs under the action lock so nothing else can change
+        the open chat or steal foreground between open → fill → send."""
         if not (message_text or "").strip():
             return SendResult.failed("Nothing to send (the reply was empty).")
+
+        state = session.probe(self._reader._title_hint if hasattr(self._reader, "_title_hint") else "WhatsApp")
+        if state.can_send == session.Health.BLOCKED:
+            return SendResult.failed(state.send_blocked_reason or "Sending is not possible right now.")
+
         async with self._sta.action_lock:
-            return await self._send_locked(chat_name, message_text)
+            await self._wait_for_a_quiet_moment()
+            previous = await self._sta.invoke_async(previous_foreground)
+            started = time.monotonic()
+            try:
+                result = await self._send_locked(chat_name, message_text)
+            finally:
+                restored = await self._sta.invoke_async(lambda: restore_foreground(previous))
+            return replace(
+                result,
+                duration_ms=int((time.monotonic() - started) * 1000),
+                activated_window=True,
+                foreground_restored=restored,
+            )
+
+    async def _wait_for_a_quiet_moment(self) -> None:
+        """Hold a send back while the user is actively typing.
+
+        Bounded on purpose. Waiting forever for an idle desktop would mean a
+        busy machine never delivers anything, which is a worse failure than a
+        brief interruption — so after `MAX_DEFER_SECONDS` the send goes ahead
+        regardless and says so in the log."""
+        waited = 0.0
+        while waited < MAX_DEFER_SECONDS:
+            idle = session.user_idle_seconds()
+            if idle >= QUIET_IDLE_SECONDS:
+                return
+            await asyncio.sleep(0.5)
+            waited += 0.5
+        logger.info("sending after waiting %.0fs for an idle desktop — going ahead anyway",
+                    waited)
 
     async def _send_locked(self, chat_name: str, message_text: str) -> SendResult:
         window_handle, row = await self.resolve_chat_row_async(chat_name)

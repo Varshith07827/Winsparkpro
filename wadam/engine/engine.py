@@ -57,6 +57,7 @@ from wadam.engine.relay import RelayService
 from wadam.engine.webhook import RelayMessage, WebhookClient, WebhookOutcome
 from wadam.storage.repository import Repository
 from wadam.whatsapp.reader import WhatsAppMessage, WhatsAppReader
+from wadam.whatsapp import session as win_session
 from wadam.whatsapp.sender import WhatsAppSender
 from wadam.whatsapp.sta_thread import StaAutomationThread
 
@@ -82,6 +83,9 @@ class EngineSnapshot:
     json_status: str = ""
     json_ok: bool = False
     last_error: str = ""
+    # Windows session / desktop / UIA preconditions, refreshed each cycle.
+    session_rows: list = field(default_factory=list)   # (label, value, health)
+    send_blocked_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -133,6 +137,7 @@ class AutomationEngine:
         self._active_chat_name = ""
         # When each chat's webhook was last GETted, by chat id (monotonic).
         self._relay_polled_at: dict[str, float] = {}
+        self._session_state = win_session.probe(settings.whatsapp_window_title)
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -334,6 +339,9 @@ class AutomationEngine:
         state.chats_seen = len(self._repo.list_chats())
         state.queued_chats = self._queue.qsize()
         state.last_error = self._last_error
+        # Cheap enough to refresh every cycle, and it is how a disconnected RDP
+        # session or a locked desktop becomes visible instead of mysterious.
+        self._session_state = win_session.probe(self._settings.whatsapp_window_title)
         # Written to MongoDB on the first cycle (so the collection exists and a
         # short run still leaves a trace) and every ten cycles after that, not
         # every three seconds: it is telemetry, and the in-memory copy the UI
@@ -589,6 +597,8 @@ class AutomationEngine:
             json_status=status.get("json", ""),
             json_ok=status.get("json_ok") == "yes",
             last_error=self._last_error,
+            session_rows=list(self._session_state.summary()),
+            send_blocked_reason=self._session_state.send_blocked_reason,
         )
         try:
             self._on_snapshot(snapshot)

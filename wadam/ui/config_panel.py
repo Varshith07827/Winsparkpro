@@ -156,6 +156,7 @@ class ChatConfigPanel(QWidget):
         self._body_layout.addWidget(self._build_automation_card())
         self._body_layout.addWidget(self._build_contact_id_card())
         self._body_layout.addWidget(self._build_activity_card())
+        self._body_layout.addWidget(self._build_health_card())
         self._body_layout.addWidget(self._build_storage_card())
         self._body_layout.addLayout(self._build_actions())
         self._body_layout.addStretch(1)
@@ -331,6 +332,47 @@ class ChatConfigPanel(QWidget):
             self._values[key] = value
         card.add_layout(grid)
         return card
+
+    def _build_health_card(self) -> QWidget:
+        """Session health — the preconditions a send depends on, stated before
+        it fails rather than after."""
+        card = _Card("Session health")
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(20)
+        grid.setVerticalSpacing(8)
+        grid.setColumnStretch(1, 1)
+        self._health_rows: list[tuple[QLabel, QLabel]] = []
+        for index in range(5):
+            label = QLabel("")
+            label.setObjectName("fieldLabel")
+            value = QLabel("")
+            value.setWordWrap(True)
+            grid.addWidget(label, index, 0, Qt.AlignTop)
+            grid.addWidget(value, index, 1)
+            self._health_rows.append((label, value))
+        card.add_layout(grid)
+        self._health_note = QLabel("")
+        self._health_note.setWordWrap(True)
+        self._health_note.setObjectName("statusBad")
+        self._health_note.setVisible(False)
+        card.add(self._health_note)
+        return card
+
+    def set_session_health(self, rows: list, blocked_reason: str = "") -> None:
+        for (label, value), row in zip(self._health_rows, list(rows) + [None] * 5):
+            if row is None:
+                label.setText(""); value.setText(""); continue
+            name, text, health = row
+            if label.text() != name:
+                label.setText(name)
+            if value.text() != text:
+                value.setText(text)
+            style = {"ok": "statusOk", "degraded": "statusWarn"}.get(health, "statusBad")
+            if value.objectName() != style:
+                value.setObjectName(style)
+                value.style().unpolish(value); value.style().polish(value)
+        self._health_note.setText(blocked_reason)
+        self._health_note.setVisible(bool(blocked_reason))
 
     def _build_storage_card(self) -> QWidget:
         card = _Card("Storage")

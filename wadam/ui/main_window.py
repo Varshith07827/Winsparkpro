@@ -217,6 +217,7 @@ class MainWindow(QMainWindow):
         self._set_status(self._status_mongo, f"MongoDB {snapshot.mongo_status}", snapshot.mongo_ok)
         self._set_status(self._status_json, f"JSON {snapshot.json_status}", snapshot.json_ok)
 
+        self._config.set_session_health(snapshot.session_rows, snapshot.send_blocked_reason)
         self._config.set_storage_status(
             snapshot.mongo_status, snapshot.mongo_ok, snapshot.json_status, snapshot.json_ok
         )

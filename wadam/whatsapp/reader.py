@@ -368,13 +368,18 @@ def read_chat_rows_sync(window_handle: int, grid_name: str = RECENTS_GRID) -> li
     if chat_list is None and grid_name == RECENTS_GRID:
         # An active search HIDES the recents grid entirely on recent WhatsApp
         # builds — no chat DataGrid exists at all while a query sits in the
-        # search box. Clear it (self-gated on the box having text) and re-read,
-        # so the poll keeps working no matter what the user left typed.
-        from wadam.whatsapp.sender import clear_search_sync
-
-        clear_search_sync(window_handle)
-        time.sleep(0.4)  # let the recents grid re-render
-        chat_list = find_chat_grid(window_handle, grid_name)
+        # search box.
+        #
+        # This used to clear the search here, which meant the three-second POLL
+        # could activate WhatsApp and inject Ctrl+A/Delete/Escape — a passive
+        # read stealing the user's focus mid-keystroke. Reading is now
+        # unconditionally input-free: the search results grid is read instead,
+        # and clearing the search is left to the send path, which is allowed to
+        # interact and is accounted for.
+        search_results = find_chat_grid(window_handle, SEARCH_RESULTS_GRID)
+        if search_results is not None:
+            logger.debug("recents hidden by an active search — reading the results grid")
+            chat_list = search_results
     if chat_list is None:
         return []
 

@@ -80,6 +80,7 @@ can reach (a local `mongod` or an Atlas cluster).
 | [SEND_API.md](docs/SEND_API.md) | The inbound HTTP API for sending messages |
 | [RELAY.md](docs/RELAY.md) | Polling your webhook for outbound messages (winSpark's model) |
 | [SENDING.md](docs/SENDING.md) | Option A in detail; options B, C and D analysed |
+| [HEADLESS.md](docs/HEADLESS.md) | Input-simulation audit, what WhatsApp's UIA provider really does, RDP |
 | [LIMITATIONS.md](docs/LIMITATIONS.md) | Known limitations and future enhancements |
 | [MIGRATION.md](docs/MIGRATION.md) | What came from winSpark, what was removed, how to move over |
 | [TEST_REPORT.md](docs/TEST_REPORT.md) | Results, acceptance-criteria evidence, defects found |
@@ -288,8 +289,16 @@ over simulated input at every step:
 
 The fallbacks exist because the pure paths demonstrably fail on current WhatsApp
 builds — `ValuePattern.SetValue` silently no-ops on the contenteditable compose
-box. The pure rung is still tried first so that the day WhatsApp implements it,
-this application stops touching the clipboard with no code change. Full analysis,
+box **despite reporting `IsReadOnly = False`**. The pure rung is still tried
+first so that the day WhatsApp implements it, sending becomes completely
+invisible with no code change.
+
+**Reading is fully headless** — no focus, no cursor, no keystrokes, verified by
+a call-graph check that no read path can reach an input-simulating call.
+**Sending is not, and cannot be**: the cursor never moves, but the window must
+briefly take the foreground. The audit, the measurements behind that claim, and
+why a disconnected RDP session stops sending are in
+[HEADLESS.md](docs/HEADLESS.md). Full analysis,
 including options B, C and D: [SENDING.md](docs/SENDING.md).
 
 ---
