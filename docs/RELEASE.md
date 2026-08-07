@@ -13,7 +13,7 @@ WhatsApp Desktop MSIX `2.2630.102.0` · RDP session 4 (console session 5).
 ## 1. Test results
 
 ```
-297 passed
+302 passed
 ```
 
 The storage-dependent suites run **twice** — once against a dict-backed fake
@@ -221,10 +221,10 @@ Three cases prove the census logic rather than mere presence:
 | 24-hour stability | ❌ | **Not run.** Unverified |
 | **Security** | ✅ | §7 |
 | **Testing** | | |
-| Unit + integration | ✅ | 297 tests |
+| Unit + integration | ✅ | 302 tests |
 | Real MongoDB | ✅ | Storage suites run against both stores |
 | Real WhatsApp reads | ✅ | Live probes and benchmarks |
-| **Real WhatsApp send end-to-end** | ❌ | **Exercised 2026-08-07 and it FAILED — see §11.** ~114 attempts, 14 delivered |
+| **Real WhatsApp send end-to-end** | ✅ | Failed at first (§11), **root cause found and fixed (§12)**; 5/5 verified in the chat |
 | **Documentation** | ✅ | Ten documents; see the README index |
 | **Deployment** | ⚠️ | No installer or packaging; run from source |
 | **Send API path** | ❌ | Bypasses the durable queue and the verifier entirely — §11 |
@@ -291,10 +291,16 @@ could ever be done about it.
 
 ## 10. Recommendation
 
-**Not ready for production.** Superseded by §11: the first real end-to-end
-send test delivered 13 of ~141 messages. An earlier draft of this document
-recommended supervised production use; that recommendation was written before
-the send path had ever been exercised against a real chat, and it was wrong.
+**Ready for supervised production use** on a dedicated machine, with an
+operator watching the Operations card for the first days.
+
+This section has been wrong twice and the history is worth keeping. It first
+recommended supervised production before the send path had ever run against a
+real chat. §11 then corrected it to "not ready" when that test delivered 14 of
+~114 messages. §12 found and fixed the cause, and the path is now verified
+end to end. Defect 1 of §11 — the Send API bypassing the durable queue and the
+verifier — **is still open**, so an API send still has no retry and no
+delivery verification.
 
 If genuinely unattended, invisible operation is a hard requirement, the desktop
 path cannot deliver it and the WhatsApp Business Platform is the correct
@@ -389,3 +395,80 @@ A `for /L` loop of 100 curl requests kept running after the operator pressed
 `^C` and had to be killed by PID. Each iteration takes ~10 s because the sender
 waits for an idle desktop, so a cancelled burst keeps sending for minutes. The
 API should expose a way to cancel queued work for a chat.
+
+---
+
+## 12. Root cause and fix (2026-08-07)
+
+**The compose box was focused but never clicked.**
+
+`SetFocus` makes an element the focused UIA element — `HasKeyboardFocus`
+returns True, `GetForegroundWindow` returns WhatsApp, every call reports
+success — while a Chromium contenteditable still has **no insertion point**.
+Pasted and typed characters are discarded. The failure is invisible at every
+layer except the readback.
+
+### How it got in
+
+The headless refactor removed `compose.Click(simulateMove=False)` from the fill
+path, on the strength of one live measurement where SetFocus alone appeared
+sufficient, recorded in the docstring as *"The click that used to precede every
+keystroke was unnecessary."*
+
+That measurement was taken **after a chat switch**. Switching chats clicks a
+sidebar row, which leaves WhatsApp with a caret already in the compose box — so
+it measured a caret it had not created. Every send in that session followed a
+chat switch. The moment sends went to an already-open chat, nothing placed a
+caret and roughly half of them silently failed.
+
+The reference implementation
+(`winspark/connectors/whatsapp_group_sender.py`) had already found this and
+says so in two separate docstrings: *"SetFocus alone was not enough … A
+physical click is what actually places the caret inside the contenteditable;
+SetFocus focuses the element without a caret and Enter is ignored."* The
+regression was reintroducing a bug the reference had already fixed.
+
+### Measured
+
+Interleaved A/B on a live window, identical fill path, no Enter pressed:
+
+| Arm | Filled |
+|---|---|
+| SetFocus only (the regression) | 10/14 |
+| **SetFocus + Click (restored)** | **14/14** |
+
+Baseline before the capability gate was added was worse still — ~6/14.
+Two changes contribute:
+
+1. **`focus_compose_caret`** — SetFocus, then `Click(simulateMove=False)`, with
+   the cursor put back where the user left it. Took 10/14 → 14/14.
+2. **The capability probe is now consulted.** `capabilities.json` recorded
+   `value_pattern_write: false` and nothing read it, so every send spent 0.4s
+   re-attempting a write this build discards — immediately before the paste.
+   Gating it took ~6/14 → 10/14.
+
+Longer confirmation across plain, long, emoji, multiline and Unicode text:
+**21/25**, the remainder recovering through the per-character fallback or a
+foreground failure unrelated to the caret.
+
+### End-to-end
+
+Five messages through the Send API — the path that had failed ~100 consecutive
+times — all five returned `ok: true` and **all five were independently read
+back from the conversation**, in order, no duplicates.
+
+### Guarded
+
+`tests/test_compose_caret.py` fails if the click is removed again, if it is
+ordered before the focus, or if the engine stops passing the probe result to
+the sender. The docstring on `focus_compose_caret` records why the click is
+there and what the flawed measurement was, so the next person to "optimise"
+it has to argue with the evidence first.
+
+### Still open
+
+* Defect 1 of §11 — API sends bypass the durable queue and the verifier. The
+  fix above makes the transport reliable; it does not give that path retry,
+  verification, ordering or crash recovery.
+* The `WhatsApp` title hint still matches four windows, including this app's
+  own.

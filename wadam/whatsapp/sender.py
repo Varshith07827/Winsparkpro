@@ -188,20 +188,63 @@ def restore_foreground(hwnd: int) -> bool:
 def focus_control(control) -> bool:
     """Give a control keyboard focus WITHOUT touching the mouse.
 
-    `IUIAutomationElement::SetFocus` activates the owning window as a side
-    effect, which is the one interruption sending cannot avoid — but it moves no
-    cursor and clicks nothing, and it is the reason this file no longer contains
-    a single coordinate click on the normal path.
-
-    Measured against a live window: SetFocus alone put the caret in WhatsApp's
-    compose box and subsequent keystrokes landed in it, with `GetCursorPos`
-    unchanged. The click that used to precede every keystroke was unnecessary."""
+    Enough for controls that only need focus. **Not enough for the compose
+    box** — see `focus_compose_caret`."""
     try:
         control.SetFocus()
         return True
     except Exception:  # noqa: BLE001
         logger.debug("SetFocus failed", exc_info=True)
         return False
+
+
+def focus_compose_caret(compose) -> bool:
+    """Put the CARET inside the compose box — SetFocus, then a physical click.
+
+    The click is not belt-and-braces. UIA focus and a DOM caret are different
+    things in a Chromium contenteditable: `SetFocus` makes the element the
+    focused UIA element (`HasKeyboardFocus` reports True, and it looks like it
+    worked) while the contenteditable has no insertion point, so pasted and
+    typed characters are discarded and `Enter` is ignored.
+
+    An earlier version of this file dropped the click, on the strength of one
+    live measurement where SetFocus alone appeared sufficient. That measurement
+    was taken after a chat switch, which clicks a row and leaves WhatsApp with a
+    caret already placed — so it measured a caret it had not created. Without
+    that, filling the box failed roughly half the time and reported
+    "Could not put the message into the compose box".
+
+    The reference implementation this project was ported from
+    (`winspark/connectors/whatsapp_group_sender.py`) does SetFocus followed by
+    `Click(simulateMove=False)` for exactly this reason, and records the same
+    finding for `Enter`. Do not remove the click without re-measuring on a
+    window that has NOT just had a chat switch.
+
+    The cursor is put back where the user left it, as with `_click_item`."""
+    try:
+        compose.SetFocus()
+    except Exception:  # noqa: BLE001
+        logger.debug("SetFocus failed", exc_info=True)
+
+    origin = None
+    try:
+        origin = win32gui.GetCursorPos()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        compose.Click(simulateMove=False)
+        return True
+    except Exception:  # noqa: BLE001
+        logger.warning("Failed to click the compose box", exc_info=True)
+        return False
+    finally:
+        if origin is not None:
+            try:
+                win32api.SetCursorPos(origin)
+                if _metrics_hook is not None:
+                    _metrics_hook.record_cursor_restore()
+            except Exception:  # noqa: BLE001
+                logger.debug("could not restore the cursor position", exc_info=True)
 
 
 def ensure_foreground(hwnd: int, attempts: int = 5, settle: float = 0.2) -> bool:
@@ -349,6 +392,23 @@ def _clear_compose(compose) -> None:
     time.sleep(0.2)  # let the clear render before anything reads or types
 
 
+_value_pattern_ruled_out = False
+
+
+def set_value_pattern_ruled_out(ruled_out: bool) -> None:
+    """Told by the capability probe whether rung 1 can ever work on this build.
+
+    The probe already writes its answer to `data/capabilities.json`; until this
+    existed nothing read it, and every send paid 0.4s to re-discover a
+    known-dead path."""
+    global _value_pattern_ruled_out
+    _value_pattern_ruled_out = bool(ruled_out)
+
+
+def value_pattern_worth_trying() -> bool:
+    return not _value_pattern_ruled_out
+
+
 def _try_value_pattern(compose, text: str) -> bool:
     """Rung 1 — pure UI Automation. Known to no-op on current WhatsApp builds
     (the call succeeds, the text never appears), which is exactly why the result
@@ -470,8 +530,11 @@ def set_compose_text_sync(window_handle: int, text: str,
     if compose is None:
         return False, ""
 
-    # Rung 1 needs no foreground at all — try it before disturbing the desktop.
-    if text and _try_value_pattern(compose, text):
+    # Rung 1 needs no foreground at all — try it before disturbing the desktop,
+    # but only where the capability probe has not already ruled it out. On a
+    # build whose provider discards SetValue this costs 0.4s of guaranteed
+    # failure per send, and it writes to the box before the paste that follows.
+    if text and value_pattern_worth_trying() and _try_value_pattern(compose, text):
         return True, "uia-value-pattern"
 
     if not ensure_foreground(window_handle):
@@ -484,7 +547,7 @@ def set_compose_text_sync(window_handle: int, text: str,
         if text and _normalize_compose_text(_read_compose_text(compose)) == _normalize_compose_text(text):
             return True, "already-present"
 
-        focus_control(compose)
+        focus_compose_caret(compose)
 
         if not _compose_is_blank(compose):
             _clear_compose(compose)

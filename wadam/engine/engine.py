@@ -62,6 +62,7 @@ from wadam.storage.repository import Repository
 from wadam.whatsapp.reader import WhatsAppMessage, WhatsAppReader
 from wadam.whatsapp import capabilities as win_caps
 from wadam.whatsapp import session as win_session
+from wadam.whatsapp import sender
 from wadam.whatsapp.sender import WhatsAppSender
 from wadam.whatsapp.sta_thread import StaAutomationThread
 from wadam.whatsapp.verifier import SendVerifier
@@ -335,6 +336,11 @@ class AutomationEngine:
                 self._capabilities = await asyncio.to_thread(
                     self._capability_store.refresh_if_needed, hwnd)
                 self._capability_summary = self._capabilities.summary()
+                # Tell the sender what the probe found. Without this the probe
+                # was written to disk and never read, and every send retried a
+                # write path already known to be discarded by this build.
+                sender.set_value_pattern_ruled_out(
+                    not self._capabilities.value_pattern_write)
                 self._repo.log("INFO", "capabilities.probed",
                                message=self._capability_summary)
             except Exception as ex:  # noqa: BLE001 - never block startup on a probe
