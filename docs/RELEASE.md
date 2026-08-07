@@ -221,7 +221,7 @@ Three cases prove the census logic rather than mere presence:
 | 24-hour stability | ❌ | **Not run.** Unverified |
 | **Security** | ✅ | §7 |
 | **Testing** | | |
-| Unit + integration | ✅ | 295 tests |
+| Unit + integration | ✅ | 297 tests |
 | Real MongoDB | ✅ | Storage suites run against both stores |
 | Real WhatsApp reads | ✅ | Live probes and benchmarks |
 | **Real WhatsApp send end-to-end** | ❌ | **Never exercised through the new queue → send → verify path** |
