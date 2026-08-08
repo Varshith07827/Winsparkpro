@@ -456,6 +456,13 @@ class Repository:
                        if m.status not in OutgoingStatus.FINAL]
         return sorted(pending, key=lambda m: (m.created_at or utcnow(), m.sequence))
 
+    def all_outgoing(self) -> list[OutgoingMessage]:
+        """Every queued message, finished or not — what a status lookup needs,
+        since the interesting answers (delivered, failed, unverified) are all
+        terminal states that `pending_outgoing` deliberately excludes."""
+        with self._lock:
+            return list(self._outgoing.values())
+
     def outgoing_in_state(self, states) -> list[OutgoingMessage]:
         with self._lock:
             return [m for m in self._outgoing.values() if m.status in states]

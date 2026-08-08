@@ -13,7 +13,7 @@ WhatsApp Desktop MSIX `2.2630.102.0` · RDP session 4 (console session 5).
 ## 1. Test results
 
 ```
-302 passed
+305 passed
 ```
 
 The storage-dependent suites run **twice** — once against a dict-backed fake
@@ -206,7 +206,7 @@ Three cases prove the census logic rather than mere presence:
 | **Reliability** | | |
 | No duplicate messages | ✅ | Proven across all four crash points, both stores |
 | No lost messages | ✅ | Durable queue; `test_nothing_is_lost_across_a_restart` |
-| Retry policy | ⚠️ | Holds for queued sends; **the Send API path has no retry at all** — see §11 |
+| Retry policy | ✅ | Applies to every path now that API sends are queued (§13) |
 | Per-chat ordering | ✅ | Sequence assigned at enqueue |
 | **Recovery** | | |
 | Crash before/during/after send | ✅ | Four enumerated scenarios, both stores |
@@ -221,13 +221,13 @@ Three cases prove the census logic rather than mere presence:
 | 24-hour stability | ❌ | **Not run.** Unverified |
 | **Security** | ✅ | §7 |
 | **Testing** | | |
-| Unit + integration | ✅ | 302 tests |
+| Unit + integration | ✅ | 305 tests |
 | Real MongoDB | ✅ | Storage suites run against both stores |
 | Real WhatsApp reads | ✅ | Live probes and benchmarks |
 | **Real WhatsApp send end-to-end** | ✅ | Failed at first (§11), **root cause found and fixed (§12)**; 5/5 verified in the chat |
 | **Documentation** | ✅ | Ten documents; see the README index |
 | **Deployment** | ⚠️ | No installer or packaging; run from source |
-| **Send API path** | ❌ | Bypasses the durable queue and the verifier entirely — §11 |
+| **Send API path** | ✅ | Queue-backed since §13; 20-message burst accepted in 11s, 19/20 verified |
 | **Monitoring** | ✅ | Operations card, 19 metrics, session health |
 | **Observability** | ✅ | Correlation IDs, structured logs, `trace()`, all 13 metrics wired |
 
@@ -298,9 +298,8 @@ This section has been wrong twice and the history is worth keeping. It first
 recommended supervised production before the send path had ever run against a
 real chat. §11 then corrected it to "not ready" when that test delivered 14 of
 ~114 messages. §12 found and fixed the cause, and the path is now verified
-end to end. Defect 1 of §11 — the Send API bypassing the durable queue and the
-verifier — **is still open**, so an API send still has no retry and no
-delivery verification.
+end to end. Defect 1 of §11 — the Send API bypassing the durable queue — was closed in
+§13. Every send path is now queued, retried and verified.
 
 If genuinely unattended, invisible operation is a hard requirement, the desktop
 path cannot deliver it and the WhatsApp Business Platform is the correct
@@ -472,3 +471,74 @@ it has to argue with the evidence first.
   verification, ordering or crash recovery.
 * The `WhatsApp` title hint still matches four windows, including this app's
   own.
+
+---
+
+## 13. Queue-backed API sends (2026-08-07)
+
+Closes defect 1 of §11.
+
+### The arithmetic that made blocking untenable
+
+The endpoint held the HTTP request open until WhatsApp physically sent. At
+~17s per send, a burst of twenty needs almost six minutes, so every caller past
+the third received:
+
+```
+{"ok": false, "code": "timeout",
+ "error": "The send did not complete within 60s..."}
+```
+
+**for messages that were in fact delivered.** A caller that retried on timeout
+would have duplicated real messages — the failure this system works hardest to
+avoid. Confirmed live: 19 of 20 requests timed out and all 20 messages arrived.
+
+### The change
+
+A request is now bounded by the **enqueue**, not by the send. `POST` returns
+`202 Accepted` with an `outgoing_id`; the message goes into the same durable
+queue the webhook and relay paths use, and the single drainer delivers it with
+per-chat ordering, retry, and census verification. Delivery is reported by
+`GET /wam/status/<outgoing_id>`.
+
+`ok: true` now means **accepted**, not delivered. That is a deliberate contract
+change: the previous response could not honestly mean "delivered" either, since
+it timed out on messages that had been sent.
+
+### Measured, same 20-message burst
+
+| | Before | After |
+|---|---|---|
+| HTTP responses | 1 × 200, **19 × 504 timeout** | **20 × 202** |
+| Time to accept all 20 | >19 minutes | **11 seconds** |
+| Per-request latency | 60s (timeout) | 36–144 ms |
+| Delivered | all 20, reported as failures | **19 verified, 1 unverified** |
+| Lost | 0 | 0 |
+| Retry / ordering / verification | none | all three |
+
+The one `unverified` is the design working, not a failure: its pre-send census
+could not be read, so a new bubble could not be told apart from one already
+present. It reports that reason verbatim through the status endpoint and is
+**not** retried, because a retry there risks a duplicate.
+
+### Send latency
+
+Two phases were cut:
+
+* `chat_already_open` ran an expensive header scan (~2.5s) even when the
+  active-conversation read had already answered the question. It now only falls
+  back to the header when no name came back at all — which is the case it was
+  written for (read-only groups have no compose box to name).
+* Clearing the compose box took the foreground and clicked, even when the box
+  was already empty — the common case straight after a send.
+
+Send **including verification** now averages **10.8s** (min 9.0, max 12.4)
+against a previous **17.0s** cadence that did no verification at all.
+
+### Still open
+
+* `find_window_sync` matches four top-level windows by title, including this
+  application's own. It resolves correctly today by ordering, not by design.
+* A queued burst still drains at ~11s per message. That is throughput, not
+  correctness — nothing is lost or duplicated — but a caller sending hundreds
+  should know the queue is the buffer.

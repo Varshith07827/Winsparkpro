@@ -74,11 +74,13 @@ class SendApiServer:
     class knows nothing about WhatsApp, MongoDB or Qt."""
 
     def __init__(self, host: str, port: int, token: str,
-                 send: Callable[[str, str], SendResponse]) -> None:
+                 send: Callable[[str, str], SendResponse],
+                 status: Optional[Callable[[str], SendResponse]] = None) -> None:
         self._host = host
         self._port = port
         self._token = token
         self._send = send
+        self._status = status
         self._httpd: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
         self._semaphore = threading.BoundedSemaphore(MAX_CONCURRENT_SENDS)
@@ -158,6 +160,17 @@ class SendApiServer:
         import hmac
 
         return hmac.compare_digest(supplied, self._token)
+
+    def handle_status(self, outgoing_id: str) -> SendResponse:
+        """Look up one queued message. Authenticated exactly like a send: it
+        returns message text and chat names, so it is not health-check data."""
+        if self._status is None:
+            return SendResponse(501, {"ok": False, "code": "unsupported",
+                                      "error": "Status lookup is not available."})
+        if not outgoing_id:
+            return SendResponse(400, {"ok": False, "code": "bad_request",
+                                      "error": "Missing message id."})
+        return self._status(outgoing_id)
 
     def handle_send(self, body: bytes) -> SendResponse:
         try:
@@ -274,8 +287,27 @@ def _make_handler(server: SendApiServer):
                 # names, no counts that would describe someone's conversations.
                 self._respond(200, server.health())
                 return
+
+            marker = "/status/"
+            if marker in path:
+                # Authenticated: unlike /health this returns a chat name and the
+                # message text.
+                if not server.authorized(self.headers):
+                    self._respond(401, {
+                        "ok": False, "code": "unauthorized",
+                        "error": "Missing or incorrect token. Send it as "
+                                 "'Authorization: Bearer <API_TOKEN>'.",
+                    })
+                    return
+                outgoing_id = path.rsplit(marker, 1)[1].strip("/")
+                response = server.handle_status(outgoing_id)
+                self._respond(response.status, response.payload)
+                return
+
             self._respond(405, {"ok": False, "code": "method_not_allowed",
-                                "error": "Use POST to send a message, or GET /health."})
+                                "error": "Use POST to send a message, GET "
+                                         "/wam/status/<id> for one message, or "
+                                         "GET /health."})
 
         def _respond(self, status: int, payload: dict) -> None:
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")

@@ -1,14 +1,21 @@
 """Wiring the send API to the engine.
 
 Everything policy-shaped lives here rather than in the HTTP layer: which chat an
-identifier resolves to, what each failure means in HTTP terms, and how long to
-wait for a send before giving up. `server.py` stays a transport.
+identifier resolves to, and what each failure means in HTTP terms. `server.py`
+stays a transport.
 
-The threading is the same pattern the UI uses. An HTTP request arrives on one of
-the server's worker threads, submits a coroutine to the engine's event loop with
-`run_coroutine_threadsafe`, and blocks on the resulting future. The engine loop
-is never blocked — only the request thread is, which is exactly what an HTTP
-caller waiting for a definitive answer wants.
+**A request is bounded by the enqueue, never by the send.** An HTTP request
+arrives on one of the server's worker threads, submits a coroutine to the
+engine's loop with `run_coroutine_threadsafe`, and waits only for the message to
+be written to the queue — about a millisecond. The physical send costs seconds
+and happens afterwards, on the engine's single drainer.
+
+This used to block on the send itself, and the arithmetic was fatal: at ~17s per
+send a burst of twenty needs almost six minutes, so every caller past the third
+got a `timeout` response for a message that was in fact delivered. A caller that
+retried on timeout would have duplicated real messages. Delivery is now reported
+through `GET /wam/status/<outgoing_id>` instead of through the response to the
+send.
 """
 
 from __future__ import annotations
@@ -21,6 +28,10 @@ from wadam.api.server import SendApiServer, SendResponse
 from wadam.config import Settings
 from wadam.engine.engine import AutomationEngine
 from wadam.storage.repository import Repository
+
+# How long to wait for the ENGINE to accept a message, not for
+# WhatsApp to send it. Enqueue is two sub-millisecond writes.
+_ENQUEUE_TIMEOUT_SECONDS = 10.0
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +47,7 @@ class SendApiHost:
             port=settings.api_port,
             token=settings.api_token,
             send=self._send,
+            status=self.status,
         )
 
     @property
@@ -94,24 +106,23 @@ class SendApiHost:
         chat = resolution.chat
         try:
             future = self._engine.submit(
-                lambda: self._engine.send_message(chat.chat_id, text, origin="api")
+                lambda: self._engine.queue_message(chat.chat_id, text, origin="api")
             )
         except Exception as ex:  # noqa: BLE001
             return SendResponse(503, {"ok": False, "code": "engine_unavailable",
                                       "error": str(ex)})
 
         try:
-            outcome = future.result(timeout=self._settings.api_send_timeout)
+            # Bounded by the ENQUEUE, not by the send. Writing to Mongo and the
+            # JSON mirror takes about a millisecond; if that cannot finish in
+            # ten seconds the machine has a much larger problem.
+            outcome = future.result(timeout=_ENQUEUE_TIMEOUT_SECONDS)
         except concurrent.futures.TimeoutError:
-            # The send may still complete after this: it holds the automation
-            # lock and will run to its own conclusion. Saying "timed out" rather
-            # than "failed" is the honest description, and the chat's activity
-            # panel will show what actually happened.
-            return SendResponse(504, {
-                "ok": False, "code": "timeout",
-                "error": f"The send did not complete within "
-                         f"{self._settings.api_send_timeout:.0f}s. It may still be in "
-                         f"progress — check the chat before retrying.",
+            return SendResponse(503, {
+                "ok": False, "code": "busy",
+                "error": "The engine did not accept the message within "
+                         f"{_ENQUEUE_TIMEOUT_SECONDS:.0f}s. Nothing was queued; "
+                         "this one is safe to retry.",
                 "chat": chat.chat_name,
             })
         except Exception as ex:  # noqa: BLE001 - the engine raised
@@ -120,20 +131,50 @@ class SendApiHost:
                                       "error": f"{type(ex).__name__}: {ex}"})
 
         if not outcome.ok:
-            # 502: the request was fine, the downstream (WhatsApp) did not
-            # deliver. Distinguishing this from a 4xx matters — the caller
-            # should retry this one, and not the others.
             return SendResponse(502, {
                 "ok": False, "code": "send_failed", "error": outcome.error,
                 "chat": chat.chat_name, "chat_id": chat.chat_id,
             })
 
-        return SendResponse(200, {
+        # 202, not 200: the message is ACCEPTED and durably queued, which is a
+        # different promise from "delivered". Callers that need delivery ask
+        # GET /wam/status/<outgoing_id>; the queue retries transport failures
+        # and verifies arrival against the conversation on its own.
+        return SendResponse(202, {
             "ok": True,
+            "status": "queued",
             "id": identifier,
             "chat": chat.chat_name,
             "chat_id": chat.chat_id,
             "matched_by": resolution.matched_by,
-            "strategy": outcome.strategy,
-            "message_key": outcome.message_key,
+            "outgoing_id": outcome.outgoing_id,
+            "status_url": f"/wam/status/{outcome.outgoing_id}",
+        })
+
+    def status(self, outgoing_id: str) -> SendResponse:
+        """What happened to one queued message.
+
+        The states worth acting on: `delivered` is confirmed present in the
+        conversation; `failed` exhausted its retries and never left the compose
+        box, so it is safe to resend; `unverified` left the box but was never
+        found in the chat, and is deliberately NOT retried automatically —
+        resending risks a duplicate, which is the worse failure."""
+        message = self._engine.outgoing_status(outgoing_id)
+        if message is None:
+            return SendResponse(404, {
+                "ok": False, "code": "unknown_id",
+                "error": f"No queued message with id '{outgoing_id}'.",
+            })
+        return SendResponse(200, {
+            "ok": True,
+            "outgoing_id": message.outgoing_id,
+            "status": str(message.status),
+            "chat": message.chat_name,
+            "chat_id": message.chat_id,
+            "text": message.text,
+            "attempts": message.attempts,
+            "verification": message.verification or "",
+            "error": message.error or "",
+            "queued_at": message.created_at.isoformat() if message.created_at else "",
+            "delivered_at": message.delivered_at.isoformat() if message.delivered_at else "",
         })

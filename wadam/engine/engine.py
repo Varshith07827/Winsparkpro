@@ -106,11 +106,16 @@ class SendOutcome:
     strategy: str = ""
     message_key: str = ""
     error: str = ""
+    outgoing_id: str = ""
+    queued: bool = False
 
 
 @dataclass
 class _Job:
-    kind: str          # "scan" | "process" | "resume" | "relay"
+    # "drain" carries no work of its own: the worker drains the outgoing queue
+    # after every job, so queueing one is how an API send wakes the drainer
+    # without waiting for the next poll tick.
+    kind: str          # "scan" | "process" | "resume" | "relay" | "drain"
     chat_id: str
     message: Optional[StoredMessage] = None
     relay: Optional[RelayMessage] = None
@@ -850,6 +855,37 @@ class AutomationEngine:
                        message=f"Rescan found {len(result.seen)} chats ({len(result.new)} new).")
         self.publish()
         return len(result.seen)
+
+    async def queue_message(self, chat_id: str, text: str,
+                            origin: str = "api") -> "SendOutcome":
+        """Put an explicitly requested send in the durable queue and return.
+
+        The entry point the inbound API uses. It does NOT wait for WhatsApp:
+        a physical send costs seconds, and a caller posting a burst of twenty
+        cannot hold twenty HTTP connections open for minutes — that was the
+        original design's mistake, and it produced `timeout` responses for
+        messages that had in fact been delivered.
+
+        Everything the queue provides applies from here on: the message is on
+        disk before this returns, it keeps its place in that chat's order, it
+        is retried on transport failure, its delivery is verified against the
+        conversation, and a crash mid-send is resolved by reading the chat
+        rather than by guessing."""
+        chat = self._repo.get_chat(chat_id)
+        if chat is None:
+            return SendOutcome(False, error="Chat not found.")
+        message = await self._delivery.enqueue(chat, text, origin=origin)
+        # Wake the drainer rather than waiting for the next poll tick.
+        self._enqueue(_Job("drain", chat_id))
+        self.publish()
+        return SendOutcome(True, outgoing_id=message.outgoing_id, queued=True)
+
+    def outgoing_status(self, outgoing_id: str):
+        """One queued message's current state, for the API's status lookup."""
+        for message in self._repo.all_outgoing():
+            if message.outgoing_id == outgoing_id:
+                return message
+        return None
 
     async def send_message(self, chat_id: str, text: str, origin: str = "api") -> "SendOutcome":
         """Send `text` to a chat and persist the result — the entry point the

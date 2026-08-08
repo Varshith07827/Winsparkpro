@@ -537,6 +537,12 @@ def set_compose_text_sync(window_handle: int, text: str,
     if text and value_pattern_worth_trying() and _try_value_pattern(compose, text):
         return True, "uia-value-pattern"
 
+    # Clearing a box that is already empty is the common case after a send, and
+    # it does not need the foreground, a click, or any input at all. Checking
+    # first saves ~2s per send.
+    if not text and _compose_is_blank(compose):
+        return True, "already-empty"
+
     if not ensure_foreground(window_handle):
         logger.warning("WhatsApp is not in the foreground; not typing (input would go elsewhere)")
         return False, ""
@@ -946,8 +952,13 @@ def chat_already_open(window_handle: int, target: str) -> bool:
     if not target:
         return False
     active = get_active_conversation_name_sync(window_handle)
-    if active and (active.strip().lower() == target.strip().lower() or chat_names_match(target, active)):
-        return True
+    if active:
+        # A name came back, so the question is already answered — matching or
+        # not. The header scan below costs ~2.5s and can only agree.
+        return (active.strip().lower() == target.strip().lower()
+                or chat_names_match(target, active))
+    # No name at all: a read-only/announcement group has no compose box to take
+    # the name from, so fall back to the (expensive) header read.
     return _conversation_header_matches(window_handle, target)
 
 

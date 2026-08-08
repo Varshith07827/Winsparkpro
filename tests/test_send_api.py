@@ -408,11 +408,21 @@ def test_a_malformed_response_from_the_send_path_still_answers():
 # ---------------------------------------------------------------------------
 
 
+def engine_chat_id(repo, name: str) -> str:
+    for c in repo.list_chats():
+        if c.chat_name == name:
+            return c.chat_id
+    raise AssertionError(f"no chat named {name}")
+
+
 class FakeEngine:
     def __init__(self, outcome: SendOutcome | None = None) -> None:
-        self.outcome = outcome or SendOutcome(True, strategy="test", message_key="k")
+        self.outcome = outcome or SendOutcome(True, outgoing_id="q1", queued=True)
         self.sent: list[tuple[str, str]] = []
         self.raise_on_submit: Exception | None = None
+        self.queued: list[tuple[str, str]] = []
+        self.calls: list[str] = []
+        self.status_result = None
 
     def submit(self, factory):
         if self.raise_on_submit:
@@ -421,13 +431,23 @@ class FakeEngine:
 
         future: concurrent.futures.Future = concurrent.futures.Future()
         coroutine = factory()
-        coroutine.close()  # we are not running it; the outcome is canned
+        # Which engine method the API reached for. The coroutine is never
+        # awaited (the outcome is canned), so this is the only record of it.
+        self.calls.append(coroutine.cr_code.co_name)
+        coroutine.close()
         future.set_result(self.outcome)
         return future
 
     async def send_message(self, chat_id: str, text: str, origin: str = "api"):
         self.sent.append((chat_id, text))
         return self.outcome
+
+    async def queue_message(self, chat_id: str, text: str, origin: str = "api"):
+        self.queued.append((chat_id, text))
+        return self.outcome
+
+    def outgoing_status(self, outgoing_id: str):
+        return self.status_result
 
 
 @pytest.fixture()
@@ -450,10 +470,53 @@ def test_a_resolved_send_reports_which_chat_it_reached(host):
 
     response = api_host._send("9423", "Hello Varshith")
 
-    assert response.status == 200
+    # 202, not 200: the message is queued, not yet delivered.
+    assert response.status == 202
     assert response.payload["chat"] == "Aarav Sharma"
     assert response.payload["matched_by"] == "external_id"
-    assert response.payload["strategy"] == "test"
+    assert response.payload["status"] == "queued"
+    assert response.payload["outgoing_id"] == "q1"
+
+
+def test_a_send_is_queued_rather_than_performed_inline(host):
+    """The request must not wait on WhatsApp.
+
+    A physical send costs seconds; a caller posting twenty of them cannot hold
+    twenty connections open for minutes. Blocking here is what produced
+    `timeout` responses for messages that had actually been delivered."""
+    api_host, repo, engine = host
+    repo.save_chat(chat("Aarav Sharma", "9423"))
+
+    api_host._send("9423", "Hello")
+
+    assert engine.calls == ["queue_message"], (
+        "the API must enqueue, not call the blocking send path"
+    )
+
+
+def test_a_status_lookup_reports_what_happened(host):
+    api_host, repo, engine = host
+    from wadam.domain.models import OutgoingMessage, OutgoingStatus
+
+    message = OutgoingMessage(chat_id="c1", chat_name="Aarav", text="Hello")
+    message.status = OutgoingStatus.DELIVERED
+    engine.status_result = message
+
+    response = api_host.status(message.outgoing_id)
+
+    assert response.status == 200
+    assert response.payload["status"] == "delivered"
+    assert response.payload["chat"] == "Aarav"
+
+
+def test_an_unknown_status_id_is_404(host):
+    api_host, _repo, engine = host
+    engine.status_result = None
+
+    response = api_host.status("nope")
+
+    assert response.status == 404
+    assert response.payload["code"] == "unknown_id"
 
 
 def test_an_ambiguous_id_returns_409_and_names_the_conflict(host):
