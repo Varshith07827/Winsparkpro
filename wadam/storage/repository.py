@@ -456,6 +456,24 @@ class Repository:
                        if m.status not in OutgoingStatus.FINAL]
         return sorted(pending, key=lambda m: (m.created_at or utcnow(), m.sequence))
 
+    def pending_counts(self) -> dict:
+        """Per chat, how many messages are still mid-flight.
+
+        Counts an incoming message from the moment it is stored until its
+        automation round trip finishes, plus anything still owed from the
+        outgoing queue. This is the only number the simplified UI shows, so it
+        has to mean something a user can act on: if it is not falling, the
+        automation is stuck."""
+        counts: dict = {}
+        with self._lock:
+            for message in self._messages:
+                if message.status in MessageStatus.INCOMPLETE:
+                    counts[message.chat_id] = counts.get(message.chat_id, 0) + 1
+            for outgoing in self._outgoing.values():
+                if outgoing.status not in OutgoingStatus.FINAL:
+                    counts[outgoing.chat_id] = counts.get(outgoing.chat_id, 0) + 1
+        return counts
+
     def all_outgoing(self) -> list[OutgoingMessage]:
         """Every queued message, finished or not — what a status lookup needs,
         since the interesting answers (delivered, failed, unverified) are all

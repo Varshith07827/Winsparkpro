@@ -55,14 +55,44 @@ def test_a_new_chat_arrives_inert(discovery):
     assert chat.seeded is False, "the backlog must not count as processed yet"
 
 
-def test_default_webhook_is_applied_to_new_chats_only(tmp_path: Path):
+def test_a_new_chat_stores_no_webhook_of_its_own(tmp_path: Path):
+    """The global template is the source of truth.
+
+    Chats used to each carry a copy of the default webhook, which then drifted
+    out of step the moment the default changed. Now the URL is derived from the
+    template and the chat's number every time it is needed."""
     repository, settings = make_repo(tmp_path, default_webhook="https://x.test/hook")
     engine_discovery = ChatDiscovery(repository, settings)
     chat = engine_discovery.sync([row("Alice")]).new[0]
-    assert chat.webhook_url == "https://x.test/hook"
+    assert chat.webhook_url == "", "a chat only stores a URL when overriding"
     # Still off: a webhook is a destination, not permission to use it.
     assert chat.automation_enabled is False
     repository.stop()
+
+
+def test_a_chat_named_by_its_number_resolves_a_phone_number(discovery):
+    engine_discovery, _repo = discovery
+    chat = engine_discovery.sync([row("+91 94231 55555")]).new[0]
+    assert chat.phone_number == "919423155555"
+
+
+def test_a_saved_contact_gets_no_invented_number(discovery):
+    """WhatsApp shows a saved contact by name and never exposes the number.
+
+    Storing anything here would build a webhook URL pointing at the wrong
+    person, so it stays empty until it can genuinely be resolved."""
+    engine_discovery, _repo = discovery
+    chat = engine_discovery.sync([row("Alice")]).new[0]
+    assert chat.phone_number == ""
+
+
+def test_a_resolved_number_is_never_overwritten_by_a_later_scan(discovery):
+    engine_discovery, repo = discovery
+    chat = engine_discovery.sync([row("+91 94231 55555")]).new[0]
+    chat.phone_number = "919999999999"      # corrected by hand
+    repo.save_chat(chat)
+    engine_discovery.sync([row("+91 94231 55555", message="new")])
+    assert repo.get_chat(chat.chat_id).phone_number == "919999999999"
 
 
 def test_an_unchanged_row_is_not_reported_as_changed(discovery):
@@ -92,7 +122,9 @@ def test_a_users_settings_survive_rediscovery(discovery):
     engine_discovery.sync([row("Alice")])
     chat = repository.get_chat(chat_id_for("Alice"))
     chat.automation_enabled = True
-    chat.webhook_url = "https://x.test/alice"
+    # A deliberate per-chat destination goes in the OVERRIDE. `webhook_url` is
+    # derived from the global template and is rebuilt on every pass.
+    chat.webhook_override = "https://x.test/alice"
     chat.seeded = True
     repository.save_chat(chat)
 
@@ -102,6 +134,45 @@ def test_a_users_settings_survive_rediscovery(discovery):
     assert after.webhook_url == "https://x.test/alice"
     assert after.seeded is True
     assert after.unread_count == 2
+
+
+def test_changing_the_template_updates_every_chat(discovery_factory=None):
+    """The template is the source of truth, so editing it must reach chats that
+    have had no new message since."""
+    import dataclasses
+    import tempfile
+    from pathlib import Path as _P
+
+    with tempfile.TemporaryDirectory() as tmp:
+        repository, settings = make_repo(_P(tmp))
+        one = dataclasses.replace(settings,
+                                  webhook_template="https://one.test/?{phone_number}")
+        chat = ChatDiscovery(repository, one).sync([row("+91 94231 55555")]).new[0]
+        assert chat.webhook_url == "https://one.test/?919423155555"
+
+        two = dataclasses.replace(settings,
+                                  webhook_template="https://two.test/?{phone_number}")
+        ChatDiscovery(repository, two).sync([row("+91 94231 55555")])
+        assert repository.get_chat(chat.chat_id).webhook_url ==             "https://two.test/?919423155555"
+        repository.stop()
+
+
+def test_a_chat_without_a_number_gets_no_url_at_all(discovery):
+    """Substituting an empty number would produce a valid-looking URL pointing
+    at nobody, and messages would post to it forever unnoticed."""
+    engine_discovery, _repo = discovery
+    chat = engine_discovery.sync([row("Alice")]).new[0]
+    assert chat.phone_number == ""
+    assert chat.webhook_url == ""
+
+
+def test_an_override_beats_the_template(discovery):
+    engine_discovery, repository = discovery
+    chat = engine_discovery.sync([row("+91 94231 55555")]).new[0]
+    chat.webhook_override = "https://elsewhere.test/hook"
+    repository.save_chat(chat)
+    engine_discovery.sync([row("+91 94231 55555", message="new")])
+    assert repository.get_chat(chat.chat_id).webhook_url == "https://elsewhere.test/hook"
 
 
 def test_group_hint_is_sticky(discovery):

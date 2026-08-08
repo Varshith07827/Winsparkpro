@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QEvent, Qt, Signal
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QHBoxLayout,
@@ -27,13 +27,14 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
 from wadam.domain.models import ChatConfig
 from wadam.ui import theme
-from wadam.ui.widgets import CHAT_ROLE, ChatItemDelegate
+from wadam.ui.widgets import CHAT_ROLE, ChatItemDelegate, checkbox_rect
 
 MIN_WIDTH = 320
 MAX_WIDTH = 560
@@ -53,7 +54,9 @@ def _sort_key(chat: ChatConfig):
 
 
 class ChatListPanel(QWidget):
-    chat_selected = Signal(str)   # chat_id
+    chat_selected = Signal(str)          # chat_id
+    automation_toggled = Signal(str, bool)   # chat_id, enabled
+    refresh_requested = Signal()
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -78,6 +81,10 @@ class ChatListPanel(QWidget):
         self._list.setUniformItemSizes(True)
         self._list.setVerticalScrollMode(QListWidget.ScrollPerPixel)
         self._list.currentItemChanged.connect(self._on_current_changed)
+        # The checkbox is painted, not a real widget, so the click has to be
+        # routed by geometry. `checkbox_rect` is shared with the painter so the
+        # target and the picture cannot drift apart.
+        self._list.viewport().installEventFilter(self)
         layout.addWidget(self._list, 1)
 
         # Keyboard: Ctrl+F (and Ctrl+K, the habit from every chat application)
@@ -123,6 +130,17 @@ class ChatListPanel(QWidget):
         text_column.addWidget(self._profile_name)
         text_column.addLayout(meta_row)
         row.addLayout(text_column, 1)
+
+        # Manual refresh. Everything updates by itself; this is for the moment
+        # somebody wants to be sure, which is a real need even when the
+        # automatic path is working.
+        self._refresh = QToolButton()
+        self._refresh.setObjectName("refreshButton")
+        self._refresh.setText("⟳")
+        self._refresh.setToolTip("Refresh the chat list")
+        self._refresh.setCursor(Qt.PointingHandCursor)
+        self._refresh.clicked.connect(self.refresh_requested.emit)
+        row.addWidget(self._refresh)
         # Styles the avatar only. NOT restyle() — that refreshes the list, which
         # does not exist yet at header-construction time.
         self._style_rail_avatar()
@@ -227,6 +245,25 @@ class ChatListPanel(QWidget):
             self._search.clear()
         else:
             self._list.setFocus(Qt.ShortcutFocusReason)
+
+    def eventFilter(self, watched, event):  # noqa: N802 - Qt naming
+        """Turn a click on the painted checkbox into a toggle.
+
+        Clicking anywhere else selects the chat, which is the rule the
+        specification asks for: selecting a chat must never switch its
+        automation on or off by accident."""
+        if watched is self._list.viewport() and event.type() == QEvent.MouseButtonRelease:
+            if event.button() == Qt.LeftButton:
+                point = event.position().toPoint()
+                item = self._list.itemAt(point)
+                if item is not None:
+                    chat = item.data(CHAT_ROLE)
+                    box = checkbox_rect(self._list.visualItemRect(item))
+                    if chat is not None and box.contains(point):
+                        self.automation_toggled.emit(
+                            chat.chat_id, not chat.automation_enabled)
+                        return True     # consumed: do NOT also select the chat
+        return super().eventFilter(watched, event)
 
     def _on_current_changed(self, current: Optional[QListWidgetItem], _previous) -> None:
         if current is None:

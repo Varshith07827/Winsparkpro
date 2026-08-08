@@ -26,7 +26,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 
 from wadam import constants
 from wadam.api.host import SendApiHost
-from wadam.config import ConfigError, Settings, load_settings
+from wadam.config import ConfigError, Settings, default_env_path, load_settings
 from wadam.logging_setup import configure_logging
 from wadam.storage.json_backup import JsonBackupStore
 from wadam.storage.mongo import MongoStore, MongoUnavailableError
@@ -34,6 +34,7 @@ from wadam.storage.repository import Repository
 from wadam.ui import theme
 from wadam.ui.engine_host import EngineHost
 from wadam.ui.main_window import MainWindow
+from wadam.ui.first_run import START, FirstRunDialog, needs_setup
 from wadam.ui.startup import RETRY, StartupErrorDialog, StartupWarningDialog
 
 logger = logging.getLogger(__name__)
@@ -122,6 +123,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     app.setFont(QFont("Segoe UI", 10))
 
     startup = _Startup()
+    # First run: ask the only two things the application cannot work out for
+    # itself, write .env, and never ask again. Anything already configured
+    # skips straight past this.
+    env_path = default_env_path()
+    if needs_setup(env_path):
+        if FirstRunDialog(env_path).exec() != START:
+            return 2
+
     while True:
         dialog = startup.attempt()
         if dialog is None:

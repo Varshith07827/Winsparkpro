@@ -402,7 +402,7 @@ def test_mongodb_failure_does_not_lose_the_queue_from_the_mirror(storage, tmp_pa
     ("http://127.0.0.1:9/unreachable", True),   # valid shape, fails at call time
 ])
 def test_invalid_webhook_urls_are_rejected_before_any_request(url, expect_ok):
-    from wadam.ui.config_panel import validate_webhook_url
+    from wadam.domain.webhook_url import validate_webhook_url
 
     assert validate_webhook_url(url)[0] is expect_ok
 

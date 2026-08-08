@@ -729,8 +729,14 @@ class AutomationEngine:
     def publish(self) -> None:
         status = self._repo.status()
         state = self._repo.poll_state
+        chats = self._repo.list_chats()
+        # Derived every time rather than stored: a pending count that survived a
+        # restart while the work behind it did not would be a lie on screen.
+        pending = self._repo.pending_counts()
+        for chat in chats:
+            chat.pending_count = pending.get(chat.chat_id, 0)
         snapshot = EngineSnapshot(
-            chats=self._repo.list_chats(),
+            chats=chats,
             logs=self._repo.recent_logs(limit=250),
             global_automation=self._repo.app_state.global_automation_enabled,
             whatsapp_found=self._hwnd is not None,

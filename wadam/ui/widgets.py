@@ -19,9 +19,20 @@ CHAT_ROLE = Qt.UserRole + 1
 
 ROW_HEIGHT = 72
 AVATAR_SIZE = 49
-PADDING_LEFT = 13
+CHECK_LEFT = 12
+CHECK_SIZE = 18
+PADDING_LEFT = CHECK_LEFT + CHECK_SIZE + 10
 TEXT_LEFT = PADDING_LEFT + AVATAR_SIZE + 13
 PADDING_RIGHT = 14
+
+
+def checkbox_rect(row: QRect) -> QRect:
+    """Where the automation checkbox sits. Shared by the painter and the click
+    handler so the thing you see and the thing you can hit are the same
+    rectangle by construction."""
+    return QRect(row.left() + CHECK_LEFT,
+                 row.top() + (ROW_HEIGHT - CHECK_SIZE) // 2,
+                 CHECK_SIZE, CHECK_SIZE)
 
 
 class ChatItemDelegate(QStyledItemDelegate):
@@ -49,6 +60,7 @@ class ChatItemDelegate(QStyledItemDelegate):
         painter.setPen(QPen(QColor(theme.DIVIDER), 1))
         painter.drawLine(rect.left() + TEXT_LEFT, rect.bottom(), rect.right(), rect.bottom())
 
+        self._paint_checkbox(painter, rect, chat)
         self._paint_avatar(painter, rect, chat)
 
         right_edge = rect.right() - PADDING_RIGHT
@@ -61,6 +73,24 @@ class ChatItemDelegate(QStyledItemDelegate):
         painter.restore()
 
     # -- pieces ------------------------------------------------------------
+
+    def _paint_checkbox(self, painter: QPainter, rect: QRect, chat) -> None:
+        """The automation switch — the one control in the whole chat list.
+
+        Drawn rather than made a real QCheckBox for the same reason the rest of
+        the row is drawn: several hundred rows. Kept visually quiet, as a
+        checkbox that shouts is a checkbox people are afraid to click."""
+        box = checkbox_rect(rect)
+        on = bool(chat.automation_enabled)
+        painter.setPen(QPen(QColor(theme.ACCENT if on else theme.MUTED), 1.4))
+        painter.setBrush(QBrush(QColor(theme.ACCENT)) if on else Qt.NoBrush)
+        painter.drawRoundedRect(box, 4, 4)
+        if on:
+            painter.setPen(QPen(QColor(theme.ACCENT_TEXT), 2.0))
+            painter.drawLine(box.left() + 4, box.center().y(),
+                             box.center().x() - 1, box.bottom() - 5)
+            painter.drawLine(box.center().x() - 1, box.bottom() - 5,
+                             box.right() - 4, box.top() + 5)
 
     def _paint_avatar(self, painter: QPainter, rect: QRect, chat) -> None:
         top = rect.top() + (ROW_HEIGHT - AVATAR_SIZE) // 2
@@ -97,26 +127,16 @@ class ChatItemDelegate(QStyledItemDelegate):
         x = rect.right() - PADDING_RIGHT
         y = rect.top() + 40
 
-        if chat.unread_count:
-            x = self._draw_pill(painter, x, y, str(chat.unread_count),
+        # ONE badge, and it does not mean "unread". It counts messages that
+        # arrived and have not yet finished the automation round trip, which is
+        # the only number in this application a user can act on: if it is not
+        # falling, something is wrong. WhatsApp's own unread count is not shown
+        # — the user can already see that in WhatsApp.
+        pending = int(getattr(chat, "pending_count", 0) or 0)
+        if pending:
+            x = self._draw_pill(painter, x, y, str(pending),
                                 fill=theme.ACCENT, text_color=theme.ACCENT_TEXT, bold=True)
             x -= 6
-        if chat.automation_enabled:
-            x = self._draw_pill(painter, x, y, "AUTO",
-                                fill=theme.ACCENT, text_color=theme.ACCENT_TEXT)
-            x -= 5
-        if (chat.webhook_url or "").strip():
-            # The badge carries this chat's connection status: red when the last
-            # webhook call failed, so a broken endpoint is visible in the list
-            # rather than only after clicking through to the panel.
-            status = (chat.last_webhook_status or "").lower()
-            failing = bool(status) and any(
-                word in status for word in ("fail", "timeout", "error")
-            )
-            colour = theme.DANGER if failing else theme.LINK
-            x = self._draw_pill(painter, x, y, "HOOK",
-                                fill="", text_color=colour, border=colour)
-            x -= 5
         return x
 
     def _draw_pill(self, painter: QPainter, right_x: int, center_y: int, text: str,

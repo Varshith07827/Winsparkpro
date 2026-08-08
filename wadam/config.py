@@ -15,11 +15,17 @@ MongoDB's own system database.
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from wadam.constants import POLL_INTERVAL_SECONDS
+from wadam.constants import (
+    DATABASE_NAME,
+    DEFAULT_WEBHOOK_TEMPLATE,
+    PHONE_PLACEHOLDER,
+    POLL_INTERVAL_SECONDS,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -74,10 +80,14 @@ class Settings:
     """The effective configuration. Immutable for the life of the process."""
 
     mongodb_uri: str = ""
-    database_name: str = "wadam"
+    #: Fixed, deliberately not configurable. Kept as a field so tests can use a
+    #: throwaway database, but nothing reads it from the environment.
+    database_name: str = DATABASE_NAME
     json_backup_folder: Path = field(default_factory=lambda: PROJECT_ROOT / "backup")
     json_autosave_interval: float = 15.0
 
+    #: The one webhook setting. `{phone_number}` is substituted per chat.
+    webhook_template: str = DEFAULT_WEBHOOK_TEMPLATE
     default_webhook: str = ""
     webhook_api_key: str = ""
     webhook_timeout: float = 20.0
@@ -121,6 +131,7 @@ class Settings:
             "database_name": self.database_name,
             "json_backup_folder": str(self.json_backup_folder),
             "json_autosave_interval": self.json_autosave_interval,
+            "webhook_template": self.webhook_template,
             "default_webhook": self.default_webhook,
             "webhook_api_key": "***" if self.webhook_api_key else "",
             "webhook_timeout": self.webhook_timeout,
@@ -193,15 +204,27 @@ def _as_int(values: dict[str, str], key: str, default: int, problems: list[str],
     return parsed
 
 
+def default_env_path() -> Path:
+    """Where `.env` lives: beside the executable, or the project root when run
+    from source. `WADAM_ENV_FILE` overrides both."""
+    override = os.environ.get("WADAM_ENV_FILE")
+    if override:
+        return Path(override)
+    if getattr(sys, "frozen", False):     # PyInstaller: next to the .exe
+        return Path(sys.executable).resolve().parent / ".env"
+    return PROJECT_ROOT / ".env"
+
+
 def load_settings(env_path: Optional[Path] = None) -> Settings:
     """Load and validate configuration, or raise ConfigError listing everything
     that's wrong. Real process environment variables win over `.env`, so a
     deployment can override a single value without editing the file."""
-    path = env_path or Path(os.environ.get("WADAM_ENV_FILE", PROJECT_ROOT / ".env"))
+    path = env_path or default_env_path()
     values = load_env_file(path)
     # Process environment overrides file values for the keys we know about.
     for key in (
-        "MONGODB_URI", "DATABASE_NAME", "JSON_BACKUP_FOLDER", "JSON_AUTOSAVE_INTERVAL",
+        "MONGODB_URI", "WEBHOOK_URL", "DATABASE_NAME",
+        "JSON_BACKUP_FOLDER", "JSON_AUTOSAVE_INTERVAL",
         "DEFAULT_WEBHOOK", "WEBHOOK_API_KEY", "WEBHOOK_TIMEOUT", "WEBHOOK_MAX_RETRIES",
         "WHATSAPP_WINDOW_TITLE", "LOG_LEVEL", "POLL_INTERVAL",
         "API_HOST", "API_PORT", "API_TOKEN", "API_SEND_TIMEOUT",
@@ -225,11 +248,24 @@ def load_settings(env_path: Optional[Path] = None) -> Settings:
     elif not mongodb_uri.startswith(("mongodb://", "mongodb+srv://")):
         problems.append("MONGODB_URI must start with mongodb:// or mongodb+srv://.")
 
-    database_name = (values.get("DATABASE_NAME") or "wadam").strip() or "wadam"
-    if database_name in {"admin", "local", "config"}:
-        problems.append(
-            f"DATABASE_NAME cannot be {database_name!r} — that's one of MongoDB's own "
-            f"system databases. Use a name of your own (e.g. wadam)."
+    # Fixed. It used to be configurable, which only ever created ways to get it
+    # wrong (DATABASE_NAME=admin put application collections in a system
+    # database). One less thing in .env, one less thing to validate.
+    database_name = DATABASE_NAME
+    if values.get("DATABASE_NAME"):
+        warnings.append(
+            f"DATABASE_NAME is ignored — the database is always {DATABASE_NAME!r}."
+        )
+
+    webhook_template = (values.get("WEBHOOK_URL")
+                        or values.get("DEFAULT_WEBHOOK")
+                        or DEFAULT_WEBHOOK_TEMPLATE).strip() or DEFAULT_WEBHOOK_TEMPLATE
+    if not webhook_template.startswith(("http://", "https://")):
+        problems.append("WEBHOOK_URL must be an http:// or https:// URL.")
+    elif PHONE_PLACEHOLDER not in webhook_template:
+        warnings.append(
+            f"WEBHOOK_URL has no {PHONE_PLACEHOLDER} placeholder, so every chat "
+            f"will use the same URL."
         )
 
     folder_raw = (values.get("JSON_BACKUP_FOLDER") or "backup").strip() or "backup"
@@ -306,6 +342,7 @@ def load_settings(env_path: Optional[Path] = None) -> Settings:
     return Settings(
         mongodb_uri=mongodb_uri,
         database_name=database_name,
+        webhook_template=webhook_template,
         json_backup_folder=folder,
         json_autosave_interval=autosave,
         default_webhook=default_webhook,

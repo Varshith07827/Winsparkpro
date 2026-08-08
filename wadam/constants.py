@@ -48,3 +48,15 @@ JSON_LOG_LIMIT = 2000
 
 # Rows kept in the automation_logs collection before the oldest are pruned.
 LOG_RETENTION_ROWS = 20000
+
+
+#: The MongoDB database. Fixed by the product specification and deliberately
+#: not configurable — a configurable name only ever produced ways to get it
+#: wrong.
+DATABASE_NAME = "wa_events"
+
+#: The token replaced with a chat's number when building its webhook URL.
+PHONE_PLACEHOLDER = "{phone_number}"
+
+#: The default webhook template. One setting instead of a URL per chat.
+DEFAULT_WEBHOOK_TEMPLATE = "https://noteify.org/ntext/whook/?{phone_number}"

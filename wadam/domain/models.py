@@ -134,9 +134,23 @@ class ChatConfig:
 
     chat_id: str = ""
     chat_name: str = ""
+    #: The contact's number, digits only, resolved at discovery where WhatsApp
+    #: exposes it. First-class because the webhook URL is built from it. Empty
+    #: means "not resolved" and is never guessed at — a wrong number would send
+    #: someone else's conversation to a webhook.
+    phone_number: str = ""
 
     # --- configuration -----------------------------------------------------
+    #: The URL actually called for this chat. **Derived**, not typed in:
+    #: regenerated from the global template and `phone_number` on every
+    #: discovery pass, so changing the template updates every chat. Stored
+    #: rather than computed at each use so the existing webhook, relay and
+    #: recovery paths did not all need rewriting around a new signature.
     webhook_url: str = ""
+    #: Set only when a chat deliberately points somewhere else. Wins over the
+    #: template. The simplified UI does not offer this; the data model keeps it
+    #: so an operator editing the database is not fighting the application.
+    webhook_override: str = ""
     automation_enabled: bool = False
     # The identifier the inbound send API addresses this chat by — by default
     # the last four digits of the contact's number, auto-filled at discovery
@@ -152,6 +166,11 @@ class ChatConfig:
     is_pinned: bool = False
     is_muted: bool = False
     is_group: bool = False
+
+    #: Messages received for this chat that have NOT yet finished the
+    #: automation round trip. Recomputed on every snapshot, never read back
+    #: from storage — a stale count is worse than no count.
+    pending_count: int = 0
 
     # --- live status -------------------------------------------------------
     last_poll_utc: Optional[datetime] = None

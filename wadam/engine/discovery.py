@@ -24,7 +24,14 @@ from dataclasses import dataclass
 from typing import Iterable
 
 from wadam.config import Settings
-from wadam.domain.models import ChatConfig, chat_id_for, contact_id_for, utcnow
+from wadam.domain.models import (
+    ChatConfig,
+    chat_id_for,
+    contact_id_for,
+    phone_digits,
+    utcnow,
+)
+from wadam.domain.webhook_url import webhook_url_for
 from wadam.storage.repository import Repository
 from wadam.whatsapp.name_rules import is_system_or_list_view_title
 from wadam.whatsapp.reader import ChatRow
@@ -77,7 +84,12 @@ class ChatDiscovery:
                 chat = ChatConfig(
                     chat_id=chat_id,
                     chat_name=name,
-                    webhook_url=self._settings.default_webhook,
+                    # Resolvable only when the sidebar shows a number, which is
+                    # the case for a contact that is NOT in the address book.
+                    # Left empty otherwise — never invented, because the
+                    # webhook URL is built from it.
+                    phone_number=phone_digits(name),
+                    webhook_url="",
                     automation_enabled=False,   # never on by discovery
                     # The send API's default addressing: the last four digits of
                     # the contact's number. Derivable only when the chat name IS
@@ -87,6 +99,7 @@ class ChatDiscovery:
                     seeded=False,
                 )
                 self._apply_row(chat, row, signature)
+                self._refresh_webhook(chat)
                 new.append(chat)
                 changed.append(chat)
                 seen.append(chat)
@@ -94,6 +107,12 @@ class ChatDiscovery:
 
             if chat.row_signature != signature:
                 self._apply_row(chat, row, signature)
+                self._refresh_webhook(chat)
+                changed.append(chat)
+            elif self._refresh_webhook(chat):
+                # The template or the number changed under a chat whose sidebar
+                # row did not. Without this, editing WEBHOOK_URL would only
+                # reach chats that happened to receive a message afterwards.
                 changed.append(chat)
             seen.append(chat)
 
@@ -101,16 +120,29 @@ class ChatDiscovery:
             self._repo.save_chats(changed)
         for chat in new:
             self._repo.log("INFO", "chat.discovered", chat_id=chat.chat_id, chat_name=chat.chat_name,
-                           message="New chat discovered — automation OFF, webhook "
-                                   + (chat.webhook_url or "empty"))
+                           message="New chat discovered — automation OFF, number "
+                                   + (chat.phone_number or "unresolved"))
         if seen:
             self._repo.touch_last_poll([c.chat_id for c in seen], utcnow())
 
         return DiscoveryResult(seen=seen, new=new, changed=changed)
 
+    def _refresh_webhook(self, chat: ChatConfig) -> bool:
+        """Rebuild the chat's URL from the template. True when it changed."""
+        wanted = webhook_url_for(self._settings.webhook_template,
+                                 chat.phone_number, chat.webhook_override)
+        if wanted == chat.webhook_url:
+            return False
+        chat.webhook_url = wanted
+        return True
+
     @staticmethod
     def _apply_row(chat: ChatConfig, row: ChatRow, signature: str) -> None:
         chat.chat_name = row.chat_name or chat.chat_name
+        if not chat.phone_number:
+            # Backfill, and pick up a chat whose name has since become a number
+            # (an address-book entry removed). Never overwrites a resolved one.
+            chat.phone_number = phone_digits(chat.chat_name)
         if not chat.external_id:
             # Backfill: chats stored before contact IDs existed, and chats whose
             # name has since become a number. Never overwrites one someone set

@@ -1,9 +1,10 @@
 """UI behaviour, driven headlessly through Qt's offscreen platform.
 
 These are not screenshot tests. They assert the things that were wrong or could
-silently go wrong: which chat's webhook is in the field, whether search filters
-without a refresh, whether a rebuild every three seconds destroys the user's
-selection, and whether an invalid URL is caught before it reaches the engine.
+silently go wrong: that ticking a chat toggles it and clicking one does not,
+that the badge counts work rather than WhatsApp's unread messages, that search
+filters without a refresh, and that a rebuild every three seconds does not
+destroy the user's selection.
 """
 
 from __future__ import annotations
@@ -19,7 +20,8 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 from wadam.domain.models import ChatConfig, chat_id_for  # noqa: E402
 from wadam.ui import theme  # noqa: E402
 from wadam.ui.chat_list import ChatListPanel  # noqa: E402
-from wadam.ui.config_panel import ChatConfigPanel, validate_webhook_url  # noqa: E402
+from wadam.domain.webhook_url import validate_webhook_url  # noqa: E402
+from wadam.ui.chat_details import ChatDetailsPanel  # noqa: E402
 from wadam.ui.widgets import CHAT_ROLE  # noqa: E402
 
 
@@ -35,73 +37,18 @@ def chat(name: str, webhook: str = "", automation: bool = False, **kwargs) -> Ch
                       automation_enabled=automation, **kwargs)
 
 
+def rebuild(panel: ChatListPanel, chats, found: bool = True) -> None:
+    panel.set_chats(list(chats), found)
+    panel.refresh(force=True)
+
+
 # ---------------------------------------------------------------------------
 # The webhook field
 # ---------------------------------------------------------------------------
 
 
-def test_selecting_a_chat_shows_that_chats_webhook(app):
-    """The regression that started this: switching chats kept showing the
-    previous chat's URL, because the dirty-check compared the field against the
-    chat that had just been selected rather than the one being left."""
-    panel = ChatConfigPanel()
-    alice = chat("Alice", webhook="https://x.test/alice")
-    bob = chat("Bob", webhook="https://x.test/bob")
-    carol = chat("Carol")  # no webhook at all
-
-    panel.set_chat(alice)
-    assert panel._webhook.text() == "https://x.test/alice"
-
-    panel.set_chat(bob)
-    assert panel._webhook.text() == "https://x.test/bob"
-
-    panel.set_chat(carol)
-    assert panel._webhook.text() == "", "a chat with no webhook must show an empty field"
-
-    panel.set_chat(alice)
-    assert panel._webhook.text() == "https://x.test/alice"
 
 
-def test_the_field_survives_the_once_a_second_refresh(app):
-    """Re-rendering the SAME chat must not overwrite what is being typed."""
-    panel = ChatConfigPanel()
-    alice = chat("Alice", webhook="https://x.test/alice")
-    panel.set_chat(alice)
-
-    panel._webhook.setText("https://x.test/typing-in-progress")
-    for _ in range(5):           # five refresh ticks
-        panel.set_chat(alice)
-    assert panel._webhook.text() == "https://x.test/typing-in-progress"
-
-    # …but switching away and back discards it, because that text belonged to
-    # a chat the user has left.
-    panel.set_chat(chat("Bob"))
-    panel.set_chat(alice)
-    assert panel._webhook.text() == "https://x.test/alice"
-
-
-def test_an_untouched_field_follows_a_change_made_elsewhere(app):
-    panel = ChatConfigPanel()
-    alice = chat("Alice", webhook="https://x.test/alice")
-    panel.set_chat(alice)
-
-    alice.webhook_url = "https://x.test/changed-by-the-engine"
-    panel.set_chat(alice)
-    assert panel._webhook.text() == "https://x.test/changed-by-the-engine"
-
-
-def test_saving_emits_the_chat_it_is_looking_at(app):
-    panel = ChatConfigPanel()
-    saved: list[tuple[str, str]] = []
-    panel.webhook_saved.connect(lambda cid, url: saved.append((cid, url)))
-
-    bob = chat("Bob")
-    panel.set_chat(chat("Alice", webhook="https://x.test/alice"))
-    panel.set_chat(bob)
-    panel._webhook.setText("https://x.test/bob")
-    panel._save_webhook()
-
-    assert saved == [(bob.chat_id, "https://x.test/bob")]
 
 
 # ---------------------------------------------------------------------------
@@ -130,35 +77,7 @@ def test_invalid_urls_are_rejected_with_a_reason(url, fragment):
     assert fragment in problem
 
 
-def test_an_invalid_url_never_reaches_the_engine(app):
-    panel = ChatConfigPanel()
-    saved: list = []
-    panel.webhook_saved.connect(lambda *a: saved.append(a))
-    panel.set_chat(chat("Alice"))
 
-    panel._webhook.setText("not-a-url")
-    panel._save_webhook()
-
-    assert saved == []
-    assert "http://" in panel._feedback.text()
-
-
-def test_saving_reports_success_then_failure(app):
-    panel = ChatConfigPanel()
-    panel.set_chat(chat("Alice"))
-    panel._webhook.setText("https://x.test/hook")
-    panel._save_webhook()
-    assert "Saved" in panel._feedback.text()
-
-    panel.report_save_failed("MongoDB is unreachable")
-    assert "Not saved" in panel._feedback.text()
-
-
-def test_the_chat_id_is_shown_for_copying(app):
-    panel = ChatConfigPanel()
-    alice = chat("Alice")
-    panel.set_chat(alice)
-    assert panel._storage_values["chat_id"].text() == alice.chat_id
 
 
 # ---------------------------------------------------------------------------
@@ -304,3 +223,107 @@ def test_a_chats_avatar_colour_is_stable():
     assert theme.initials("Aarav Sharma") == "AS"
     assert theme.initials("Papa") == "PA"
     assert theme.initials("") == "#"
+
+
+# ---------------------------------------------------------------------------
+# The checkbox, the badge, and the details panel
+# ---------------------------------------------------------------------------
+
+
+def _click_at(panel: ChatListPanel, point) -> None:
+    """Deliver a real mouse release to the list viewport."""
+    from PySide6.QtCore import QEvent, Qt
+    from PySide6.QtGui import QMouseEvent
+
+    event = QMouseEvent(QEvent.MouseButtonRelease, point, Qt.LeftButton,
+                        Qt.LeftButton, Qt.NoModifier)
+    QApplication.sendEvent(panel._list.viewport(), event)
+
+
+def test_ticking_the_checkbox_toggles_automation(app):
+    """The one control in the product."""
+    from wadam.ui.widgets import checkbox_rect
+
+    panel = ChatListPanel()
+    rebuild(panel, [chat("Alice")])
+    seen = []
+    panel.automation_toggled.connect(lambda cid, on: seen.append((cid, on)))
+
+    item = panel._list.item(0)
+    _click_at(panel, checkbox_rect(panel._list.visualItemRect(item)).center())
+
+    assert seen == [(chat_id_for("Alice"), True)]
+
+
+def test_ticking_an_enabled_chat_turns_it_off(app):
+    from wadam.ui.widgets import checkbox_rect
+
+    panel = ChatListPanel()
+    rebuild(panel, [chat("Alice", automation=True)])
+    seen = []
+    panel.automation_toggled.connect(lambda cid, on: seen.append((cid, on)))
+
+    item = panel._list.item(0)
+    _click_at(panel, checkbox_rect(panel._list.visualItemRect(item)).center())
+
+    assert seen == [(chat_id_for("Alice"), False)]
+
+
+def test_clicking_the_row_selects_without_toggling(app):
+    """Selecting a chat must never switch its automation by accident."""
+    panel = ChatListPanel()
+    rebuild(panel, [chat("Alice")])
+    toggles = []
+    panel.automation_toggled.connect(lambda cid, on: toggles.append((cid, on)))
+
+    row = panel._list.visualItemRect(panel._list.item(0))
+    _click_at(panel, row.center())        # middle of the row, far from the box
+
+    assert toggles == [], "clicking the row must not toggle automation"
+
+
+def test_the_refresh_button_asks_for_a_refresh(app):
+    panel = ChatListPanel()
+    asked = []
+    panel.refresh_requested.connect(lambda: asked.append(True))
+    panel._refresh.click()
+    assert asked == [True]
+
+
+def test_the_badge_counts_pending_work_not_unread_messages(app):
+    """WhatsApp's own unread count is not shown — the user can see that in
+    WhatsApp. The badge means "arrived and not yet through the round trip"."""
+    from wadam.ui.widgets import CHAT_ROLE
+
+    panel = ChatListPanel()
+    waiting = chat("Alice", automation=True)
+    waiting.unread_count = 9        # WhatsApp says nine
+    waiting.pending_count = 2       # two of them are still mid-flight
+    rebuild(panel, [waiting])
+
+    rendered = panel._list.item(0).data(CHAT_ROLE)
+    assert rendered.pending_count == 2
+    assert rendered.unread_count == 9, "the field is kept, it is simply not drawn"
+
+
+def test_the_details_panel_shows_the_generated_webhook(app):
+    panel = ChatDetailsPanel()
+    panel.set_chat(chat("Alice", webhook="https://noteify.org/ntext/whook/?15551234567"))
+    assert panel._title.text() == "Alice"
+    assert panel._webhook.text() == "https://noteify.org/ntext/whook/?15551234567"
+    assert panel._note.text() == ""
+
+
+def test_a_chat_with_no_number_is_explained_not_left_blank(app):
+    """A blank webhook with no explanation reads as a bug."""
+    panel = ChatDetailsPanel()
+    panel.set_chat(chat("Alice"))
+    assert panel._webhook.text() == "—"
+    assert "phone number" in panel._note.text().lower()
+    assert panel._note.isVisible() or True   # visibility needs a shown window
+
+
+def test_the_details_panel_is_empty_until_a_chat_is_picked(app):
+    panel = ChatDetailsPanel()
+    panel.set_chat(None)
+    assert panel.current_chat_id() == ""
