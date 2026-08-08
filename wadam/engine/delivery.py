@@ -31,6 +31,7 @@ worse than a late one.
 from __future__ import annotations
 
 import logging
+import time
 from wadam.domain.models import (
     OutgoingMessage,
     OutgoingStatus,
@@ -39,9 +40,29 @@ from wadam.domain.models import (
     utcnow,
 )
 from wadam.storage.repository import Repository
-from wadam.whatsapp.verifier import SendVerifier
+from wadam.whatsapp.verifier import (
+    SendVerifier,
+    Verification,
+    VerificationResult,
+    normalise,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _consecutive_by_chat(messages):
+    """Group a queue slice into runs of the same chat, order preserved.
+
+    Deliberately consecutive rather than grouped-by-key: reordering the queue to
+    put all of one chat's messages together would break the guarantee that
+    messages leave in the order they were produced."""
+    groups: list = []
+    for message in messages:
+        if groups and groups[-1][0] == message.chat_id:
+            groups[-1][1].append(message)
+        else:
+            groups.append((message.chat_id, [message]))
+    return groups
 
 
 class DeliveryService:
@@ -76,6 +97,131 @@ class DeliveryService:
         return message
 
     # -- delivering --------------------------------------------------------
+
+    async def deliver_batch(self, messages: list) -> list:
+        """Drain a backlog as one run rather than one message at a time.
+
+        Same guarantees, far less overhead. Per-message delivery pays, for every
+        message: a session probe, a wait for the desktop to go quiet, a
+        foreground change and its restore, a pre-send census read and a
+        post-send verification read — the two reads costing about two seconds
+        each. Twenty messages paid that twenty times.
+
+        Here the batch takes the foreground once, and each chat gets **one**
+        census read before its messages and **one** verification read after
+        them.
+
+        What does not change: messages keep their per-chat order, a transport
+        failure is still retried, and verification still requires the bubble
+        count to have *increased* — including for repeated identical text,
+        where sending "OK" three times must produce three new bubbles.
+        Consecutive messages are grouped by chat so ordering across chats is
+        preserved exactly as the queue produced it."""
+        if not messages:
+            return []
+
+        delivered: list = []
+        async with self._sender.batch() as send:
+            for chat_id, group in _consecutive_by_chat(messages):
+                chat = self._repo.get_chat(chat_id)
+                if chat is None:
+                    for message in group:
+                        message.status = OutgoingStatus.CANCELLED
+                        message.error = "the chat no longer exists"
+                        await self._to_thread(self._repo.update_outgoing, message)
+                        delivered.append(message)
+                    continue
+                delivered.extend(await self._deliver_group(chat, group, send))
+        return delivered
+
+    async def _deliver_group(self, chat, group: list, send) -> list:
+        """One chat's slice of a batch: census once, send each, verify once."""
+        before = await self._verifier.census_many(
+            chat.chat_name, [m.text for m in group])
+
+        sent: list = []
+        results: dict = {}
+        for message in group:
+            message.attempts += 1
+            message.status = OutgoingStatus.SENDING
+            await self._to_thread(self._repo.update_outgoing, message)
+
+            result = await send(chat.chat_name, message.text)
+            results[message.outgoing_id] = result
+            logger.debug("batch send %d/%d in %d ms (%s)", len(results), len(group),
+                        result.duration_ms, result.strategy or result.detail)
+            if not result.ok:
+                await self._transport_failed(chat, message, result)
+                continue
+
+            message.status = OutgoingStatus.VERIFYING
+            await self._to_thread(self._repo.update_outgoing, message)
+            sent.append(message)
+
+        if not sent:
+            return list(group)
+
+        if before is None:
+            # The conversation could not be read, so a new bubble cannot be
+            # told apart from one already there. Every message that left the
+            # box is UNVERIFIED — never re-sent on a guess.
+            for message in sent:
+                verification = VerificationResult(
+                    Verification.UNREADABLE,
+                    "the conversation could not be read before sending, so a new "
+                    "bubble cannot be told apart from one that was already there",
+                )
+                message.verification = verification.status
+                if self._metrics:
+                    self._metrics.record_verification(verification)
+                await self._unverified(chat, message, results[message.outgoing_id],
+                                       verification)
+            return list(group)
+
+        # How many bubbles of each text should exist once this batch has landed:
+        # the baseline plus one per copy actually sent.
+        expected = dict(before)
+        for message in sent:
+            key = normalise(message.text)
+            expected[key] = expected.get(key, 0) + 1
+
+        started = time.monotonic()
+        seen = await self._verifier.confirm_many(chat.chat_name, expected, before)
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+
+        # Attribute the result per message. For repeated identical text the
+        # nth copy needs the count to have reached baseline + n, so a batch that
+        # delivered two of three "OK"s marks exactly one as unverified.
+        landed: dict = dict(before)
+        for message in sent:
+            key = normalise(message.text)
+            landed[key] = landed.get(key, 0) + 1
+            result = results[message.outgoing_id]
+            if seen.get(key, 0) >= landed[key]:
+                verification = VerificationResult(
+                    Verification.VERIFIED, "",
+                    elapsed_ms=elapsed_ms,
+                    matches_before=before.get(key, 0),
+                    matches_after=seen.get(key, 0),
+                )
+                message.verification = verification.status
+                if self._metrics:
+                    self._metrics.record_verification(verification)
+                await self._delivered(chat, message, result, verification)
+            else:
+                verification = VerificationResult(
+                    Verification.NOT_FOUND,
+                    f"expected {landed[key]} copies of this text in the chat, "
+                    f"found {seen.get(key, 0)}",
+                    elapsed_ms=elapsed_ms,
+                    matches_before=before.get(key, 0),
+                    matches_after=seen.get(key, 0),
+                )
+                message.verification = verification.status
+                if self._metrics:
+                    self._metrics.record_verification(verification)
+                await self._unverified(chat, message, result, verification)
+        return list(group)
 
     async def deliver(self, message: OutgoingMessage) -> OutgoingMessage:
         """Take one queued message all the way to delivered-or-failed."""

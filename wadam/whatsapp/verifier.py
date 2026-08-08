@@ -116,6 +116,50 @@ class SendVerifier:
         self._read = read_messages
         self._timeout = timeout
 
+    async def census_many(self, chat_name: str, texts) -> Optional[dict]:
+        """One read, a baseline count for every text in a batch.
+
+        A backlog of twenty messages does not need twenty pre-send reads at two
+        seconds each. `None` means the conversation could not be read, which
+        makes the whole batch `unreadable` — the same honest answer `census`
+        gives for one message."""
+        try:
+            messages = await self._read(chat_name)
+        except Exception as ex:  # noqa: BLE001
+            logger.debug("batch census failed: %s", ex)
+            return None
+        if messages is None:
+            return None
+        return {normalise(t): count_outgoing(messages, t) for t in texts}
+
+    async def confirm_many(self, chat_name: str, expected: dict,
+                           before: dict) -> Optional[dict]:
+        """Poll once for a whole batch. Returns {normalised text: count seen}.
+
+        `expected[text]` is how many bubbles of that text should exist by the
+        end — the baseline plus however many copies this batch sent. Counting
+        rather than merely looking is what makes repeated identical messages
+        verifiable: sending "OK" three times must produce three new bubbles,
+        and two would be a real loss that a presence check would call success.
+
+        Returns as soon as every expectation is met, so a healthy batch pays
+        one read rather than one per message."""
+        started = time.monotonic()
+        seen: dict = dict(before)
+        while (time.monotonic() - started) < self._timeout:
+            await asyncio.sleep(VERIFY_POLL_SECONDS)
+            try:
+                messages = await self._read(chat_name)
+            except Exception as ex:  # noqa: BLE001
+                logger.debug("batch verification read failed: %s", ex)
+                continue
+            if messages is None:
+                continue
+            seen = {key: count_outgoing(messages, key) for key in expected}
+            if all(seen.get(key, 0) >= need for key, need in expected.items()):
+                return seen
+        return seen
+
     async def census(self, chat_name: str, text: str) -> Optional[int]:
         """How many matching outgoing bubbles exist *before* sending.
 

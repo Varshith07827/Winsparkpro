@@ -57,6 +57,7 @@ import asyncio
 import logging
 import re
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from typing import Optional
 
@@ -124,6 +125,8 @@ class SendResult:
     used_clipboard: bool = False
     recovery_used: str = ""          # non-empty when a fallback rung was needed
     foreground_restored: bool = False
+    #: So a batch can reuse it instead of re-finding the window per message.
+    window_handle: int = 0
 
     @classmethod
     def succeeded(cls, strategy: str, **kw) -> "SendResult":
@@ -1157,6 +1160,74 @@ class WhatsAppSender:
             messages = await self._reader.read_recent_messages_async(window_handle, limit)
             return window_handle, messages
 
+    @asynccontextmanager
+    async def batch(self):
+        """Hold the lock, the quiet moment and the foreground for a whole run.
+
+        A backlog is one interruption, not twenty. Sending each queued message
+        through `send_async` re-probes the session, waits for the desktop to go
+        quiet, takes the foreground and hands it back — per message. For a
+        drain of twenty that is nineteen needless waits and nineteen extra
+        foreground changes, and the user's desktop flickers once per message
+        instead of once per burst.
+
+        Yields a `send(chat_name, text)` coroutine with the same signature and
+        return type as `send_async`, so the delivery code does not care which
+        it was given. If the session cannot accept input, every send in the
+        batch fails with that reason rather than silently going nowhere."""
+        state = session.probe(self._title_hint())
+        blocked = (state.send_blocked_reason or "Sending is not possible right now."
+                   if state.can_send == session.Health.BLOCKED else "")
+
+        if blocked:
+            async def refuse(chat_name: str, message_text: str) -> SendResult:
+                return SendResult.failed(blocked)
+            yield refuse
+            return
+
+        async with self._sta.action_lock:
+            await self._wait_for_a_quiet_moment()
+            previous = await self._sta.invoke_async(previous_foreground)
+
+            # Which conversation the last send left open. Re-finding the chat
+            # row costs ~3.5s, and for consecutive messages to one chat the
+            # answer has not changed — the action lock is held for the whole
+            # batch, so nothing else can switch conversations underneath it.
+            still_open = {"chat": "", "hwnd": None}
+
+            async def send(chat_name: str, message_text: str) -> SendResult:
+                if not (message_text or "").strip():
+                    return SendResult.failed("Nothing to send (the reply was empty).")
+                started = time.monotonic()
+                result = await self._send_locked(
+                    chat_name, message_text,
+                    assume_open=(still_open["chat"] == chat_name),
+                    known_hwnd=still_open["hwnd"],
+                )
+                # Only a confirmed send proves the chat is still open. Anything
+                # else and the next message pays for a full resolve rather than
+                # trusting a guess.
+                still_open["chat"] = chat_name if result.ok else ""
+                if result.window_handle:
+                    still_open["hwnd"] = result.window_handle
+                return replace(
+                    result,
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                    activated_window=True,
+                )
+
+            try:
+                yield send
+            finally:
+                restored = await self._sta.invoke_async(
+                    lambda: restore_foreground(previous))
+                if self._metrics:
+                    self._metrics.record_focus_restore(restored)
+
+    def _title_hint(self) -> str:
+        return (self._reader._title_hint
+                if hasattr(self._reader, "_title_hint") else "WhatsApp")
+
     async def send_async(self, chat_name: str, message_text: str) -> SendResult:
         """Send `message_text` to `chat_name`, verified.
 
@@ -1179,7 +1250,7 @@ class WhatsAppSender:
         if not (message_text or "").strip():
             return SendResult.failed("Nothing to send (the reply was empty).")
 
-        state = session.probe(self._reader._title_hint if hasattr(self._reader, "_title_hint") else "WhatsApp")
+        state = session.probe(self._title_hint())
         if state.can_send == session.Health.BLOCKED:
             return SendResult.failed(state.send_blocked_reason or "Sending is not possible right now.")
 
@@ -1217,8 +1288,30 @@ class WhatsAppSender:
         logger.info("sending after waiting %.0fs for an idle desktop — going ahead anyway",
                     waited)
 
-    async def _send_locked(self, chat_name: str, message_text: str) -> SendResult:
+    async def _send_locked(self, chat_name: str, message_text: str,
+                           assume_open: bool = False,
+                           known_hwnd: Optional[int] = None) -> SendResult:
+        """`assume_open` skips finding and opening the chat row.
+
+        Only ever set by `batch()`, and only after a send to this same chat has
+        already succeeded. It is still CHECKED — the conversation's own name is
+        read back (~0.8s) before anything is typed, and a mismatch falls through
+        to the full path. Skipping the check as well would save another second
+        and risk the one failure worth avoiding above all others: a message
+        typed into somebody else's conversation."""
+        _t = [("start", time.monotonic())]
+        if assume_open and known_hwnd:
+            # The window handle does not change within a batch, and the
+            # conversation's own name is the cheapest possible proof that the
+            # right chat is still open — one read, no tree walk for the row.
+            active = await self._reader.get_active_conversation_name_async(known_hwnd)
+            _t.append(("guard", time.monotonic()))
+            if active and (active.strip().lower() == chat_name.strip().lower()
+                           or chat_names_match(chat_name, active)):
+                return await self._fill_and_send(known_hwnd, chat_name,
+                                                 message_text, _t)
         window_handle, row = await self.resolve_chat_row_async(chat_name)
+        _t.append(("resolve", time.monotonic()))
         if window_handle is None:
             return SendResult.failed("WhatsApp Desktop is not running.")
         if row is None:
@@ -1230,17 +1323,28 @@ class WhatsAppSender:
         if not opened:
             return SendResult.failed(f"Could not open chat '{chat_name}'.")
 
+        _t.append(("open", time.monotonic()))
         await asyncio.sleep(0.3)  # let the compose box swap to the new conversation
 
         active = await self._reader.get_active_conversation_name_async(window_handle)
+        _t.append(("active", time.monotonic()))
         if active is None and not await self._sta.invoke_async(
             lambda: _conversation_header_matches(window_handle, chat_name)
         ):
             return SendResult.failed("Compose box not found after opening the chat.")
 
+        return await self._fill_and_send(window_handle, chat_name, message_text, _t)
+
+    async def _fill_and_send(self, window_handle: int, chat_name: str,
+                             message_text: str, _t: list) -> SendResult:
+        """Everything from "the right chat is open" to "the box came back empty".
+
+        Shared by the normal path and by `batch()`'s already-open fast path, so
+        the two cannot drift apart in how they fill, send or confirm."""
         filled, strategy = await self._sta.invoke_async(
             lambda: set_compose_text_sync(window_handle, message_text, self._use_clipboard)
         )
+        _t.append(("fill", time.monotonic()))
         if not filled:
             # Clear up after a PARTIAL fill too: returning straight out leaves
             # whatever landed sitting in the box for the user to find, and the
@@ -1266,7 +1370,12 @@ class WhatsAppSender:
                 for _ in range(10):
                     await asyncio.sleep(0.25)
                     if await self._sta.invoke_async(lambda: compose_is_empty_sync(window_handle)):
-                        return SendResult.succeeded(f"{strategy} + {how}")
+                        _t.append(("confirm", time.monotonic()))
+                        logger.debug("send phases: %s", " ".join(
+                            f"{name}={int((t - _t[i][1]) * 1000)}ms"
+                            for i, (name, t) in enumerate(_t[1:])))
+                        return SendResult.succeeded(f"{strategy} + {how}",
+                                                    window_handle=window_handle)
                 leftover = await self._sta.invoke_async(
                     lambda: read_compose_text_sync(window_handle)
                 )

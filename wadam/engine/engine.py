@@ -157,6 +157,7 @@ class AutomationEngine:
         self._queued_chats: set[str] = set()
         self._hwnd: Optional[int] = None
         self._busy_with = ""
+        self._draining = False
         self._last_error = ""
         self._active_chat_name = ""
         # When each chat's webhook was last GETted, by chat id (monotonic).
@@ -363,6 +364,14 @@ class AutomationEngine:
         self.publish()
 
     async def _cycle(self) -> None:
+        if self._draining:
+            # A drain is sending a backlog right now. This cycle's conversation
+            # read costs ~2s on the same STA thread, so running it here does not
+            # just delay the poll — it delays every message in the batch behind
+            # it. Measured: it tripled the cost of a send inside a batch, from
+            # ~0.8s to ~4.6s for a single name read. Nothing is missed; the next
+            # cycle picks it up as soon as the queue is empty.
+            return
         hwnd = self._hwnd
         if hwnd is None or not await self._reader.window_is_alive_async(hwnd):
             previous = self._hwnd
@@ -541,22 +550,27 @@ class AutomationEngine:
         Runs on the worker, so sends stay serialized against chat scans and
         against each other — the ordering guarantee comes from the queue's
         per-chat sequence, and the safety from there being exactly one drainer."""
-        for message in await asyncio.to_thread(self._repo.pending_outgoing):
-            if self._stop.is_set():
-                return
-            if message.status in OutgoingStatus.AMBIGUOUS:
-                continue      # handled at startup, never mid-run
-            self._busy_with = message.chat_name
-            self.publish()
-            try:
-                await self._delivery.deliver(message)
-            except Exception as ex:  # noqa: BLE001 - one bad message must not stall the queue
-                logger.exception("Delivering a queued message failed")
-                self._repo.log("ERROR", "outgoing.error", chat_id=message.chat_id,
-                               chat_name=message.chat_name, error=str(ex),
-                               message="Unexpected failure while delivering.")
-            finally:
-                self._busy_with = ""
+        pending = [m for m in await asyncio.to_thread(self._repo.pending_outgoing)
+                   if m.status not in OutgoingStatus.AMBIGUOUS]  # resolved at startup
+        if not pending or self._stop.is_set():
+            return
+
+        # The whole backlog goes out as one run: one foreground change, one
+        # census read per chat, one verification read per chat. Draining message
+        # by message made a burst of twenty take twenty times the setup.
+        self._busy_with = pending[0].chat_name
+        self._draining = True
+        self.publish()
+        try:
+            await self._delivery.deliver_batch(pending)
+        except Exception as ex:  # noqa: BLE001 - one bad batch must not stall the queue
+            logger.exception("Delivering the outgoing queue failed")
+            self._repo.log("ERROR", "outgoing.error", chat_id=pending[0].chat_id,
+                           chat_name=pending[0].chat_name, error=str(ex),
+                           message="Unexpected failure while delivering.")
+        finally:
+            self._draining = False
+            self._busy_with = ""
 
     # -- relay -------------------------------------------------------------
 

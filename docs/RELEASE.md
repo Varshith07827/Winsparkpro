@@ -13,7 +13,7 @@ WhatsApp Desktop MSIX `2.2630.102.0` · RDP session 4 (console session 5).
 ## 1. Test results
 
 ```
-305 passed
+313 passed
 ```
 
 The storage-dependent suites run **twice** — once against a dict-backed fake
@@ -221,7 +221,7 @@ Three cases prove the census logic rather than mere presence:
 | 24-hour stability | ❌ | **Not run.** Unverified |
 | **Security** | ✅ | §7 |
 | **Testing** | | |
-| Unit + integration | ✅ | 305 tests |
+| Unit + integration | ✅ | 313 tests |
 | Real MongoDB | ✅ | Storage suites run against both stores |
 | Real WhatsApp reads | ✅ | Live probes and benchmarks |
 | **Real WhatsApp send end-to-end** | ✅ | Failed at first (§11), **root cause found and fixed (§12)**; 5/5 verified in the chat |
@@ -539,6 +539,79 @@ against a previous **17.0s** cadence that did no verification at all.
 
 * `find_window_sync` matches four top-level windows by title, including this
   application's own. It resolves correctly today by ordering, not by design.
-* A queued burst still drains at ~11s per message. That is throughput, not
-  correctness — nothing is lost or duplicated — but a caller sending hundreds
-  should know the queue is the buffer.
+* Filling the compose box (~1.5s) and confirming the box emptied (~1.6s) are
+  now the floor. Both are Chromium accessibility-tree walks; a narrower walk is
+  the remaining win.
+
+---
+
+## 14. Draining a backlog as one run (2026-08-08)
+
+§13 made bursts safe. They were still slow: a queue of twenty took **329
+seconds**, because delivery paid the full per-message setup twenty times.
+
+### What each message was paying for
+
+Measured inside a live drain, per send:
+
+| Phase | Before |
+|---|---:|
+| Find the chat row | 3.5 s |
+| Open the chat | 0.3 s |
+| Read the active conversation | 0.8 s |
+| Fill the compose box | 4.9 s |
+| Confirm the box emptied | 1.6 s |
+
+Plus, per message: a session probe, a wait for the desktop to go quiet, a
+foreground change and its restore, a pre-send census read and a post-send
+verification read.
+
+### Three changes
+
+1. **One run, not twenty.** `WhatsAppSender.batch()` holds the action lock, the
+   quiet moment and the foreground for the whole drain, and
+   `DeliveryService.deliver_batch` takes **one** census read before a chat's
+   messages and **one** verification read after them. The desktop is
+   interrupted once per burst instead of once per message.
+2. **Don't re-find a chat that never closed.** Consecutive messages to one chat
+   skip finding and opening the row. The conversation's own name is still read
+   back before anything is typed — a mismatch falls through to the full path,
+   because a message typed into the wrong conversation is the one failure worth
+   paying a second to avoid.
+3. **Stop polling while draining.** The 3-second poll reads the open
+   conversation (~2 s) on the same STA thread, so it was not just delaying the
+   poll — it was delaying every message queued behind it. This was the single
+   biggest cost: the already-open guard measured **4.6 s** with polling active
+   and **0.4 s** without.
+
+### Measured, 20 messages to one chat, queue cleared first
+
+| | Per message | 20 messages |
+|---|---:|---:|
+| Blocking, unqueued (§11) | ~17 s | ~340 s, 19 reported as timeouts |
+| Queued, one at a time (§13) | 16.4 s | 329 s |
+| Batched | 8.3 s | 213 s |
+| Batched + open-chat reuse | 8.2 s | 216 s |
+| **+ polling paused while draining** | **5.2 s** | **104 s** |
+
+Send phases after: `guard=0.4s fill=1.55s confirm=1.6s` — **3.6 s of actual
+send**, against 11 s before.
+
+**20/20 delivered and verified**, in order, no duplicates, in all runs.
+
+### What did not change
+
+Every guarantee. `tests/test_batch_delivery.py` pins them: per-chat ordering,
+interleaving preserved across chats (grouping is by *consecutive* chat, since
+sorting the queue would be faster still and would break the ordering promise),
+transport failures retried without stopping the batch, an unreadable
+conversation marking the whole batch UNVERIFIED rather than guessing, and — the
+one batching could most easily get wrong — three identical messages each
+requiring their own new bubble, with a batch that half-lands marking exactly
+the missing ones.
+
+### Note on the poll pause
+
+Nothing is missed. Incoming messages are picked up on the first cycle after the
+queue empties. The trade is deliberate: while there is a backlog to send,
+sending it is more urgent than noticing new arrivals a few seconds sooner.
