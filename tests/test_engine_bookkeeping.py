@@ -119,3 +119,30 @@ def test_a_raising_repository_does_not_stop_the_loop(repo: Repository, monkeypat
         return survived
 
     assert asyncio.run(run_guarded()) == 12
+
+
+def test_draining_cannot_suspend_discovery_forever():
+    """A producer that never stops must not starve incoming-message discovery.
+
+    This happened, on a real contact: a relay endpoint returned a message on
+    every 3-second poll, so the drainer was permanently busy, the poll cycle
+    was skipped every time, and a genuine incoming message ("Hey it worked")
+    was never read or stored at all. Sending a backlog outranks discovery for a
+    few seconds — never indefinitely."""
+    import time
+
+    from wadam.engine.engine import MAX_DRAIN_POLL_PAUSE
+
+    assert MAX_DRAIN_POLL_PAUSE > 0, "an unbounded pause is a starvation bug"
+    assert MAX_DRAIN_POLL_PAUSE <= 60, "discovery must resume within a minute"
+
+    # The predicate the cycle uses, stated plainly.
+    def paused(draining: bool, since: float, now: float) -> bool:
+        return draining and (now - since) < MAX_DRAIN_POLL_PAUSE
+
+    start = time.monotonic()
+    assert paused(True, start, start) is True, "a short drain pauses the poll"
+    assert paused(True, start, start + MAX_DRAIN_POLL_PAUSE + 1) is False, (
+        "a long drain must let discovery through"
+    )
+    assert paused(False, start, start + 1) is False

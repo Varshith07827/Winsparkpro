@@ -71,6 +71,10 @@ from wadam.whatsapp.verifier import SendVerifier
 
 logger = logging.getLogger(__name__)
 
+#: How long draining may suspend the poll before discovery runs anyway. Sending
+#: a backlog is more urgent than noticing new messages — but only briefly.
+MAX_DRAIN_POLL_PAUSE = 30.0
+
 
 @dataclass
 class EngineSnapshot:
@@ -160,6 +164,7 @@ class AutomationEngine:
         self._hwnd: Optional[int] = None
         self._busy_with = ""
         self._draining = False
+        self._draining_since = 0.0
         self._last_error = ""
         self._active_chat_name = ""
         # When each chat's webhook was last GETted, by chat id (monotonic).
@@ -366,13 +371,17 @@ class AutomationEngine:
         self.publish()
 
     async def _cycle(self) -> None:
-        if self._draining:
+        if self._draining and (time.monotonic() - self._draining_since) < MAX_DRAIN_POLL_PAUSE:
             # A drain is sending a backlog right now. This cycle's conversation
-            # read costs ~2s on the same STA thread, so running it here does not
-            # just delay the poll — it delays every message in the batch behind
-            # it. Measured: it tripled the cost of a send inside a batch, from
-            # ~0.8s to ~4.6s for a single name read. Nothing is missed; the next
-            # cycle picks it up as soon as the queue is empty.
+            # read costs seconds on the same STA thread, so running it here does
+            # not just delay the poll — it delays every message in the batch
+            # behind it. Measured: it tripled the cost of a send inside a batch.
+            #
+            # BOUNDED, because an unbounded pause is a starvation bug and it
+            # happened: a relay endpoint that returned a message on every poll
+            # kept the drainer permanently busy, so this cycle never ran and a
+            # real incoming message was never read at all. Sending is more
+            # urgent than discovery for a few seconds, never forever.
             return
         hwnd = self._hwnd
         if hwnd is None or not await self._reader.window_is_alive_async(hwnd):
@@ -562,6 +571,7 @@ class AutomationEngine:
         # by message made a burst of twenty take twenty times the setup.
         self._busy_with = pending[0].chat_name
         self._draining = True
+        self._draining_since = time.monotonic()
         self.publish()
         try:
             await self._delivery.deliver_batch(pending)
