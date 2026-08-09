@@ -130,7 +130,8 @@ class ChatDiscovery:
     def _refresh_webhook(self, chat: ChatConfig) -> bool:
         """Rebuild the chat's URL from the template. True when it changed."""
         wanted = webhook_url_for(self._settings.webhook_template,
-                                 chat.phone_number, chat.webhook_override)
+                                 chat.phone_number, chat.webhook_override,
+                                 chat.chat_name)
         if wanted == chat.webhook_url:
             return False
         chat.webhook_url = wanted

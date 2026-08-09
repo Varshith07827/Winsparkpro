@@ -8,46 +8,60 @@ out of step with the template.
     https://noteify.org/ntext/whook/?{phone_number}
                                      └── replaced with the chat's number
 
-A chat whose number could not be resolved gets **no URL at all**. That is the
-whole point of the rule: substituting an empty string would produce a valid,
-sending-looking URL pointing at nobody, and messages would be posted to it
-forever without anyone noticing.
+A chat whose number is not known yet falls back to its **name**, URL-encoded:
+
+    https://noteify.org/ntext/whook/?Novus%20Tech%20Group
+
+An empty substitution is still refused — that would produce a valid,
+sending-looking URL pointing at nobody, and messages would post to it forever
+unnoticed. A name is different: it identifies the chat, the receiving end can
+tell the two apart, and it means every chat forwards from the moment it is
+ticked instead of waiting for somebody to look up a phone number.
+
+The number remains preferred and replaces the name the moment it is known.
 """
 
 from __future__ import annotations
 
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from wadam.constants import PHONE_PLACEHOLDER
 
 
-def webhook_url_for(template: str, phone_number: str, override: str = "") -> str:
-    """The URL to call for a chat, or "" when there isn't one.
+def webhook_url_for(template: str, phone_number: str, override: str = "",
+                    chat_name: str = "") -> str:
+    """The URL to call for a chat, or "" when there is genuinely nothing to
+    identify it by.
 
-    `override` wins when set — an escape hatch for a chat that genuinely needs
-    a different endpoint, which the UI does not offer but the data model still
-    honours."""
+    Order of preference: an explicit `override`, then the phone number, then
+    the chat name. `override` is an escape hatch for a chat that needs a
+    different endpoint — the UI does not offer it, the data model honours it."""
     if override.strip():
         return override.strip()
     template = (template or "").strip()
-    number = (phone_number or "").strip()
     if not template:
         return ""
     if PHONE_PLACEHOLDER not in template:
         # A template with no placeholder is the same URL for every chat. Odd,
         # but explicit, and warned about at startup.
         return template
-    if not number:
+
+    identifier = (phone_number or "").strip()
+    if not identifier:
+        # Quoted, because a chat name can hold spaces, "&", "#" or an emoji,
+        # any of which would otherwise truncate or corrupt the query string.
+        identifier = quote((chat_name or "").strip(), safe="")
+    if not identifier:
         return ""
-    return template.replace(PHONE_PLACEHOLDER, number)
+    return template.replace(PHONE_PLACEHOLDER, identifier)
 
 
 def describe_missing(phone_number: str) -> str:
-    """Why a chat has no webhook URL, in words a non-technical user can act on."""
+    """Why a chat's URL uses its name rather than its number."""
     if not (phone_number or "").strip():
-        return ("No phone number could be read for this chat, so its webhook "
-                "address cannot be built. WhatsApp only shows a number for "
-                "contacts that are not saved in your address book.")
+        return ("This chat is addressed by name because WhatsApp does not show "
+                "a number for a saved contact. Enter the number to use it "
+                "instead.")
     return ""
 
 

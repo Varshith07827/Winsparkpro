@@ -311,19 +311,134 @@ def test_the_details_panel_shows_the_generated_webhook(app):
     panel.set_chat(chat("Alice", webhook="https://noteify.org/ntext/whook/?15551234567"))
     assert panel._title.text() == "Alice"
     assert panel._webhook.text() == "https://noteify.org/ntext/whook/?15551234567"
-    assert panel._note.text() == ""
 
 
-def test_a_chat_with_no_number_is_explained_not_left_blank(app):
-    """A blank webhook with no explanation reads as a bug."""
+def test_a_chat_with_no_number_is_addressed_by_name(app):
+    """Every chat gets a usable webhook the moment it is discovered."""
     panel = ChatDetailsPanel()
-    panel.set_chat(chat("Alice"))
-    assert panel._webhook.text() == "—"
-    assert "phone number" in panel._note.text().lower()
-    assert panel._note.isVisible() or True   # visibility needs a shown window
+    panel.set_chat(chat("Alice", webhook="https://noteify.org/ntext/whook/?Alice"))
+    assert panel._webhook.text() == "https://noteify.org/ntext/whook/?Alice"
+    # One explanation, under the field that would improve it.
+    assert "number" in panel._phone_hint.text().lower()
 
 
 def test_the_details_panel_is_empty_until_a_chat_is_picked(app):
     panel = ChatDetailsPanel()
     panel.set_chat(None)
     assert panel.current_chat_id() == ""
+
+
+def test_every_chat_paints_whether_or_not_it_is_ticked(app):
+    """An unchecked row once rendered completely blank.
+
+    `_paint_checkbox` referenced a colour that did not exist, the exception
+    escaped `paint()`, and Qt abandoned the row — so exactly the chats with
+    automation OFF vanished from the list while the count still said 5."""
+    from PySide6.QtGui import QImage, QPainter
+    from PySide6.QtWidgets import QStyleOptionViewItem
+    from wadam.ui.widgets import ChatItemDelegate, ROW_HEIGHT
+
+    panel = ChatListPanel()
+    rebuild(panel, [chat("On", automation=True), chat("Off", automation=False)])
+    assert panel._list.count() == 2
+
+    delegate = ChatItemDelegate(panel._list)
+    image = QImage(320, ROW_HEIGHT, QImage.Format_ARGB32)
+    for row in range(panel._list.count()):
+        painter = QPainter(image)
+        option = QStyleOptionViewItem()
+        option.rect = panel._list.visualItemRect(panel._list.item(row))
+        # Must not raise: a raising paint() is what produced the blank row.
+        delegate.paint(painter, option, panel._list.model().index(row, 0))
+        painter.end()
+
+
+def test_typing_a_number_saves_it_as_digits(app):
+    panel = ChatDetailsPanel()
+    panel.set_chat(chat("Alice"))
+    saved = []
+    panel.phone_saved.connect(lambda cid, num: saved.append((cid, num)))
+
+    panel._phone.setText("+91 94231 55555")
+    panel._save_phone()
+
+    assert saved == [(chat_id_for("Alice"), "919423155555")]
+    assert panel._phone.text() == "919423155555"
+
+
+def test_the_once_a_second_refresh_does_not_eat_a_half_typed_number(app):
+    """The panel re-renders every second. Overwriting the field on each pass
+    made it impossible to type a number at all."""
+    panel = ChatDetailsPanel()
+    alice = chat("Alice")
+    panel.set_chat(alice)
+    panel._phone.setFocus()
+    panel._phone.setText("9142")          # mid-typing
+
+    panel.set_chat(alice)                 # the tick fires
+
+    assert panel._phone.text() == "9142"
+
+
+def test_clearing_the_number_clears_the_webhook(app):
+    panel = ChatDetailsPanel()
+    saved = []
+    panel.set_chat(chat("Alice", webhook="https://n.test/?91", phone_number="91"))
+    panel.phone_saved.connect(lambda cid, num: saved.append((cid, num)))
+
+    panel._phone.setText("")
+    panel._save_phone()
+
+    assert saved == [(chat_id_for("Alice"), "")]
+
+
+def test_the_webhook_box_is_prefilled_and_editable(app):
+    panel = ChatDetailsPanel()
+    panel.set_chat(chat("Alice", webhook="https://noteify.org/ntext/whook/?Alice"))
+    assert panel._webhook.text() == "https://noteify.org/ntext/whook/?Alice"
+    assert panel._webhook.isReadOnly() is False
+
+    saved = []
+    panel.webhook_saved.connect(lambda cid, url: saved.append((cid, url)))
+    panel._webhook.setText("https://elsewhere.test/hook")
+    panel._save_webhook()
+
+    assert saved == [(chat_id_for("Alice"), "https://elsewhere.test/hook")]
+
+
+def test_an_invalid_webhook_is_not_saved_and_is_not_thrown_away(app):
+    """Reverting the box would mean retyping a long URL because of one typo."""
+    panel = ChatDetailsPanel()
+    panel.set_chat(chat("Alice", webhook="https://n.test/?Alice"))
+    saved = []
+    panel.webhook_saved.connect(lambda cid, url: saved.append((cid, url)))
+
+    panel._webhook.setText("htp://broken")
+    panel._save_webhook()
+
+    assert saved == [], "an invalid URL must not reach the engine"
+    assert panel._webhook.text() == "htp://broken", "what was typed stays put"
+    assert "http" in panel._webhook_hint.text()
+
+
+def test_clearing_the_webhook_returns_the_chat_to_the_default(app):
+    panel = ChatDetailsPanel()
+    panel.set_chat(chat("Alice", webhook="https://elsewhere.test/hook"))
+    saved = []
+    panel.webhook_saved.connect(lambda cid, url: saved.append((cid, url)))
+
+    panel._webhook.setText("")
+    panel._save_webhook()
+
+    assert saved == [(chat_id_for("Alice"), "")]
+
+
+def test_the_webhook_box_survives_the_once_a_second_refresh(app):
+    panel = ChatDetailsPanel()
+    alice = chat("Alice", webhook="https://n.test/?Alice")
+    panel.set_chat(alice)
+    panel._webhook.setText("https://half-typed")
+
+    panel.set_chat(alice)          # the tick fires
+
+    assert panel._webhook.text() == "https://half-typed"

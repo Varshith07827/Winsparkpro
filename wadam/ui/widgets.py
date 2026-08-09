@@ -82,7 +82,7 @@ class ChatItemDelegate(QStyledItemDelegate):
         checkbox that shouts is a checkbox people are afraid to click."""
         box = checkbox_rect(rect)
         on = bool(chat.automation_enabled)
-        painter.setPen(QPen(QColor(theme.ACCENT if on else theme.MUTED), 1.4))
+        painter.setPen(QPen(QColor(theme.ACCENT if on else theme.TEXT_MUTED), 1.4))
         painter.setBrush(QBrush(QColor(theme.ACCENT)) if on else Qt.NoBrush)
         painter.drawRoundedRect(box, 4, 4)
         if on:

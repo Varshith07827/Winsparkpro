@@ -456,6 +456,38 @@ class Repository:
                        if m.status not in OutgoingStatus.FINAL]
         return sorted(pending, key=lambda m: (m.created_at or utcnow(), m.sequence))
 
+    def backfill_phone_number(self, chat_id: str, phone_number: str) -> int:
+        """Stamp a newly-known number onto everything already stored for a chat.
+
+        WhatsApp does not expose a saved contact's number, so a chat can run for
+        days before anyone types one in. Without this, its history would be
+        split into messages that carry the number and messages that do not —
+        the kind of gap that is invisible until someone queries the collection
+        and quietly gets half the rows.
+
+        Returns how many stored messages were updated."""
+        if not chat_id:
+            return 0
+        number = (phone_number or "").strip()
+        updated = 0
+        with self._lock:
+            for message in self._messages:
+                if message.chat_id == chat_id and message.phone_number != number:
+                    message.phone_number = number
+                    updated += 1
+        if updated:
+            try:
+                self._mongo.messages.update_many(
+                    {"chat_id": chat_id},
+                    {"$set": {"phone_number": number}},
+                )
+                self._mongo.note_success()
+            except Exception as ex:  # noqa: BLE001 - the mirror still has it
+                self._mongo.note_failure(ex)
+                logger.error("Could not backfill phone numbers in MongoDB: %s", ex)
+            self._mark_messages_dirty()
+        return updated
+
     def pending_counts(self) -> dict:
         """Per chat, how many messages are still mid-flight.
 

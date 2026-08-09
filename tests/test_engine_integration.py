@@ -146,8 +146,10 @@ def test_a_new_chat_is_registered_within_one_cycle(engine):
 
     assert {c.chat_name for c in repo.list_chats()} == {"Alice", "Bob"}
     for chat in repo.list_chats():
-        assert chat.automation_enabled is False
-        assert chat.webhook_url == ""
+        assert chat.automation_enabled is False, "discovery never switches a chat on"
+        # Addressed by name until a number is supplied, so it can forward the
+        # moment it is ticked.
+        assert chat.webhook_url.endswith(f"?{chat.chat_name}")
 
 
 def test_a_chat_appearing_later_is_picked_up_on_the_next_cycle(engine):

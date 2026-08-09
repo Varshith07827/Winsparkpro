@@ -272,6 +272,11 @@ class StoredMessage:
     message_key: str = ""
     chat_id: str = ""
     chat_name: str = ""
+    #: The chat's number as known when this message was stored. Denormalised on
+    #: purpose: the specification asks messages to preserve it, and a consumer
+    #: reading the messages collection should not have to join to find out whose
+    #: number a message belongs to. Backfilled when a number is set later.
+    phone_number: str = ""
     sender: str = ""
     text: str = ""
     direction: str = "in"          # "in" (received) | "out" (sent by us)

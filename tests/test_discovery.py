@@ -51,7 +51,6 @@ def test_a_new_chat_arrives_inert(discovery):
     assert len(result.new) == 1
     chat = result.new[0]
     assert chat.automation_enabled is False, "discovery must never enable automation"
-    assert chat.webhook_url == ""
     assert chat.seeded is False, "the backlog must not count as processed yet"
 
 
@@ -64,7 +63,7 @@ def test_a_new_chat_stores_no_webhook_of_its_own(tmp_path: Path):
     repository, settings = make_repo(tmp_path, default_webhook="https://x.test/hook")
     engine_discovery = ChatDiscovery(repository, settings)
     chat = engine_discovery.sync([row("Alice")]).new[0]
-    assert chat.webhook_url == "", "a chat only stores a URL when overriding"
+    assert chat.webhook_override == "", "a chat only stores a URL when overriding"
     # Still off: a webhook is a destination, not permission to use it.
     assert chat.automation_enabled is False
     repository.stop()
@@ -157,13 +156,13 @@ def test_changing_the_template_updates_every_chat(discovery_factory=None):
         repository.stop()
 
 
-def test_a_chat_without_a_number_gets_no_url_at_all(discovery):
-    """Substituting an empty number would produce a valid-looking URL pointing
-    at nobody, and messages would post to it forever unnoticed."""
+def test_a_chat_without_a_number_is_addressed_by_name(discovery):
+    """A saved contact never exposes a number, so it is addressed by name until
+    somebody supplies one. Waiting instead would mean it never forwards."""
     engine_discovery, _repo = discovery
     chat = engine_discovery.sync([row("Alice")]).new[0]
     assert chat.phone_number == ""
-    assert chat.webhook_url == ""
+    assert chat.webhook_url.endswith("?Alice")
 
 
 def test_an_override_beats_the_template(discovery):

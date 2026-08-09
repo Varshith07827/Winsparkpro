@@ -50,8 +50,10 @@ from wadam.domain.models import (
     StoredMessage,
     message_key_for,
     outgoing_key_for,
+    phone_digits,
     utcnow,
 )
+from wadam.domain.webhook_url import webhook_url_for
 from wadam.engine.delivery import DeliveryService
 from wadam.engine.discovery import ChatDiscovery
 from wadam.engine.pipeline import MessagePipeline
@@ -691,6 +693,7 @@ class AutomationEngine:
                 message_key=key,
                 chat_id=chat.chat_id,
                 chat_name=chat.chat_name,
+            phone_number=chat.phone_number,
                 sender=message.sender or ("You" if not message.is_incoming else chat.chat_name),
                 text=message.text,
                 direction=direction,
@@ -772,6 +775,63 @@ class AutomationEngine:
             future.set_exception(RuntimeError("The engine is not running."))
             return future
         return asyncio.run_coroutine_threadsafe(coroutine_factory(), self._loop)
+
+    async def set_chat_phone_number(self, chat_id: str, phone_number: str) -> None:
+        """Record a chat's number and rebuild its webhook URL from the template.
+
+        Typed in rather than read, because WhatsApp shows a saved contact by
+        name and exposes the number nowhere an accessibility client can see it.
+        Clearing the field clears the URL too — a chat with no number must have
+        no webhook, never a URL with an empty number in it."""
+        chat = self._repo.get_chat(chat_id)
+        if chat is None:
+            return
+        digits = phone_digits(phone_number)
+        chat.phone_number = digits
+        chat.webhook_url = webhook_url_for(self._settings.webhook_template,
+                                           digits, chat.webhook_override,
+                                           chat.chat_name)
+        await asyncio.to_thread(self._repo.save_chat, chat)
+        # Everything already stored for this chat was recorded before the number
+        # was known. Backfilling means one chat has one number across its whole
+        # history, rather than a silent split between "before we knew" and
+        # "after" that anyone querying the data would have to know about.
+        filled = await asyncio.to_thread(self._repo.backfill_phone_number,
+                                         chat_id, digits)
+        self._repo.log("INFO", "chat.number_set", chat_id=chat_id, chat_name=chat.chat_name,
+                       webhook_url=chat.webhook_url,
+                       message=f"Number set to {digits or '(cleared)'}"
+                               + (f"; backfilled {filled} stored message(s)." if filled
+                                  else "."))
+        await asyncio.to_thread(self._repo.flush_json, True)
+        self.publish()
+
+    async def set_chat_webhook(self, chat_id: str, url: str) -> None:
+        """Point one chat somewhere other than the template says.
+
+        Stored as an OVERRIDE, not as the URL itself: `webhook_url` is derived
+        and gets rebuilt from the template on every discovery pass, so writing
+        the edit there would survive until the next poll and then silently
+        revert. Clearing the box removes the override and the chat goes back to
+        following the template."""
+        chat = self._repo.get_chat(chat_id)
+        if chat is None:
+            return
+        wanted = (url or "").strip()
+        generated = webhook_url_for(self._settings.webhook_template,
+                                    chat.phone_number, "", chat.chat_name)
+        # Typing the generated URL back in is not an override, it is agreement.
+        chat.webhook_override = "" if wanted == generated else wanted
+        chat.webhook_url = webhook_url_for(self._settings.webhook_template,
+                                           chat.phone_number,
+                                           chat.webhook_override, chat.chat_name)
+        await asyncio.to_thread(self._repo.save_chat, chat)
+        self._repo.log("INFO", "webhook.set", chat_id=chat_id, chat_name=chat.chat_name,
+                       webhook_url=chat.webhook_url,
+                       message=("Webhook set to " + chat.webhook_url) if chat.webhook_override
+                               else "Webhook back to the default for this chat.")
+        await asyncio.to_thread(self._repo.flush_json, True)
+        self.publish()
 
     async def set_chat_automation(self, chat_id: str, enabled: bool) -> None:
         chat = self._repo.get_chat(chat_id)
@@ -934,6 +994,7 @@ class AutomationEngine:
             message_key=outgoing_key_for(chat.chat_id, text),
             chat_id=chat.chat_id,
             chat_name=chat.chat_name,
+            phone_number=chat.phone_number,
             sender="You",
             text=text,
             direction="out",

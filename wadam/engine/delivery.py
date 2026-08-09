@@ -301,7 +301,8 @@ class DeliveryService:
 
         stored = StoredMessage(
             message_key=outgoing_key_for(chat.chat_id, message.text),
-            chat_id=chat.chat_id, chat_name=chat.chat_name, sender="You",
+            chat_id=chat.chat_id, chat_name=chat.chat_name,
+            phone_number=chat.phone_number, sender="You",
             text=message.text, direction="out", status="sent",
             origin=message.origin, external_ref=message.external_ref,
         )

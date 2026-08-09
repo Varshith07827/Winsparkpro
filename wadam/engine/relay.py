@@ -170,6 +170,7 @@ class RelayService:
             message_key=outgoing_key_for(chat.chat_id, message.text),
             chat_id=chat.chat_id,
             chat_name=chat.chat_name,
+            phone_number=chat.phone_number,
             sender="You",
             text=message.text,
             direction="out",

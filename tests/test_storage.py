@@ -65,10 +65,14 @@ class FakeCollection:
             self.documents.append(dict(update["$set"]))
 
     def update_many(self, query, update):
-        key = next(iter(query))
-        wanted = set(query[key]["$in"])
+        """Plain equality AND {"$in": [...]}, because real MongoDB takes both.
+
+        This understood only `$in` and raised on `{"chat_id": "abc"}` — the
+        third time a double here has been narrower than the thing it stands in
+        for. See `tests/conftest.py`: the storage suites run against a real
+        mongod as well for exactly this reason."""
         for existing in self.documents:
-            if existing.get(key) in wanted:
+            if _matches(existing, query):
                 existing.update(update["$set"])
 
     def bulk_write(self, operations, ordered=False):

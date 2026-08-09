@@ -89,8 +89,6 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        layout.addWidget(self._build_top_bar())
-
         splitter = QSplitter(Qt.Horizontal)
         splitter.setHandleWidth(1)
         splitter.setChildrenCollapsible(False)
@@ -104,6 +102,8 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self._chat_list)
 
         self._config = ChatDetailsPanel()
+        self._config.phone_saved.connect(self._on_phone_saved)
+        self._config.webhook_saved.connect(self._on_webhook_saved)
         splitter.addWidget(self._config)
 
         splitter.setStretchFactor(0, 0)
@@ -126,29 +126,6 @@ class MainWindow(QMainWindow):
 
     # -- chrome ------------------------------------------------------------
 
-    def _build_top_bar(self) -> QWidget:
-        bar = QWidget()
-        bar.setObjectName("panelHeader")
-        bar.setFixedHeight(52)
-        row = QHBoxLayout(bar)
-        row.setContentsMargins(20, 0, 16, 0)
-        row.setSpacing(12)
-
-        title = QLabel(constants.APP_NAME)
-        title.setObjectName("railTitle")
-        row.addWidget(title)
-
-        self._engine_state = QLabel("starting…")
-        self._engine_state.setObjectName("configSubtitle")
-        row.addWidget(self._engine_state)
-        row.addStretch(1)
-
-        # No global automation switch, and no rescan button up here. The
-        # per-chat checkbox is the only automation control in the product, and
-        # refresh lives in the chat list header next to the thing it refreshes.
-        # `set_global_automation` still exists on the engine for scripted use;
-        # it simply is not a button any more.
-        return bar
 
     def _build_status_bar(self) -> QWidget:
         bar = QWidget()
@@ -178,14 +155,6 @@ class MainWindow(QMainWindow):
         self._chat_list.set_chats(snapshot.chats, snapshot.whatsapp_found)
 
 
-        if not snapshot.whatsapp_found:
-            self._engine_state.setText("waiting for WhatsApp Desktop")
-        elif snapshot.busy_with:
-            self._engine_state.setText(f"reading {snapshot.busy_with}…")
-        elif snapshot.last_error:
-            self._engine_state.setText(snapshot.last_error[:80])
-        else:
-            self._engine_state.setText(f"watching {len(snapshot.chats)} chats")
 
         self._status_poll.setText(
             f"cycle {snapshot.cycle_count} · {snapshot.last_cycle_ms}ms · "
@@ -230,10 +199,16 @@ class MainWindow(QMainWindow):
 
     def _on_engine_stopped(self, error: str) -> None:
         if error:
-            self._engine_state.setText("engine stopped")
             QMessageBox.critical(self, "Automation engine stopped", error)
 
     # -- actions -----------------------------------------------------------
+
+    def _on_phone_saved(self, chat_id: str, phone_number: str) -> None:
+        self._host.submit(
+            lambda: self._host.engine.set_chat_phone_number(chat_id, phone_number))
+
+    def _on_webhook_saved(self, chat_id: str, url: str) -> None:
+        self._host.submit(lambda: self._host.engine.set_chat_webhook(chat_id, url))
 
     def _on_chat_selected(self, chat_id: str) -> None:
         self._config.set_chat(self._repository.get_chat(chat_id))

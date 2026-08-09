@@ -32,12 +32,31 @@ def test_the_url_is_built_from_the_template_and_the_number():
         "https://noteify.org/ntext/whook/?15551234567"
 
 
-def test_a_chat_without_a_number_gets_no_url():
-    """The rule the whole module exists for.
+def test_a_chat_without_a_number_falls_back_to_its_name():
+    """Every chat forwards from the moment it is ticked.
 
-    Substituting an empty string yields a valid-looking URL pointing at nobody;
-    messages would post to it forever and look fine."""
-    assert webhook_url_for("https://noteify.org/ntext/whook/?{phone_number}", "") == ""
+    A saved contact never exposes a number, so waiting for one meant those
+    chats could never forward at all. The name identifies the chat and the
+    receiving end can tell them apart."""
+    assert webhook_url_for("https://noteify.org/ntext/whook/?{phone_number}", "",
+                           chat_name="Novus Tech Group") ==         "https://noteify.org/ntext/whook/?Novus%20Tech%20Group"
+
+
+def test_a_name_with_awkward_characters_is_url_encoded():
+    """A raw "&" or "#" would truncate the query string."""
+    url = webhook_url_for("https://n.test/?{phone_number}", "", chat_name="A & B #1")
+    assert url == "https://n.test/?A%20%26%20B%20%231"
+
+
+def test_a_number_is_preferred_over_the_name():
+    assert webhook_url_for("https://n.test/?{phone_number}", "919423155555",
+                           chat_name="Varshith") == "https://n.test/?919423155555"
+
+
+def test_with_neither_a_number_nor_a_name_there_is_still_no_url():
+    """The original rule survives: an empty substitution would be a valid-looking
+    URL pointing at nobody."""
+    assert webhook_url_for("https://n.test/?{phone_number}", "", chat_name="") == ""
 
 
 def test_an_override_wins_over_the_template():
@@ -53,7 +72,7 @@ def test_a_template_without_a_placeholder_is_used_as_is():
 
 
 def test_a_missing_number_is_explained_in_words():
-    assert "phone number" in describe_missing("").lower()
+    assert "name" in describe_missing("").lower()
     assert describe_missing("15551234567") == ""
 
 
@@ -210,3 +229,62 @@ def test_a_seeded_backlog_is_not_pending(repo):
     repo.save_message(_incoming(cid, "old", MessageStatus.SEEDED))
 
     assert repo.pending_counts().get(cid) is None
+
+
+# ---------------------------------------------------------------------------
+# Backfilling a number onto history
+# ---------------------------------------------------------------------------
+
+
+def test_a_new_number_is_stamped_onto_messages_already_stored(repo):
+    """A chat can run for days before anyone supplies its number.
+
+    Without backfilling, its history splits into rows that carry the number and
+    rows that do not — invisible until someone queries the collection and
+    quietly gets half of it."""
+    cid = chat_id_for("Alice")
+    repo.save_chat(ChatConfig(chat_id=cid, chat_name="Alice"))
+    repo.save_message(_incoming(cid, "before one", MessageStatus.REPLIED))
+    repo.save_message(_incoming(cid, "before two", MessageStatus.REPLIED))
+
+    filled = repo.backfill_phone_number(cid, "919423155555")
+
+    assert filled == 2
+    for message in repo.messages_for(cid):
+        assert message.phone_number == "919423155555"
+
+
+def test_backfilling_leaves_other_chats_alone(repo):
+    alice, bob = chat_id_for("Alice"), chat_id_for("Bob")
+    repo.save_chat(ChatConfig(chat_id=alice, chat_name="Alice"))
+    repo.save_chat(ChatConfig(chat_id=bob, chat_name="Bob"))
+    repo.save_message(_incoming(alice, "hers", MessageStatus.REPLIED))
+    repo.save_message(_incoming(bob, "his", MessageStatus.REPLIED))
+
+    repo.backfill_phone_number(alice, "919423155555")
+
+    by_chat = {cid: repo.messages_for(cid)[0].phone_number
+               for cid in (alice, bob)}
+    assert by_chat[alice] == "919423155555"
+    assert by_chat[bob] == ""
+
+
+def test_backfilling_the_same_number_twice_changes_nothing(repo):
+    cid = chat_id_for("Alice")
+    repo.save_chat(ChatConfig(chat_id=cid, chat_name="Alice"))
+    repo.save_message(_incoming(cid, "one", MessageStatus.REPLIED))
+
+    assert repo.backfill_phone_number(cid, "919423155555") == 1
+    assert repo.backfill_phone_number(cid, "919423155555") == 0
+
+
+def test_clearing_a_number_clears_it_from_history_too(repo):
+    """A number entered by mistake has to be removable everywhere, or the
+    wrong one lives on in the messages after being fixed on the chat."""
+    cid = chat_id_for("Alice")
+    repo.save_chat(ChatConfig(chat_id=cid, chat_name="Alice"))
+    repo.save_message(_incoming(cid, "one", MessageStatus.REPLIED))
+    repo.backfill_phone_number(cid, "919999999999")
+
+    assert repo.backfill_phone_number(cid, "") == 1
+    assert all(m.phone_number == "" for m in repo.messages_for(cid))

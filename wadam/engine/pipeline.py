@@ -195,6 +195,7 @@ class MessagePipeline:
             message_key=outgoing_key_for(chat.chat_id, reply),
             chat_id=chat.chat_id,
             chat_name=chat.chat_name,
+            phone_number=chat.phone_number,
             sender="You",
             text=reply,
             direction="out",
