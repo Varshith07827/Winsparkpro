@@ -13,7 +13,7 @@ WhatsApp Desktop MSIX `2.2630.102.0` · RDP session 4 (console session 5).
 ## 1. Test results
 
 ```
-313 passed
+410 passed
 ```
 
 The storage-dependent suites run **twice** — once against a dict-backed fake
