@@ -54,6 +54,7 @@ from wadam.domain.models import (
     utcnow,
 )
 from wadam.domain.webhook_url import webhook_url_for
+from wadam.engine import send_guard
 from wadam.engine.delivery import DeliveryService
 from wadam.engine.discovery import ChatDiscovery
 from wadam.engine.pipeline import MessagePipeline
@@ -998,6 +999,7 @@ class AutomationEngine:
         if chat is None:
             return SendOutcome(False, error="Chat not found.")
 
+        send_guard.check(origin, chat_name=chat.chat_name, text=text)
         result = await self._sender.send_async(chat.chat_name, text)
         if not result.ok:
             chat.last_error = result.detail

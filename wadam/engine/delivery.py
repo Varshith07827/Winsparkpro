@@ -39,6 +39,7 @@ from wadam.domain.models import (
     outgoing_key_for,
     utcnow,
 )
+from wadam.engine import send_guard
 from wadam.storage.repository import Repository
 from wadam.whatsapp.verifier import (
     SendVerifier,
@@ -146,6 +147,12 @@ class DeliveryService:
             message.status = OutgoingStatus.SENDING
             await self._to_thread(self._repo.update_outgoing, message)
 
+            try:
+                send_guard.check(message.origin, chat_name=chat.chat_name,
+                                 text=message.text)
+            except send_guard.SendRefused as refused:
+                await self._refused(chat, message, str(refused))
+                continue
             result = await send(chat.chat_name, message.text)
             results[message.outgoing_id] = result
             logger.debug("batch send %d/%d in %d ms (%s)", len(results), len(group),
@@ -241,6 +248,11 @@ class DeliveryService:
         # were there already.
         before = await self._verifier.census(chat.chat_name, message.text)
 
+        try:
+            send_guard.check(message.origin, chat_name=chat.chat_name, text=message.text)
+        except send_guard.SendRefused as refused:
+            return await self._refused(chat, message, str(refused))
+
         result = await self._sender.send_async(chat.chat_name, message.text)
 
         if not result.ok:
@@ -289,6 +301,18 @@ class DeliveryService:
         message.status = OutgoingStatus.QUEUED
         await self._to_thread(self._repo.update_outgoing, message)
         return await self.deliver(message)
+
+    async def _refused(self, chat, message, reason: str):
+        """The guard forbade this producer. CANCELLED, not failed: nothing was
+        attempted and nothing should be retried."""
+        message.status = OutgoingStatus.CANCELLED
+        message.error = reason
+        await self._to_thread(self._repo.update_outgoing, message)
+        self._repo.log("WARNING", "outgoing.refused", chat_id=chat.chat_id,
+                       chat_name=chat.chat_name, direction="out",
+                       correlation_id=message.outgoing_id, error=reason,
+                       message=f"Refused ({message.origin}): {message.text[:80]}")
+        return message
 
     # -- outcomes ----------------------------------------------------------
 

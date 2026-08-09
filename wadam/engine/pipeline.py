@@ -55,6 +55,7 @@ from wadam.domain.models import (
     utcnow,
 )
 from wadam.engine.webhook import WebhookClient, build_payload, optional_reply
+from wadam.engine import send_guard
 from wadam.storage.repository import Repository
 from wadam.whatsapp.sender import WhatsAppSender
 
@@ -177,6 +178,7 @@ class MessagePipeline:
                       f"Reply queued for delivery: {reply[:120]}")
             return
 
+        send_guard.check("webhook_reply", chat_name=chat.chat_name, text=reply)
         result = await self._sender.send_async(chat.chat_name, reply)
 
         if not result.ok:

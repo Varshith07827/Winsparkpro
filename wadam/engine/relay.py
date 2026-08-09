@@ -63,6 +63,7 @@ from wadam.domain.models import (
     utcnow,
 )
 from wadam.engine.webhook import RelayMessage, WebhookClient, parse_relay_messages
+from wadam.engine import send_guard
 from wadam.storage.repository import Repository
 
 logger = logging.getLogger(__name__)
@@ -151,6 +152,7 @@ class RelayService:
         """Persist, send, verify, persist. The same order and the same
         guarantees as an automated reply: nothing is claimed as sent that was
         not observed to leave the compose box."""
+        send_guard.check("relay", chat_name=chat.chat_name, text=message.text)
         result = await sender.send_async(chat.chat_name, message.text)
 
         if not result.ok:
