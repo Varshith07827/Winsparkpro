@@ -5,6 +5,75 @@ obvious, and finding them out during an incident is expensive.
 
 ---
 
+## A saved contact's phone number cannot be discovered
+
+**This is the single most consequential limitation in the product**, because the
+webhook URL is built from the phone number.
+
+### What works
+
+A contact who is **not** in the address book appears in WhatsApp's sidebar with
+their number as the chat name. Discovery reads it, normalises it and persists
+it, with no configuration and nothing to type:
+
+```
+chat name     '+91 81069 72933'
+phone_number  918106972933
+webhook       https://noteify.org/ntext/whook/?918106972933
+```
+
+### What does not
+
+A **saved** contact shows only their name. Their number is not reachable
+through UI Automation anywhere. Established by four read-only probes against
+WhatsApp Beta `2.2630.102.0`:
+
+| Probe | Result |
+|---|---|
+| Deep tree scan with the chat open, 18 levels | 37 distinct accessible names, **0 phone-shaped strings** |
+| Element carrying the conversation title | **None.** The title is not an accessible element; the app derives the name from the compose box placeholder, `"Type a message to <name>"` |
+| `"Open chat details for …"` button | Present on **group** bubbles only, to identify a sender. Absent in a 1:1 chat |
+| Every `ButtonControl` with a real rectangle in the whole window | **Eight**: `Close`, `Minimize`, `Restore`, `New Tab` ×2, `Close tab` ×2, `Resize the chat list panel` |
+
+That last row is the finding. The entire window exposes eight clickable
+elements with geometry, and not one of them is a contact header, profile or
+info affordance. There is nothing to invoke, and nothing to read.
+
+### What the application does instead
+
+A chat with no resolvable number is addressed by **name**, URL-encoded:
+
+```
+https://noteify.org/ntext/whook/?Novus%20Tech%20Group
+```
+
+The alternative — refusing to build a URL — meant a saved contact could never
+forward anything at all, which was the behaviour before this fallback existed.
+A number always wins when one is known, and the name is replaced the moment it
+becomes available.
+
+### What was deliberately NOT done
+
+Clicking a hardcoded pixel offset where the contact header is believed to be.
+It would work today and break on any layout change, and it is the same class of
+assumption as the alignment threshold that once made every outgoing message
+read back as incoming. A guess that happens to be right is still a guess.
+
+### If number-based addressing is required
+
+Four options, in the order they preserve the current architecture:
+
+1. **Accept name-based URLs for saved contacts.** What ships today.
+2. **Require unsaved-number chats** for automated conversations. Reliable, and
+   restricts who can be automated.
+3. **Find a non-UIA source** — WhatsApp's own local storage, or an export.
+   Unexplored, and outside the accessibility layer this application is built on.
+4. **The WhatsApp Business Platform.** Phone numbers are first-class there, and
+   it removes the desktop dependency entirely. See
+   [SENDING.md](SENDING.md), Option D.
+
+---
+
 ## Windows UI Automation
 
 ### The window must be visible, and sending takes it over

@@ -615,3 +615,67 @@ the missing ones.
 Nothing is missed. Incoming messages are picked up on the first cycle after the
 queue empties. The trade is deliberate: while there is a backlog to send,
 sending it is more urgent than noticing new arrivals a few seconds sooner.
+
+---
+
+## 15. Final audit (2026-08-09)
+
+A full current-state audit against the simplified product definition, then two
+release blockers, then an attempted end-to-end test that went wrong and taught
+more than a clean run would have.
+
+### Defects found and fixed
+
+| # | Defect | Severity | Evidence |
+|---|---|---|---|
+| 1 | **Our own messages read as INCOMING** | CRITICAL | Outgoing bubbles at `center_x=1005` against a threshold of `1154` — 60% of the *window*, which includes a 570px sidebar. The definitive `"You:"` label was on 2 of 100 bubbles. Misclassified sends are stored as incoming, **posted to the webhook, and the endpoint's answer sent back** — the app answering its own answer. It also defeated the loop guard, which only ran for messages already believed outgoing. |
+| 2 | **The packaged EXE destroyed its own backup on every quit** | CRITICAL | `PROJECT_ROOT` derives from `__file__`, which in a one-file build lives under `sys._MEIPASS` — deleted on exit. Two orphaned `_MEI*/backup/` folders found, each a full mirror. |
+| 3 | **Sender name and number leaked into the message body** | CRITICAL | A partially saved contact's message reached MongoDB and the webhook as `"Pritam +91 63032 31690 Ok mam"` when the message was `"Ok mam"`. Violates the raw-content rule outright. |
+| 4 | **A drain could starve message discovery forever** | CRITICAL | The poll skips itself while draining, with no bound. A relay answering every 3s kept the drainer busy, the cycle never ran, and a real incoming message was **never read or stored at all**. |
+| 5 | The webhook payload had no `phone_number` | HIGH | The field the product is keyed on, absent from the body — and with the name fallback the URL may carry no number either. |
+| 6 | The relay was enabled in configuration | HIGH | Not part of this product. GETs every automated chat's webhook every 3s and sends whatever comes back. |
+
+### The incident
+
+An end-to-end attempt sent about **thirty unintended messages to a real
+contact**. The cause was the test rig: a capture endpoint that answered GET as
+well as POST, feeding a relay that polls with GET every three seconds. All nine
+recorded sends carry `origin=relay`; none came from the pipeline under test.
+
+Two defects it exposed (#4 and #6 above) were real and are fixed. The harness
+is now hardened: `GET` returns `204` with zero bytes, the send API is disabled
+outright rather than merely guarded, and `WADAM_ONLY_ORIGIN` permits exactly one
+producer, checked on **all six** send paths — three of which bypass the queue
+and would have been missed by a guard on `enqueue` alone.
+
+### Measured
+
+| Operation | Result |
+|---|---:|
+| Conversation read, 12-message chat | 1,640 ms |
+| Conversation read, ~100-bubble chat | 5,843 ms |
+| Chat-list read | 120 ms |
+| EXE build | 51.8 MB, clean |
+
+Read time **scales with the number of rendered bubbles**. The 6–8 s figures
+seen mid-audit were a large conversation, not a regression — confirmed by
+disabling the new parsing step and re-measuring (5,843 vs 5,824 ms, no
+difference).
+
+### Still not proven
+
+The real inbound → webhook → response → send → verify chain. It has been
+attempted once and the incoming half demonstrably did not work, because
+discovery was starved (#4). That is fixed and **has not been re-tested**.
+
+`scripts/arm_e2e.py` refuses to arm unless a chat carries a number the
+application discovered itself, the relay is off, the API is unreachable, and
+the capture endpoint answers GET with 204.
+
+### Verdict
+
+**NOT READY** — one gate remains, and it is evidence, not suspicion: the
+complete pipeline has never been observed working end to end against a real
+message. Everything upstream and downstream is verified separately.
+
+Tests: 410.
