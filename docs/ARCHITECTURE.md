@@ -1,173 +1,130 @@
-# Architecture
+# Architecture — two independent flows
 
-## The whole system
-
-```
-                    ┌──────────────────────────┐
-                    │   WhatsApp Desktop       │
-                    │   (Chromium, UIA tree)   │
-                    └───────────▲──────────────┘
-                                │ read (accessibility tree)
-                                │ write (UIA patterns)
-                    ┌───────────┴──────────────┐
-                    │  STA automation thread   │  one thread, COM-safe,
-                    │  wadam/whatsapp/         │  every UIA call marshalled
-                    └───────────▲──────────────┘
-                                │
-   ┌────────────────────────────┴─────────────────────────────────────┐
-   │  Automation engine — its own asyncio loop, its own OS thread     │
-   │                                                                  │
-   │   poll loop (3 s)              worker (one job at a time)        │
-   │   ───────────────              ──────────────────────────        │
-   │   find window                  open chat                         │
-   │   read chat list        queue  read messages                     │
-   │   discovery ───────────────▶   persist                           │
-   │   read open conversation       webhook dispatch                  │
-   │   detect change                outgoing send                     │
-   │   enqueue                      verification                      │
-   │                                                                  │
-   │   relay loop (optional): GET each chat's webhook ──▶ queue        │
-   └───────▲───────┬─────────────────────────────┬────────────────────┘
-           │       │ every write                 │ snapshots (Qt signal)
-           │  ┌────▼────────────────────┐  ┌─────▼──────────────────────┐
-           │  │  Repository             │  │  UI (Qt GUI thread)        │
-           │  │  ├─▶ MongoDB  (primary) │  │  ├─ chat rail              │
-           │  │  └─▶ JSON     (mirror)  │  │  └─ configuration panel    │
-           │  └─────────────────────────┘  └────────────────────────────┘
-           │ submit(send)
-   ┌───────┴──────────────────┐
-   │  Send API (optional)     │◀── POST {"id","message"} from your server
-   │  http.server thread pool │
-   └──────────────────────────┘
-```
-
-The send API is the only inbound path. It resolves an identifier to exactly one
-chat, submits a send onto the engine loop, and blocks its own request thread —
-never the engine's — until the send has been verified.
-
-## The three threads, and why
-
-| Thread | Owns | Must never |
-|---|---|---|
-| **Qt GUI** | widgets, painting, user input | block on the engine or the database |
-| **Engine** (asyncio) | the poll loop, the work queue, webhooks | block on UI Automation or on MongoDB |
-| **STA automation** | every UI Automation / COM call | be bypassed by a call from another thread |
-| **Send API** (optional) | the listening socket, one thread per request | touch the repository or WhatsApp directly |
-
-The relay is not a fourth thread — it is a second task on the engine's loop,
-because it is only network I/O and belongs where the queue is.
-
-UI Automation is COM, and COM is not safe from arbitrary threads — hence the
-dedicated STA thread. The engine needs its own loop because a three-second poll
-cannot wait on a repaint, and a repaint cannot wait on a twenty-second webhook.
-MongoDB calls are synchronous (pymongo), so the engine pushes them through
-`asyncio.to_thread` rather than stalling its own loop.
-
-Traffic across the boundaries is deliberately narrow:
-
-* **engine → UI**: an immutable `EngineSnapshot`, re-emitted as a Qt signal.
-  The UI never reaches into the engine or the database.
-* **UI → engine**: `AutomationEngine.submit(...)` schedules a coroutine onto the
-  engine loop with `run_coroutine_threadsafe`.
-* **engine → WhatsApp**: only through the STA thread.
-
-## Message flow
+winSpark is a **bridge**, not a bot. It does not decide anything, interpret
+anything, or answer anything. Messages travel in two directions and the two
+paths never touch:
 
 ```
-  WhatsApp                Engine                    Repository            Webhook
-     │                      │                            │                   │
-     │◀── read chat list ───┤ (3 s)                      │                   │
-     │                      ├─ discovery ───────────────▶│ upsert + JSON     │
-     │◀── read messages ────┤                            │                   │
-     │                      ├─ new incoming? ───────────▶│ save   (PENDING)  │
-     │                      │                            │                   │
-     │                      ├──────────────────────────▶ │ mark DISPATCHING  │
-     │                      ├─ POST ─────────────────────┼──────────────────▶│
-     │                      │◀─ reply ───────────────────┼───────────────────┤
-     │                      ├──────────────────────────▶ │ save response     │
-     │                      ├──────────────────────────▶ │ mark AWAITING_SEND│
-     │◀── open + fill + send┤                            │                   │
-     │─── compose cleared ─▶│ verified                   │                   │
-     │                      ├──────────────────────────▶ │ mark REPLIED      │
+INBOUND — collect                       OUTBOUND — deliver
+
+  someone messages you                   your application
+          │                                      │
+          ▼                                      │ POST /wam/
+  WhatsApp Desktop                                │ {"id","message"}
+          │                                      ▼
+          │ passive accessibility read     winSpark send API
+          ▼                                      │
+      winSpark reader                     resolve id → chat
+          │                                      │
+          ▼                                      ▼
+   MongoDB  wa_events                    durable outgoing queue
+          │                                      │
+          ▼                                      ▼
+  your monitoring application            WhatsApp Desktop (UI Automation)
+                                                 │
+                                                 ▼
+                                        census verification
+                                                 │
+                                                 ▼
+                                             VERIFIED
 ```
 
-Every arrow into the Repository is a write to **both** MongoDB and the JSON
-mirror. The two `mark` steps before irreversible actions are what makes a crash
-recoverable — see [DATA.md](DATA.md#message-lifecycle) and
-[LIMITATIONS.md](LIMITATIONS.md).
+**Receiving a message never causes winSpark to send one.** The inbound side
+writes to `wa_events` and stops. Whatever reads that database decides what to
+do; if it wants to reply, it calls the outbound bridge like any other caller.
+That is what makes a reply loop structurally impossible rather than guarded
+against — an earlier version POSTed each incoming message to a webhook and sent
+back whatever came, and that behaviour is gone.
 
-## Module boundaries
+---
 
-```
-wadam/
-  config.py          .env → validated Settings. The entire configuration surface.
-  constants.py       Fixed values. The 3-second interval lives here and nowhere else.
-  logging_setup.py   Console + rotating file.
+## Inbound: WhatsApp → `wa_events`
 
-  domain/            Data shapes and rules with no I/O.
-    models.py          One dataclass per collection; MessageStatus lifecycle.
+Every three seconds the reader walks WhatsApp's accessibility tree. **It is
+passive**: no mouse, no keyboard, no focus change, no foreground steal. Proven
+by call graph — the poll cycle reaches only reader functions, and
+`wadam/whatsapp/reader.py` contains no input call of any kind.
 
-  storage/           Persistence. Knows nothing about WhatsApp.
-    mongo.py           Primary: connection, indexes, collections.
-    json_backup.py     Mirror: atomic controlled saves, autosave timer.
-    repository.py      The facade every write goes through.
+What is stored, per message: the **raw** text exactly as WhatsApp rendered it,
+the chat, the phone number if known, direction, state and timestamps. Nothing
+is summarised, classified, filtered or enriched.
 
-  whatsapp/          UI Automation. Knows nothing about MongoDB or webhooks.
-    sta_thread.py      The COM apartment every call is marshalled onto.
-    reader.py          Chat list + conversation reading.
-    sender.py          Option A: open, fill, send, verify.
-    row_parser.py      Flattened accessible Name → fields.
-    name_rules.py      Truncation-tolerant chat-name matching.
+Duplicate protection is a content-derived `message_key` with a unique index, so
+re-reading the same visible bubble every three seconds cannot store it twice.
 
-  engine/            Orchestration. The only layer that knows about all of them.
-    engine.py          Poll loop, relay loop, worker queue, recovery, commands.
-    discovery.py       Automatic chat registration.
-    pipeline.py        Persist → webhook → persist → send → verify.
-    relay.py           GET the webhook, dedupe, send what it offers.
-    webhook.py         The HTTP calls (POST and GET), shapes, retry policy.
+---
 
-  api/               The inbound send API. Optional; off unless a port is set.
-    server.py          Transport only: HTTP, auth, JSON in and out.
-    resolver.py        identifier → exactly one chat, or a refusal.
-    host.py            Policy: resolution outcomes → HTTP status codes.
+## Outbound: `POST /wam/` → WhatsApp
 
-  ui/                Qt. Talks to the engine through snapshots and submit().
-    app.py             load → validate → launch.
-    main_window.py     Layout, global controls, actions.
-    chat_list.py       Left rail.
-    config_panel.py    Right panel.
-    widgets.py         Chat-row painting (delegate).
-    theme.py           Light/dark palettes and stylesheet.
-    startup.py         Startup error and warning screens.
-    engine_host.py     The thread bridge.
+```bash
+curl --location 'http://127.0.0.1:8765/wam/'   --header 'Content-Type: application/json'   --data '{"id":"2933","message":"Hello"}'
 ```
 
-The dependency direction is one-way: `{ui, api} → engine → {storage, whatsapp} → domain`.
-Nothing in `storage/` imports from `whatsapp/`, nothing in `whatsapp/` imports
-from `storage/`, and `domain/` imports nothing of ours at all. That is what makes
-the engine testable with a fake reader and a fake database, which is how most of
-the test suite works.
+`id` resolves to a chat — by `external_id` (the last four digits of the
+number), the full number, the chat id, or the chat name. An ambiguous `id` is
+**refused**, never guessed: sending to the wrong person is the one failure this
+must not produce quietly.
 
-## Design decisions worth knowing
+The response is `202 Accepted` with an `outgoing_id`. It means *queued*, not
+*delivered* — delivery is reported by `GET /wam/status/<outgoing_id>`. The
+request is bounded by the enqueue (about a millisecond), never by the send,
+because a physical send takes seconds and a burst of twenty would otherwise
+hold twenty connections open for minutes.
 
-**Two loops, not one.** Opening a chat, calling a webhook and sending a reply
-take seconds. If the poll did that work it would no longer be a three-second
-poll. The loop does only cheap accessibility reads; anything expensive goes to a
-single worker that runs jobs one at a time — a second concurrent send is exactly
-how a message ends up in the wrong conversation.
+### Delivery is a bubble, not an empty box
 
-**Only automated chats are opened.** Everything else is tracked from its sidebar
-row. Switching chats is visible to the user, so the application does it only
-when it has a reason.
+```
+resolve chat → open it if it is not already → read the BASELINE
+             → send → read the chat again → count
+```
 
-**The JSON mirror is fed from memory, not from MongoDB.** Rebuilding the mirror
-by querying the primary would mean the backup only works while the primary is
-healthy — backwards for a backup. A ring buffer (seeded from MongoDB at startup)
-feeds it instead, so a MongoDB outage degrades to "JSON keeps recording".
+Verification requires the count of matching outgoing bubbles to have **gone
+up**. An empty compose box proves the text left the input; it does not prove it
+reached the conversation. A pre-existing identical message can never satisfy a
+new send.
 
-**The queue is not a durable structure.** It is reconstructed at startup from
-the state each message was persisted in. That is why the states exist.
+A message that leaves the box but is never found is `UNVERIFIED` and is **not
+retried** — retrying risks a duplicate, which is the worse failure. It is
+surfaced for a person to resolve.
 
-**A chat's identity is its name.** WhatsApp exposes no durable chat id, so one
-is hashed from the display name — with the consequences documented in
-[LIMITATIONS.md](LIMITATIONS.md).
+---
+
+## Noteify's `/ntext/whook/` is a different system
+
+```
+https://noteify.org/ntext/whook/?<WEB_KEY><MESSAGE_ID>
+```
+
+That endpoint belongs to Noteify. winSpark does not call it. Probed live: GET,
+POST and a bare request all answer
+`400 Bad Request: Invalid URL format. Expected format is ?<WEB_KEY><MESSAGE_ID>`.
+
+It is not the winSpark outbound API and must not be configured as one. The
+winSpark outbound API is `POST /wam/`.
+
+---
+
+## The relay
+
+An **alternative** outbound mechanism, off by default and not used by the
+Noteify integration. Instead of your server pushing to `/wam/`, winSpark polls
+each automated chat's `WEBHOOK_URL` with `GET` and sends whatever comes back.
+It exists for deployments where nothing can reach the machine WhatsApp runs on.
+
+It is retained and documented, not deleted — see [RELAY.md](RELAY.md) for the
+response shapes and the three deduplication rules. `WEBHOOK_URL` is the relay's
+poll address and **nothing else reads it** now that inbound no longer calls a
+webhook.
+
+---
+
+## Limitations that shape the design
+
+* **A saved contact's phone number cannot be discovered.** WhatsApp exposes it
+  nowhere reachable, so such a chat has no `external_id` and cannot be
+  addressed by number. See [LIMITATIONS.md](LIMITATIONS.md).
+* **Sending needs an interactive desktop.** Reading works over a disconnected
+  RDP session or a locked workstation; sending does not, and messages wait in
+  the queue rather than being lost.
+* **Identity is hashed from the display name**, so renaming a contact creates a
+  new chat here.

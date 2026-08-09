@@ -1148,17 +1148,26 @@ class WhatsAppSender:
         the whole sequence — opening a chat is exactly the operation that, run
         mid-send, made a message land in the wrong conversation."""
         async with self._sta.action_lock:
-            window_handle, row = await self.resolve_chat_row_async(chat_name)
-            if window_handle is None or row is None:
-                return None, []
-            opened = await self._sta.invoke_async(
-                lambda: open_chat_sync(window_handle, row.raw_text, chat_name)
-            )
-            if not opened:
-                return window_handle, []
-            await asyncio.sleep(0.4)  # let the conversation render
-            messages = await self._reader.read_recent_messages_async(window_handle, limit)
-            return window_handle, messages
+            return await self.open_and_read_locked(chat_name, limit)
+
+    async def open_and_read_locked(self, chat_name: str, limit: int = 25):
+        """The same thing for a caller that ALREADY holds the action lock.
+
+        `batch()` holds it for a whole drain, and `asyncio.Lock` is not
+        reentrant, so the locking version would deadlock there. The pre-send
+        census needs exactly this: the baseline has to be read from the target
+        chat, and the target chat may not be the one on screen."""
+        window_handle, row = await self.resolve_chat_row_async(chat_name)
+        if window_handle is None or row is None:
+            return None, []
+        opened = await self._sta.invoke_async(
+            lambda: open_chat_sync(window_handle, row.raw_text, chat_name)
+        )
+        if not opened:
+            return window_handle, []
+        await asyncio.sleep(0.4)  # let the conversation render
+        messages = await self._reader.read_recent_messages_async(window_handle, limit)
+        return window_handle, messages
 
     @asynccontextmanager
     async def batch(self):

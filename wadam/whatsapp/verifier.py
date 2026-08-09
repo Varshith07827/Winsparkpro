@@ -112,9 +112,14 @@ class SendVerifier:
     tested without WhatsApp, and so the relay, pipeline and send API all verify
     through exactly the same code."""
 
-    def __init__(self, read_messages, timeout: float = VERIFY_TIMEOUT_SECONDS) -> None:
+    def __init__(self, read_messages, timeout: float = VERIFY_TIMEOUT_SECONDS,
+                 open_and_read=None) -> None:
         self._read = read_messages
         self._timeout = timeout
+        # Used for the BASELINE only. The baseline may need the target chat
+        # brought on screen; the post-send confirmation never does, because the
+        # send just left it there.
+        self._open_and_read = open_and_read or read_messages
 
     async def census_many(self, chat_name: str, texts) -> Optional[dict]:
         """One read, a baseline count for every text in a batch.
@@ -124,7 +129,7 @@ class SendVerifier:
         makes the whole batch `unreadable` — the same honest answer `census`
         gives for one message."""
         try:
-            messages = await self._read(chat_name)
+            messages = await self._open_and_read(chat_name)
         except Exception as ex:  # noqa: BLE001
             logger.debug("batch census failed: %s", ex)
             return None
@@ -167,7 +172,7 @@ class SendVerifier:
         still proceeds, but it is verified as `unreadable` rather than being
         falsely confirmed."""
         try:
-            messages = await self._read(chat_name)
+            messages = await self._open_and_read(chat_name)
         except Exception as ex:  # noqa: BLE001
             logger.debug("pre-send census failed: %s", ex)
             return None

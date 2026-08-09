@@ -1,5 +1,36 @@
 # Data model
 
+---
+
+## Identifiers — seven, none interchangeable
+
+`POST /wam/ {"id": "2933"}` has to reach one chat and no other, so what each of
+these is — and is not — matters.
+
+| Identifier | Source | Purpose | Unique? | Can change? | Safe to route on? |
+|---|---|---|---|---|---|
+| `chat_id` | sha1 of the chat **name** | primary key for a chat | yes | **yes** — renaming a contact creates a new chat | yes, within a run |
+| `external_id` | last 4 digits of the number, derived at discovery | what `POST /wam/` addresses | **no** — 10,000 values | only if the number does | yes, and an ambiguous one is **refused** |
+| `phone_number` | the chat name when it IS a number | identity; builds the relay URL | yes | rarely | yes |
+| `chat_name` | what WhatsApp displays | display, and the sender's target | no | **yes** | as a fallback only |
+| `message_key` | sha1 of chat+sender+text+time+direction | incoming dedup | yes, by construction | no | never — dedup only |
+| `outgoing_id` | uuid4 per queued message | one queued send | yes, forever | no | yes |
+| `correlation_id` | the incoming `message_key` or the `outgoing_id` | tracing one message through the logs | yes | no | never — diagnostics only |
+
+Three rules worth stating plainly:
+
+* **`external_id` is not `phone_number`.** It is the last four digits of it.
+  `918106972933` has `external_id` `2933`, and a second contact ending `2933`
+  collides. The resolver refuses an ambiguous id rather than picking one.
+* **A number is never invented.** A saved contact exposes none, so it has an
+  empty `phone_number`, an empty `external_id`, and cannot be addressed by
+  number at all — only by name.
+* **`chat_id` follows the display name**, because WhatsApp exposes no durable
+  chat identifier. Renaming a contact makes a new chat here.
+
+Pinned by `tests/test_identifiers.py`.
+
+
 MongoDB is the source of truth. The JSON files are a mirror: every write goes to
 both, MongoDB first.
 

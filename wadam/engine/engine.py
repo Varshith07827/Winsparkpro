@@ -149,7 +149,8 @@ class AutomationEngine:
         self._discovery = ChatDiscovery(repository, settings)
         # Verification reads the conversation back; it goes through the same
         # opener the worker uses so it sees exactly what WhatsApp is showing.
-        self._verifier = SendVerifier(self._read_for_verification)
+        self._verifier = SendVerifier(self._read_for_verification,
+                                      open_and_read=self._read_baseline)
         self._delivery = DeliveryService(repository, self._sender, self._verifier,
                                          asyncio.to_thread, self.metrics)
         self._pipeline = MessagePipeline(repository, self._webhook, self._sender,
@@ -553,6 +554,23 @@ class AutomationEngine:
         if active.strip().lower() != chat_name.strip().lower()                 and not chat_names_match(chat_name, active):
             return None          # a different chat is open — cannot verify from here
         return await self._reader.read_recent_messages_async(hwnd, constants.MESSAGE_READ_LIMIT)
+
+    async def _read_baseline(self, chat_name: str):
+        """Read the target chat for the PRE-SEND baseline, opening it if needed.
+
+        `_read_for_verification` deliberately refuses to switch chats: after a
+        send the right conversation is already on screen, and re-opening it
+        would be another interruption for nothing. That reasoning does not hold
+        *before* a send — the chat may not be open at all — and applying it
+        there made the baseline unreadable, which marked every first send to an
+        unopened chat UNVERIFIED even though it arrived.
+
+        Runs under the action lock the caller already holds, through the same
+        proven chat-switch mechanism the send itself uses. No new interaction,
+        no coordinates, and nothing here is reachable from the passive poll."""
+        _hwnd, messages = await self._sender.open_and_read_locked(
+            chat_name, constants.MESSAGE_READ_LIMIT)
+        return messages or None
 
     # -- outgoing queue ----------------------------------------------------
 
