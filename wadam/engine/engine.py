@@ -676,10 +676,17 @@ class AutomationEngine:
                                   message.time_text, direction)
             if self._repo.has_message(key):
                 continue
-            if not message.is_incoming and self._repo.recently_originated(chat.chat_id, message.text):
-                # Our own message, read back out of WhatsApp. It is already
-                # stored from when we sent it; storing the bubble too would
-                # double every automated reply in the record.
+            if self._repo.recently_originated(chat.chat_id, message.text):
+                # Our own message, read back out of WhatsApp. Already stored
+                # from when we sent it; storing the bubble too would double
+                # every automated reply in the record.
+                #
+                # Deliberately NOT conditioned on `is_incoming`. That guard used
+                # to be, and direction detection is the one thing here that can
+                # be wrong: a reply of ours misread as incoming would be sent to
+                # the webhook, and the endpoint's answer sent back to the chat,
+                # answering our own message. Checking regardless costs one
+                # lookup and removes the loop entirely.
                 continue
 
             if seeding:

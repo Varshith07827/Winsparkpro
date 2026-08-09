@@ -86,6 +86,11 @@ def build_payload(chat, message) -> dict[str, Any]:
         "chat": {
             "id": chat.chat_id,
             "name": chat.chat_name,
+            # The identifier the webhook URL is built from. Included in the body
+            # too because the URL may carry the NAME instead when no number is
+            # known, which left the endpoint with no number anywhere at all.
+            # Empty string means "not known", never a guess.
+            "phone_number": getattr(chat, "phone_number", "") or "",
             "is_group": chat.is_group,
         },
         "message": {

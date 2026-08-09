@@ -29,6 +29,23 @@ from wadam.constants import (
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
+
+def app_dir() -> Path:
+    """Where the application keeps the files it OWNS: `.env`, the JSON mirror,
+    the capability cache and the diagnostic log.
+
+    Beside the executable when frozen, the project root when run from source.
+
+    `PROJECT_ROOT` cannot be used for this. Inside a PyInstaller one-file build
+    `__file__` lives in `sys._MEIPASS`, a temp directory **deleted when the
+    process exits** — so the packaged application wrote its backup, its
+    capability cache and its logs into a folder that disappeared on every quit.
+    Measured: two orphaned `_MEI*/backup/` folders on this machine, each a
+    complete mirror nobody could ever read back."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return PROJECT_ROOT
+
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 
 
@@ -83,7 +100,7 @@ class Settings:
     #: Fixed, deliberately not configurable. Kept as a field so tests can use a
     #: throwaway database, but nothing reads it from the environment.
     database_name: str = DATABASE_NAME
-    json_backup_folder: Path = field(default_factory=lambda: PROJECT_ROOT / "backup")
+    json_backup_folder: Path = field(default_factory=lambda: app_dir() / "backup")
     json_autosave_interval: float = 15.0
 
     #: The one webhook setting. `{phone_number}` is substituted per chat.
@@ -210,9 +227,7 @@ def default_env_path() -> Path:
     override = os.environ.get("WADAM_ENV_FILE")
     if override:
         return Path(override)
-    if getattr(sys, "frozen", False):     # PyInstaller: next to the .exe
-        return Path(sys.executable).resolve().parent / ".env"
-    return PROJECT_ROOT / ".env"
+    return app_dir() / ".env"
 
 
 def load_settings(env_path: Optional[Path] = None) -> Settings:
@@ -271,7 +286,7 @@ def load_settings(env_path: Optional[Path] = None) -> Settings:
     folder_raw = (values.get("JSON_BACKUP_FOLDER") or "backup").strip() or "backup"
     folder = Path(folder_raw)
     if not folder.is_absolute():
-        folder = PROJECT_ROOT / folder
+        folder = app_dir() / folder
 
     autosave = _as_float(values, "JSON_AUTOSAVE_INTERVAL", 15.0, problems, minimum=0.0)
     webhook_timeout = _as_float(values, "WEBHOOK_TIMEOUT", 20.0, problems, minimum=1.0)

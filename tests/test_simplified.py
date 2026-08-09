@@ -360,3 +360,65 @@ def test_a_chat_name_still_works_when_there_is_no_number():
 
     result = resolve_chat([_chat("Novus Tech Group")], "Novus Tech Group")
     assert result.ok and result.matched_by == "chat_name"
+
+
+# ---------------------------------------------------------------------------
+# Where the packaged application keeps its files
+# ---------------------------------------------------------------------------
+
+
+def test_a_frozen_build_keeps_its_files_beside_the_executable(monkeypatch, tmp_path: Path):
+    """The bug this encodes destroyed the backup on every quit.
+
+    In a PyInstaller one-file build `__file__` lives under `sys._MEIPASS`, a
+    temp directory removed when the process exits. The JSON mirror, the
+    capability cache and the diagnostic log were all written there, so the
+    disaster-recovery copy was deleted by the disaster-recovery-free act of
+    closing the app. Measured: two orphaned `_MEI*/backup/` folders, each a
+    full mirror nobody could read back."""
+    import sys as _sys
+
+    from wadam import config
+
+    exe = tmp_path / "install" / "Win_latest.exe"
+    exe.parent.mkdir(parents=True)
+    exe.write_bytes(b"")
+    monkeypatch.setattr(_sys, "frozen", True, raising=False)
+    monkeypatch.setattr(_sys, "executable", str(exe), raising=False)
+
+    assert config.app_dir() == exe.parent
+    assert config.default_env_path() == exe.parent / ".env"
+    assert config.Settings().json_backup_folder == exe.parent / "backup"
+
+
+def test_running_from_source_still_uses_the_project_root(monkeypatch):
+    import sys as _sys
+
+    from wadam import config
+
+    monkeypatch.delattr(_sys, "frozen", raising=False)
+    assert config.app_dir() == config.PROJECT_ROOT
+
+
+def test_a_relative_backup_folder_is_resolved_against_the_app_not_the_cwd(
+        monkeypatch, tmp_path: Path):
+    """Launched from a shortcut the cwd is anything at all, so a relative
+    JSON_BACKUP_FOLDER must not follow it."""
+    import os
+
+    from wadam.config import load_settings
+
+    env = tmp_path / ".env"
+    env.write_text("MONGODB_URI=mongodb://localhost:27017\n"
+                   "WEBHOOK_URL=https://x.test/?{phone_number}\n"
+                   "JSON_BACKUP_FOLDER=backup\n", encoding="utf-8")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    previous = os.getcwd()
+    try:
+        os.chdir(elsewhere)
+        settings = load_settings(env)
+    finally:
+        os.chdir(previous)
+    assert settings.json_backup_folder.is_absolute()
+    assert elsewhere not in settings.json_backup_folder.parents

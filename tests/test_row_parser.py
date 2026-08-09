@@ -124,3 +124,65 @@ def test_a_message_that_is_only_a_badge_word_survives():
 
 def test_the_group_senders_own_name_is_dropped():
     assert _bubble(["Manohar", "Sure sir"], sender_label="Manohar:") == "Sure sir"
+
+
+# ---------------------------------------------------------------------------
+# Direction detection
+# ---------------------------------------------------------------------------
+
+
+def test_the_details_button_names_the_author():
+    from wadam.whatsapp.reader import author_from_details_button
+
+    assert author_from_details_button("Open chat details for You") == "You"
+    assert author_from_details_button("Open chat details for Nagen US") == "Nagen US"
+    assert author_from_details_button("9:21 pm Delivered") == ""
+    assert author_from_details_button("") == ""
+
+
+class _Ctrl:
+    def __init__(self, kind, name, children=()):
+        self.ControlTypeName = kind
+        self.Name = name
+        self._children = list(children)
+
+    def GetChildren(self):
+        return list(self._children)
+
+
+def test_a_bubble_is_ours_when_the_details_button_says_you():
+    """The bug this encodes cost real money in confusion.
+
+    Measured live in a Community chat: only the two NEWEST bubbles carried the
+    "You:" group, while all 100 carried "Open chat details for You". The rest
+    fell through to alignment, which put our bubbles at x=1005 against a
+    threshold of 1154 — so our own sent messages were read as INCOMING, stored
+    as incoming, and would have been posted to the webhook and replied to."""
+    from wadam.whatsapp.reader import _bubble_item_is_ours
+
+    bubble = _Ctrl("DataItemControl", "", [
+        _Ctrl("ButtonControl", "Open chat details for You"),
+        _Ctrl("TextControl", "Hello Note #5"),
+    ])
+    assert _bubble_item_is_ours(bubble) is True
+
+
+def test_a_bubble_from_someone_else_is_not_ours():
+    from wadam.whatsapp.reader import _bubble_item_is_ours
+
+    bubble = _Ctrl("DataItemControl", "", [
+        _Ctrl("ButtonControl", "Open chat details for Nagen US"),
+        _Ctrl("TextControl", "Good morning"),
+    ])
+    # None, not False: no OUR-label found, so alignment decides.
+    assert _bubble_item_is_ours(bubble) is None
+
+
+def test_the_you_group_label_still_counts():
+    from wadam.whatsapp.reader import _bubble_item_is_ours
+
+    bubble = _Ctrl("DataItemControl", "", [
+        _Ctrl("GroupControl", "You:"),
+        _Ctrl("TextControl", "Hello"),
+    ])
+    assert _bubble_item_is_ours(bubble) is True

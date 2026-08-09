@@ -31,16 +31,14 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import (
     QApplication,
-    QFileDialog,
     QHBoxLayout,
     QLabel,
     QMainWindow,
     QMessageBox,
-    QPushButton,
     QSplitter,
     QVBoxLayout,
     QWidget,
@@ -117,12 +115,10 @@ class MainWindow(QMainWindow):
         host.snapshot_ready.connect(self._on_snapshot)
         host.engine_stopped.connect(self._on_engine_stopped)
 
-        # The snapshot carries relative times ("2m ago") that go stale between
-        # polls, so the selected chat's panel is re-rendered on a slow tick too.
-        self._tick = QTimer(self)
-        self._tick.setInterval(1000)
-        self._tick.timeout.connect(self._refresh_selected)
-        self._tick.start()
+        # No repainting timer. The panel used to show relative times ("2m ago")
+        # and needed one; it now shows a name, a number and a URL, none of which
+        # age. Every update arrives with a snapshot, and the timer's only
+        # remaining effect was to overwrite a half-typed phone number.
 
     # -- chrome ------------------------------------------------------------
 

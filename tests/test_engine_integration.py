@@ -392,3 +392,40 @@ def test_resetting_a_chat_rebaselines_it(engine):
     assert after.webhook_retry_count == 0
     assert after.last_error == ""
     assert after.webhook_url == alice.webhook_url, "the URL is kept — reset is not delete"
+
+
+def test_our_own_message_is_never_webhooked_even_if_read_as_incoming(engine):
+    """Defence in depth against a direction-detection failure.
+
+    A reply of ours misread as incoming used to skip the "did we send this?"
+    guard entirely — because that guard only ran for messages already believed
+    to be outgoing. The endpoint would then be asked to answer our own answer.
+    The guard now runs regardless of which way the reader thinks it went."""
+    instance, reader, repo = engine
+    from wadam.domain.models import ChatConfig, chat_id_for
+
+    chat = ChatConfig(chat_id=chat_id_for("Alice"), chat_name="Alice",
+                      automation_enabled=True, seeded=True,
+                      webhook_url="https://x.test/hook")
+    repo.save_chat(chat)
+    # How the application records something it sent: an outgoing message with
+    # an `origin`. That is what `recently_originated` looks for.
+    from wadam.domain.models import StoredMessage, outgoing_key_for
+    repo.save_message(StoredMessage(
+        message_key=outgoing_key_for(chat.chat_id, "our own reply"),
+        chat_id=chat.chat_id, chat_name=chat.chat_name, sender="You",
+        text="our own reply", direction="out", origin="webhook_reply",
+    ))
+    assert repo.recently_originated(chat.chat_id, "our own reply")
+    before = len(repo.messages_for(chat.chat_id))
+
+    # The reader hands it back with the WRONG direction.
+    from wadam.whatsapp.reader import WhatsAppMessage
+    incoming = WhatsAppMessage(sender="Alice", text="our own reply",
+                               is_incoming=True, time_text="9:21 pm")
+    import asyncio
+    asyncio.run(instance._ingest(chat, [incoming]))
+
+    assert len(repo.messages_for(chat.chat_id)) == before, (
+        "a message we originated must not be stored as incoming"
+    )

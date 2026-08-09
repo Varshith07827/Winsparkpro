@@ -698,14 +698,45 @@ def _bubble_item_sender(item) -> str:
     return walk(item) or ""
 
 
+#: WhatsApp labels a bubble's author on a details button as well as on the
+#: "You:" group — "Open chat details for You" / "…for Nagen US". Measured live:
+#: in a Community chat only the two newest bubbles carried the "You:" group,
+#: while all 100 carried this button, so the group alone is not enough.
+_DETAILS_FOR_PREFIX = "open chat details for "
+
+
+def author_from_details_button(name: str) -> str:
+    """The author a details-button label names, or "" if it is not one."""
+    lowered = (name or "").strip().casefold()
+    if lowered.startswith(_DETAILS_FOR_PREFIX):
+        return (name or "").strip()[len(_DETAILS_FOR_PREFIX):].strip()
+    return ""
+
+
 def _bubble_item_is_ours(item) -> Optional[bool]:
-    """True when the row carries the definitive "You:" label; None when there's
-    no label at all — alignment decides then."""
+    """True when the row carries a definitive OUR-message label; None when it
+    carries none at all — alignment decides then, badly.
+
+    Two labels count, because WhatsApp does not always render both:
+
+    * the ``You:`` group, and
+    * ``Open chat details for You``.
+
+    Getting this wrong is not cosmetic. A message of ours read as *incoming* is
+    stored as incoming, which sends it to the webhook and replies to our own
+    reply. Measured before this fix: outgoing bubbles sat at x=1005 while the
+    alignment threshold was 1154, so every one of them was called incoming."""
     def walk(ctrl, depth=0):
         if depth > 8:
             return False
-        if _safe_control_type(ctrl) == "GroupControl" and _safe_name(ctrl).strip() == _SELF_SENDER_LABEL:
+        control_type = _safe_control_type(ctrl)
+        name = _safe_name(ctrl).strip()
+        if control_type == "GroupControl" and name == _SELF_SENDER_LABEL:
             return True
+        if control_type == "ButtonControl":
+            author = author_from_details_button(name)
+            if author and author.casefold() == "you":
+                return True
         return any(walk(child, depth + 1) for child in _safe_children(ctrl))
 
     return True if walk(item) else None
@@ -859,7 +890,12 @@ def _bubble_item_content(item):
     # The same preamble strip the label-based parser does. A Community bubble
     # carries "You" and "Community admin" as their own TextControls, and
     # leaving them in made a delivered message unverifiable.
-    text = " ".join(_strip_sender_preamble(parts, _bubble_item_sender(item))).strip()
+    #
+    # `_bubble_item_sender` walks the bubble's subtree, so it is resolved ONCE
+    # and reused below. Calling it here as well took the conversation read from
+    # 2.0s to 8.4s — measured, and the reason this audit exists.
+    sender_hint = _bubble_item_sender(item)
+    text = " ".join(_strip_sender_preamble(parts, sender_hint)).strip()
     if text.startswith(_SYSTEM_NOTICE_PREFIXES):
         return None
     display, media_kind, media_note, time_text = _enrich_media(item, text)
@@ -870,7 +906,7 @@ def _bubble_item_content(item):
         top = int(item.BoundingRectangle.top)
     except Exception:  # noqa: BLE001
         top = 0
-    return (display, center_x, top, _bubble_item_sender(item),
+    return (display, center_x, top, sender_hint,
             _bubble_item_is_ours(item), media_kind, media_note, time_text)
 
 
