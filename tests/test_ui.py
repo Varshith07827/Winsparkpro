@@ -442,3 +442,33 @@ def test_the_webhook_box_survives_the_once_a_second_refresh(app):
     panel.set_chat(alice)          # the tick fires
 
     assert panel._webhook.text() == "https://half-typed"
+
+
+def test_closing_the_window_shuts_everything_down(app, tmp_path):
+    """closeEvent referenced a timer that had been deleted, so it raised on
+    every close and skipped the engine and repository shutdown beneath it.
+    Qt swallows the exception into a traceback, so nothing failed loudly."""
+    from wadam.config import Settings
+    from wadam.storage.json_backup import JsonBackupStore
+    from wadam.storage.repository import Repository
+    from wadam.ui.engine_host import EngineHost
+    from wadam.ui.main_window import MainWindow
+    from tests.test_storage import FakeMongo
+
+    settings = Settings(mongodb_uri="mongodb://localhost:27017",
+                        json_backup_folder=tmp_path, json_autosave_interval=0)
+    backup = JsonBackupStore(tmp_path, autosave_interval=0)
+    backup.ensure_folder()
+    repository = Repository(settings, FakeMongo(), backup)
+    repository.start()
+    host = EngineHost(settings, repository)          # not started: no threads
+    window = MainWindow(settings, repository, host)
+
+    class _Event:
+        def __init__(self): self.accepted = False
+        def accept(self): self.accepted = True
+
+    event = _Event()
+    window.closeEvent(event)                          # must not raise
+
+    assert event.accepted, "the close must be accepted, not abandoned mid-way"

@@ -243,7 +243,11 @@ class MainWindow(QMainWindow):
     # -- shutdown ----------------------------------------------------------
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt naming
-        self._tick.stop()
+        # No timer to stop: the repainting tick was removed when the details
+        # panel stopped showing anything time-dependent. This method kept
+        # calling it and raised AttributeError on every close, which skipped
+        # the engine and repository shutdown below — the final JSON flush only
+        # happened because app.py's `finally` repeats these calls.
         self._host.stop()
         try:
             self._repository.stop()
