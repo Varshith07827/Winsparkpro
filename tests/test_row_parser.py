@@ -186,3 +186,126 @@ def test_the_you_group_label_still_counts():
         _Ctrl("TextControl", "Hello"),
     ])
     assert _bubble_item_is_ours(bubble) is True
+
+
+# ---------------------------------------------------------------------------
+# Raw message integrity — sender must never bleed into the body
+# ---------------------------------------------------------------------------
+
+
+class _Rect:
+    def __init__(self, left, top, right, bottom):
+        self.left, self.top, self.right, self.bottom = left, top, right, bottom
+
+
+class _Node:
+    """A UIA control shaped like the ones WhatsApp actually produces."""
+
+    def __init__(self, kind, name="", rect=None, children=()):
+        self.ControlTypeName = kind
+        self.Name = name
+        self.BoundingRectangle = rect or _Rect(0, 0, 0, 0)
+        self._children = list(children)
+
+    def GetChildren(self):
+        return list(self._children)
+
+
+def _live_bubble(sender=None, body_lines=(), quoted=None, sender_phone=None):
+    """A bubble laid out the way the live tree is: the sender name inside a
+    ButtonControl, an optional phone group ON THE SENDER'S LINE, and each body
+    line in its own group BELOW. Geometry copied from a real capture."""
+    kids = []
+    if sender is not None:
+        kids.append(_Node("ButtonControl", sender, _Rect(623, 214, 1215, 240), [
+            _Node("TextControl", "~ ", _Rect(623, 218, 639, 236)),
+            _Node("TextControl", sender.replace("Maybe ", ""), _Rect(638, 218, 691, 236)),
+        ]))
+    if sender_phone is not None:
+        kids.append(_Node("GroupControl", "", _Rect(1214, 214, 1331, 240), [
+            _Node("TextControl", sender_phone, _Rect(1214, 219, 1331, 237)),
+        ]))
+    if quoted is not None:
+        kids.append(_Node("ButtonControl", "Quoted message", _Rect(615, 251, 1336, 310), [
+            _Node("TextControl", quoted, _Rect(631, 260, 803, 278)),
+        ]))
+    top = 332
+    for line in body_lines:
+        kids.append(_Node("GroupControl", "", _Rect(623, top, 1331, top + 20), [
+            _Node("TextControl", line, _Rect(623, top + 2, 696, top + 18)),
+        ]))
+        top += 26
+    kids.append(_Node("GroupControl", "", _Rect(1261, top, 1331, top + 18), [
+        _Node("TextControl", "10:44 PM", _Rect(1261, top + 1, 1331, top + 17)),
+    ]))
+    return _Node("DataItemControl", "", _Rect(527, 206, 1905, top + 30), kids)
+
+
+def _body(**kw):
+    from wadam.whatsapp.reader import _bubble_item_content
+
+    content = _bubble_item_content(_live_bubble(**kw))
+    return content[0] if content else None
+
+
+def test_the_acceptance_case_a_partially_saved_contact():
+    """Sender "Pritam +91 63032 31690", message "Ok mam".
+
+    Measured live before the fix: the webhook received
+    "Pritam +91 63032 31690 Ok mam"."""
+    assert _body(sender="Maybe Pritam", sender_phone="+91 63032 31690",
+                 body_lines=["Ok mam"]) == "Ok mam"
+
+
+def test_a_genuine_message_that_looks_like_a_sender_header_is_untouched():
+    """The other half of the acceptance criterion. If someone actually types
+    "Pritam +91 63032 31690 Ok mam", that IS the message and must survive."""
+    text = "Pritam +91 63032 31690 Ok mam"
+    assert _body(sender="Dittakavi Saritha", body_lines=[text]) == text
+
+
+def test_a_message_that_is_only_a_phone_number_survives():
+    assert _body(sender="Manohar Sripati", body_lines=["+91 63032 31690"]) == "+91 63032 31690"
+
+
+def test_a_message_beginning_with_the_senders_own_name_survives():
+    assert _body(sender="Pritam", body_lines=["Pritam will send it"]) == "Pritam will send it"
+
+
+def test_a_message_identical_to_the_sender_name_survives():
+    assert _body(sender="Pritam", body_lines=["Pritam"]) == "Pritam"
+
+
+def test_a_quoted_reply_does_not_leak_into_the_body():
+    assert _body(sender="Manohar Sripati", quoted="Dittakavi Saritha Work",
+                 body_lines=["Sure sir"]) == "Sure sir"
+
+
+def test_a_multiline_message_keeps_every_line():
+    assert _body(sender="Nagen US", body_lines=["line one", "line two", "line three"]) == \
+        "line one line two line three"
+
+
+def test_a_unicode_sender_does_not_corrupt_the_body():
+    assert _body(sender="Ελληνικά Χρήστης", sender_phone="+30 210 1234567",
+                 body_lines=["Καλημέρα"]) == "Καλημέρα"
+
+
+def test_a_sender_whose_name_contains_digits():
+    assert _body(sender="Agent 007", sender_phone="+44 7700 900123",
+                 body_lines=["Mission accepted"]) == "Mission accepted"
+
+
+def test_a_saved_contact_with_no_phone_shown():
+    assert _body(sender="Dittakavi Saritha", body_lines=["Manohar good morning"]) == \
+        "Manohar good morning"
+
+
+def test_an_unsaved_number_as_the_sender():
+    assert _body(sender="+91 63032 31690", sender_phone="+91 63032 31690",
+                 body_lines=["hello there"]) == "hello there"
+
+
+def test_a_bubble_with_no_sender_button_at_all():
+    """Our own messages carry no sender button; the body must still read."""
+    assert _body(body_lines=["Hello Note #7"]) == "Hello Note #7"

@@ -672,10 +672,11 @@ def _contains_dataitem(ctrl, depth: int = 0) -> bool:
     return False
 
 
-def _bubble_item_sender(item) -> str:
-    """The sender name shown on a group bubble, if this row carries one. The
-    name/avatar render as clickable buttons on the FIRST message of a person's
-    run; status buttons ("9:21 pm Delivered", "Forward media") are filtered."""
+def _sender_button(item):
+    """The ButtonControl carrying the sender's name, or None.
+
+    Returned as a control rather than a string because its RECTANGLE is what
+    identifies the bubble's header line — see `_on_sender_line`."""
     def walk(ctrl, depth=0):
         if depth > 8:
             return None
@@ -688,14 +689,47 @@ def _bubble_item_sender(item) -> str:
                 and not _MESSAGE_TIME_RE.match(name)
                 and not any(w in lowered for w in _NON_SENDER_BUTTON_WORDS)
             ):
-                return name
+                return ctrl
         for child in _safe_children(ctrl):
             found = walk(child, depth + 1)
-            if found:
+            if found is not None:
                 return found
         return None
 
-    return walk(item) or ""
+    return walk(item)
+
+
+def _on_sender_line(control, sender_rect) -> bool:
+    """Does this control sit on the bubble's SENDER line?
+
+    WhatsApp prints a partially saved contact's phone number beside their name,
+    on the same line, in its own group — so it survives the "skip buttons" rule
+    and lands in the message body: "Ok mam" became "+91 63032 31690 Ok mam".
+
+    The discriminator is the sender button's own rectangle, not a guessed
+    coordinate. A previous bug in this file came from a threshold computed as
+    60% of the WINDOW width; anchoring to a real element avoids repeating it.
+    Body text renders on later lines (measured: sender y=214, number y=219,
+    body y=332), so vertical overlap with the sender button means header."""
+    if sender_rect is None:
+        return False
+    try:
+        rect = control.BoundingRectangle
+    except Exception:  # noqa: BLE001
+        return False
+    if rect is None or rect.bottom <= rect.top:
+        return False
+    # Overlapping vertical bands, with no tolerance added — the number sits
+    # squarely on the name's line, and a body line does not.
+    return rect.top < sender_rect.bottom and rect.bottom > sender_rect.top
+
+
+def _bubble_item_sender(item) -> str:
+    """The sender name shown on a group bubble, if this row carries one. The
+    name/avatar render as clickable buttons on the FIRST message of a person's
+    run; status buttons ("9:21 pm Delivered", "Forward media") are filtered."""
+    button = _sender_button(item)
+    return _safe_name(button).strip() if button is not None else ""
 
 
 #: WhatsApp labels a bubble's author on a details button as well as on the
@@ -746,12 +780,22 @@ def _iter_message_parts(ctrl, depth: int = 0) -> list:
     """The row's content in document order: ("text", control) for TextControls
     and ("emoji", name) for inline emoji. WhatsApp renders emoji INSIDE a text
     message as ImageControls between the text runs, so reading only TextControls
-    silently drops them. Quoted-reply subtrees are skipped, and WhatsApp's own
-    "wds-ic-…" icon glyphs aren't emoji."""
+    silently drops them, and WhatsApp's own "wds-ic-…" icon glyphs aren't emoji.
+
+    **Every ButtonControl subtree is skipped**, not just quoted replies. That is
+    a structural rule, not a guess: surveyed across live bubbles, message text
+    always sits in a GroupControl and the things inside buttons are always
+    chrome — the sender's name, the quoted-reply preview, action buttons.
+
+    It matters because the alternative corrupted the message. A partially saved
+    contact renders its sender as `ButtonControl "Maybe Pritam"` containing
+    `TextControl "~ "` and `TextControl "Pritam"`, so walking into it made the
+    message "Ok mam" read back as "Pritam ... Ok mam" — and that contaminated
+    text is what went to MongoDB and to the webhook."""
     if depth > 8:
         return []
     control_type = _safe_control_type(ctrl)
-    if control_type == "ButtonControl" and _safe_name(ctrl).startswith("Quoted"):
+    if control_type == "ButtonControl":
         return []
     found: list = []
     if control_type == "TextControl":
@@ -872,6 +916,15 @@ def _bubble_item_content(item):
     parts: list[str] = []
     lefts: list[int] = []
     rights: list[int] = []
+    # Resolved once: the button is the anchor for the header line, and its name
+    # is the sender. Walking the subtree twice cost seconds per read.
+    sender_button = _sender_button(item)
+    sender_hint = _safe_name(sender_button).strip() if sender_button is not None else ""
+    try:
+        sender_rect = sender_button.BoundingRectangle if sender_button is not None else None
+    except Exception:  # noqa: BLE001
+        sender_rect = None
+
     for kind_tag, payload in _iter_message_parts(item):
         if kind_tag == "emoji":
             parts.append(payload)
@@ -879,6 +932,8 @@ def _bubble_item_content(item):
         value = _safe_name(payload).strip()
         if not value or value in _MARKER_TEXTS or _MESSAGE_TIME_RE.match(value):
             continue
+        if _on_sender_line(payload, sender_rect):
+            continue  # the sender's phone number, printed beside their name
         parts.append(value)
         try:
             r = payload.BoundingRectangle
@@ -891,10 +946,6 @@ def _bubble_item_content(item):
     # carries "You" and "Community admin" as their own TextControls, and
     # leaving them in made a delivered message unverifiable.
     #
-    # `_bubble_item_sender` walks the bubble's subtree, so it is resolved ONCE
-    # and reused below. Calling it here as well took the conversation read from
-    # 2.0s to 8.4s — measured, and the reason this audit exists.
-    sender_hint = _bubble_item_sender(item)
     text = " ".join(_strip_sender_preamble(parts, sender_hint)).strip()
     if text.startswith(_SYSTEM_NOTICE_PREFIXES):
         return None
