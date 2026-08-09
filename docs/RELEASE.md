@@ -13,7 +13,7 @@ WhatsApp Desktop MSIX `2.2630.102.0` · RDP session 4 (console session 5).
 ## 1. Test results
 
 ```
-410 passed
+444 passed
 ```
 
 The storage-dependent suites run **twice** — once against a dict-backed fake
@@ -218,13 +218,15 @@ Three cases prove the census logic rather than mere presence:
 | Poll cadence | ✅ | Measured; conversation read is the dominant cost |
 | Latency by stage | ✅ | §2 |
 | Memory / handles / threads | ✅ | 15-min soak: +0.8 MB, handles -23. Raw data in `docs/soak.json` |
-| 24-hour stability | ❌ | **Not run.** Unverified |
+| 24-hour stability | ❌ | **Not run.** 15-minute soak only — see §17 |
 | **Security** | ✅ | §7 |
 | **Testing** | | |
 | Unit + integration | ✅ | 313 tests |
 | Real MongoDB | ✅ | Storage suites run against both stores |
 | Real WhatsApp reads | ✅ | Live probes and benchmarks |
-| **Real WhatsApp send end-to-end** | ✅ | Failed at first (§11), **root cause found and fixed (§12)**; 5/5 verified in the chat |
+| **Real WhatsApp send end-to-end** | ✅ | §17: two-send diagnostic BOTH_MESSAGES_OBSERVED, each send one bubble |
+| **Inbound collector** | ✅ | §16: 2 bubbles → 2 reader → 2 keys → 2 records, re-poll adds 0 |
+| **RDP disconnect (real)** | ❌ | Simulated only |
 | **Documentation** | ✅ | Ten documents; see the README index |
 | **Deployment** | ⚠️ | No installer or packaging; run from source |
 | **Send API path** | ✅ | Queue-backed since §13; 20-message burst accepted in 11s, 19/20 verified |
@@ -291,15 +293,13 @@ could ever be done about it.
 
 ## 10. Recommendation
 
-**Ready for supervised production use** on a dedicated machine, with an
-operator watching the Operations card for the first days.
-
-This section has been wrong twice and the history is worth keeping. It first
+**See §17 for the current verdict.** This section is kept as written because
+its history is the useful part: it has been wrong twice, in both directions,
+and each correction came from evidence rather than argument. It first
 recommended supervised production before the send path had ever run against a
-real chat. §11 then corrected it to "not ready" when that test delivered 14 of
-~114 messages. §12 found and fixed the cause, and the path is now verified
-end to end. Defect 1 of §11 — the Send API bypassing the durable queue — was closed in
-§13. Every send path is now queued, retried and verified.
+real chat. §11 corrected it to "not ready" when that test delivered 14 of ~114
+messages. §12 found and fixed the cause. Defect 1 of §11 — the Send API
+bypassing the durable queue — was closed in §13.
 
 If genuinely unattended, invisible operation is a hard requirement, the desktop
 path cannot deliver it and the WhatsApp Business Platform is the correct
@@ -672,13 +672,13 @@ discovery was starved (#4). That is fixed and **has not been re-tested**.
 application discovered itself, the relay is off, the API is unreachable, and
 the capture endpoint answers GET with 204.
 
-### Verdict
+### Verdict at the time of §15
 
-**NOT READY** — one gate remains, and it is evidence, not suspicion: the
-complete pipeline has never been observed working end to end against a real
-message. Everything upstream and downstream is verified separately.
+**NOT READY.** Superseded — see §17. The gate named here was evidence, not
+suspicion: the complete pipeline had never been observed working end to end
+against a real message. It has been now, in both directions.
 
-Tests: 410.
+Tests at the time: 410.
 
 
 ---
@@ -726,3 +726,94 @@ destroys the evidence.
 
 Outbound verification only — the two-send diagnostic. The collector is no longer
 entangled with it.
+
+
+---
+
+## 17. Final verdict — READY WITH KNOWN LIMITATIONS
+
+Both flows are now proven end to end against real WhatsApp traffic, each link
+measured from its own evidence source rather than inferred from the one next to
+it.
+
+### Inbound — WhatsApp to `wa_events`
+
+```
+2 UIA bubbles -> 2 reader messages -> 2 unique keys -> 2 MongoDB records
+                                                   -> second poll adds 0
+```
+
+Measured on `WINSPARK_TWOSEND_DIAG`, which had no pre-existing rows and is
+therefore the uncontaminated case. Raw message text is preserved byte for byte;
+a real inbound message was stored as `'WINSPARK_E2E_TEST_84721'` with no sender
+name, badge or phone number prepended.
+
+### Outbound — `POST /wam/` to a verified bubble
+
+```
+POST /wam/ {"id":"2933"} -> external_id resolution -> durable queue
+                         -> sender -> new bubble -> census verification
+```
+
+The two-send diagnostic, re-run after the reader fix:
+
+```
+baseline=2  final=4  new_bubbles=2  expected=2
+send_1: compose_after_fill 'WINSPARK_TWOSEND_DIAG'  bubbles 2 -> 3
+send_2: compose_after_fill 'WINSPARK_TWOSEND_DIAG'  bubbles 3 -> 4
+CLASSIFICATION: BOTH_MESSAGES_OBSERVED
+```
+
+Each send produced exactly one bubble. **The sender was never defective.** The
+earlier "two sends, one bubble" was entirely the reader defect: the same send
+code, frozen and unchanged, produced the correct result once the instrument
+measuring it was fixed. Census verification recovered on its own —
+`count_outgoing` now returns 4 for four bubbles — without census logic being
+touched, which is the right outcome, since compensating there would have
+concealed the real bug.
+
+### Verdict
+
+**READY WITH KNOWN LIMITATIONS.**
+
+Ready for supervised production on a dedicated machine. Not for unattended
+operation, for the reasons below.
+
+### Known limitations
+
+| Limitation | Impact | Documented |
+|---|---|---|
+| **A saved contact's phone number cannot be discovered.** WhatsApp exposes it nowhere reachable — the whole window offers eight clickable elements and none is a contact affordance | Such a chat has no `external_id` and cannot be addressed by number through `/wam/`; it is addressed by name | [LIMITATIONS.md](LIMITATIONS.md) |
+| **Stale message keys from before the occurrence-aware format** | At most one extra row per repeated message still in the visible tail, once | [MIGRATION.md](MIGRATION.md) |
+| **Sending requires an interactive desktop** | Over a disconnected RDP session or a locked workstation, messages queue and wait; reading continues | [LIMITATIONS.md](LIMITATIONS.md) |
+| **`external_id` is four digits and can collide** | An ambiguous id is refused with `409`, never guessed; use the full number or exact name | [SEND_API.md](SEND_API.md) |
+| **Chat identity is hashed from the display name** | Renaming a contact creates a new chat here | [DATA.md](DATA.md) |
+| **A conversation read costs 1.6–5.8 s**, scaling with rendered bubbles | Bounds throughput; the queue absorbs bursts | §2 |
+| **RDP disconnect and reconnect: never tested for real** | Simulated only | below |
+| **24-hour stability: never measured** | A 15-minute soak is all that was observed | §3 |
+
+### What the last two mean
+
+They are operational validation, not pipeline correctness. Both flows work; what
+is unproven is how the application behaves over a day, and through a real
+session disconnect rather than a simulated one. Neither should be assumed from
+a 15-minute window, and this document has avoided that kind of extrapolation
+throughout.
+
+### The lesson worth keeping
+
+Every serious defect this audit found came from collapsing two of these into
+one:
+
+```
+UIA observation  !=  reader observation  !=  transport result  !=  verification result
+```
+
+The alignment threshold treated screen geometry as authorship, and our own sent
+messages read as incoming — which would have posted them to the webhook and
+answered them. The pre-send census treated "the chat is open" as "the chat can
+be read". And a diagnostic written to exonerate the sender measured bubbles
+*with the reader*, so it blamed the sender for the reader's defect and nearly
+caused working send code to be rewritten.
+
+Tests: 444.
