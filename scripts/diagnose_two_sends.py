@@ -6,14 +6,25 @@ the sender drives WhatsApp Desktop's real UI and no local target can stand in
 for it.
 
 This is deliberately not "send twice and look". It records the compose box
-immediately before and after each send, and reads the conversation
-independently between them, so the observation maps to exactly one cause:
+immediately before and after each send and reads the conversation independently
+between them.
 
-    compose never contained #2          -> winSpark transport/input problem
-    compose contained #2, no bubble     -> WhatsApp/UI delivery problem
-    bubble exists, reader missed it     -> reader/verification problem
-    two bubbles exist                   -> the earlier result was a race
-    one bubble, repeatedly              -> genuine sender reliability issue
+**It reports observations, and classifies them. It does not claim causes.**
+
+UI Automation can see what this application put into the compose control and
+what bubbles exist afterwards. It cannot see inside WhatsApp. So
+"compose held the text and no bubble appeared" is reported as
+TRANSPORT_REPORTED_SUCCESS_BUT_NO_BUBBLE — a statement about what was observed.
+Calling that "WhatsApp accepted and dropped it" would be inventing a mechanism
+between input and message creation that nothing here can watch.
+
+Classifications:
+
+    INPUT_NOT_OBSERVED                        the text never appeared in compose
+    TRANSPORT_REPORTED_SUCCESS_BUT_NO_BUBBLE  compose changed, no new bubble
+    BUBBLE_OBSERVED_BUT_VERIFICATION_FAILED   bubble present, census disagreed
+    BOTH_MESSAGES_OBSERVED                    two new bubbles
+    NEITHER_MESSAGE_OBSERVED                  no new bubbles at all
 
 It sends TWO REAL MESSAGES to a real chat. Nothing is retried.
 
@@ -75,37 +86,61 @@ def main() -> int:
     baseline = bubbles()
     print(f"baseline bubbles matching {TEXT!r}: {baseline}\n")
 
+    records = []
     for attempt in (1, 2):
-        print(f"--- send #{attempt} ---")
-        print(f"  compose before fill : {compose()!r}")
+        before_count = bubbles()
+        compose_before = compose()
         filled, strategy = S.set_compose_text_sync(hwnd, TEXT, True)
-        print(f"  fill reported       : {filled} ({strategy})")
-        print(f"  compose after fill  : {compose()!r}")
+        compose_after_fill = compose()
 
         invoked = S.invoke_send_button_sync(hwnd)
         method = "send-button-invoke" if invoked else "enter-key"
         if not invoked:
             invoked = S.press_enter_sync(hwnd)
-        print(f"  send invoked        : {invoked} ({method})")
         time.sleep(1.0)
-        print(f"  compose after send  : {compose()!r}")
-
+        compose_after_send = compose()
         time.sleep(1.5)
-        count = bubbles()
-        print(f"  bubbles now         : {count} (was {baseline + attempt - 1})")
-        print(f"  this send landed    : {count == baseline + attempt}\n")
+        after_count = bubbles()
+
+        record = {
+            "compose_before": compose_before,
+            "compose_after_fill": compose_after_fill,
+            "compose_after_send": compose_after_send,
+            "fill_reported": f"{filled} ({strategy})",
+            "send_method": method,
+            "transport_result": "success" if (filled and invoked) else "failure",
+            "bubble_count_before": before_count,
+            "bubble_count_after": after_count,
+        }
+        records.append(record)
+
+        print(f"send_{attempt}:")
+        for key, value in record.items():
+            print(f"  {key:<22} {value!r}")
+        print()
 
     final = bubbles()
-    print("=" * 58)
-    print(f"  baseline {baseline}   after two sends {final}   expected {baseline + 2}")
-    if final == baseline + 2:
-        print("  -> both landed. The earlier single-bubble result was a race.")
-    elif final == baseline + 1:
-        print("  -> one landed. Read the per-send compose lines above:")
-        print("     compose held the text  -> WhatsApp accepted and dropped it")
-        print("     compose never held it  -> winSpark never typed it")
+    landed = final - baseline
+    input_seen = [TEXT in (r["compose_after_fill"] or "") for r in records]
+
+    # Observation -> classification. No mechanism is asserted: UI Automation
+    # can see what this application put into the compose control and what
+    # bubbles exist afterwards, and nothing between those two facts.
+    if landed >= 2:
+        verdict = "BOTH_MESSAGES_OBSERVED"
+    elif not all(input_seen):
+        verdict = "INPUT_NOT_OBSERVED"
+    elif landed == 0:
+        verdict = "NEITHER_MESSAGE_OBSERVED"
     else:
-        print("  -> neither landed. Transport is reporting success falsely.")
+        verdict = "TRANSPORT_REPORTED_SUCCESS_BUT_NO_BUBBLE"
+
+    print("=" * 58)
+    print(f"  baseline={baseline}  final={final}  new_bubbles={landed}  expected=2")
+    print(f"  CLASSIFICATION: {verdict}")
+    print()
+    print("  These are observations made through UI Automation. They do not")
+    print("  assert what happened inside WhatsApp, which nothing here can see.")
     print("  Nothing was retried.")
     return 0
 
