@@ -81,46 +81,28 @@ class MessagePipeline:
     # -- the normal path ---------------------------------------------------
 
     async def process(self, chat: ChatConfig, message: StoredMessage) -> None:
-        """Run one incoming message through webhook → reply → verification.
+        """Record an incoming message. That is the whole inbound flow.
 
-        The message is already persisted when this is called; everything after
-        that happens here, each step persisted in turn."""
+            WhatsApp ─▶ reader ─▶ MongoDB (wa_events) ─▶ your monitoring app
+
+        winSpark is the **collector** on this side. It does not call anything
+        and it does not answer: whatever reads `wa_events` decides what to do
+        with a message, and if a reply is wanted it comes back through the
+        outbound bridge (`POST /wam/`) like any other outbound message.
+
+        This used to POST the message to the chat's webhook and send whatever
+        came back — an inbound→webhook→reply loop that was never part of the
+        product. It is gone. The two flows are independent by design:
+        **receiving a WhatsApp message can no longer cause winSpark to send
+        one**, which is also what makes an accidental reply loop structurally
+        impossible rather than merely guarded against.
+
+        The message is already persisted when this is called."""
         await self._to_thread(self._repo.flush_json, True)
-
-        if not (chat.webhook_url or "").strip():
-            await self._finish(chat, message, status=MessageStatus.IGNORED,
-                               webhook_status="no webhook configured")
-            self._log(chat, "WARNING", "webhook.missing", message,
-                      "Automation is on but no webhook URL is configured — message stored only.")
-            return
-
-        # The crash-safety point: this is written BEFORE the call, so a message
-        # found in this state after a crash is known to be ambiguous rather than
-        # assumed safe to retry.
-        message.status = MessageStatus.DISPATCHING
-        await self._to_thread(self._repo.update_message, message)
-        await self._to_thread(self._repo.flush_json, True)
-
-        outcome = await self._call_webhook(chat, message)
-        if outcome is None:
-            return
-
-        reply = optional_reply(outcome)
-        if reply is None:
-            # A deliberate silence from the endpoint. Successful, and final.
-            await self._finish(chat, message, status=MessageStatus.WEBHOOK_OK,
-                               webhook_status=outcome.status_text)
-            self._log(chat, "INFO", "webhook.no_reply", message,
-                      f"{outcome.status_text} — endpoint returned no reply, nothing sent.")
-            return
-
-        message.reply_text = reply
-        message.status = MessageStatus.AWAITING_SEND
-        await self._to_thread(self._repo.update_message, message)
-        await self._to_thread(self._repo.save_chat, chat)
-        await self._to_thread(self._repo.flush_json, True)
-
-        await self._send_reply(chat, message, reply, webhook_status=outcome.status_text)
+        await self._finish(chat, message, status=MessageStatus.WEBHOOK_OK,
+                           webhook_status="collected")
+        self._log(chat, "INFO", "message.collected", message,
+                  "Stored in wa_events. Inbound is collect-only; nothing is sent.")
 
     async def _call_webhook(self, chat: ChatConfig, message: StoredMessage):
         """Call the endpoint and persist everything about the attempt. Returns

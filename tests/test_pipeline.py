@@ -127,100 +127,9 @@ def read_json(folder: Path, name: str):
 # ---------------------------------------------------------------------------
 
 
-def test_the_full_path_persists_every_step(repo: Repository, tmp_path: Path, endpoint):
-    url, handler = endpoint
-    chat = make_chat(repo, url)
-    message = make_message(repo and chat)
-    repo.save_message(message)
-    sender = FakeSender()
-
-    asyncio.run(build_pipeline(repo, sender).process(chat, message))
-
-    # The endpoint saw the message, shaped as documented.
-    assert len(handler.received) == 1
-    payload = handler.received[0]
-    assert payload["event"] == "message.received"
-    assert payload["chat"]["name"] == "Alice"
-    assert payload["message"]["text"] == "ping"
-    assert payload["message"]["sender"] == "Alice"
-
-    # The reply was sent to the right chat.
-    assert sender.sent == [("Alice", "pong")]
-
-    # And every step is on disk in both stores.
-    assert message.status == "replied"
-    assert chat.last_outgoing_text == "pong"
-    assert chat.webhook_retry_count == 0
-
-    messages = read_json(tmp_path, constants.JSON_MESSAGES)
-    assert {m["direction"] for m in messages} == {"in", "out"}
-    assert [m["status"] for m in messages if m["direction"] == "in"] == ["replied"]
-
-    webhooks = read_json(tmp_path, constants.JSON_WEBHOOKS)["calls"]
-    assert webhooks[0]["ok"] is True
-    assert webhooks[0]["reply_text"] == "pong"
-    assert webhooks[0]["status_code"] == 200
 
 
-def test_an_empty_reply_sends_nothing_and_is_not_an_error(repo: Repository, endpoint):
-    url, handler = endpoint
-    handler.reply = ""
-    chat = make_chat(repo, url)
-    message = make_message(chat)
-    repo.save_message(message)
-    sender = FakeSender()
 
-    asyncio.run(build_pipeline(repo, sender).process(chat, message))
-
-    assert sender.sent == []
-    assert message.status == "webhook_ok"
-    assert "no reply" in chat.last_webhook_status
-
-
-def test_a_failing_endpoint_is_recorded_not_swallowed(repo: Repository, endpoint):
-    url, handler = endpoint
-    handler.status = 503
-    chat = make_chat(repo, url)
-    message = make_message(chat)
-    repo.save_message(message)
-    sender = FakeSender()
-
-    asyncio.run(build_pipeline(repo, sender).process(chat, message))
-
-    assert sender.sent == []
-    assert message.status == "webhook_failed"
-    assert chat.last_error
-    # 503 is retryable, so the one configured retry was spent.
-    assert chat.webhook_retry_count == 1
-
-
-def test_an_unverified_send_is_a_failure_not_a_success(repo: Repository, endpoint):
-    url, _handler = endpoint
-    chat = make_chat(repo, url)
-    message = make_message(chat)
-    repo.save_message(message)
-    sender = FakeSender(ok=False)
-
-    asyncio.run(build_pipeline(repo, sender).process(chat, message))
-
-    assert message.status == "reply_failed"
-    assert "compose box" in chat.last_error
-    # Crucially, no outgoing message was recorded — we do not claim to have
-    # sent something we could not verify.
-    assert [m.direction for m in repo.messages_for(chat.chat_id)] == ["in"]
-
-
-def test_automation_on_but_no_webhook_stores_and_stops(repo: Repository):
-    chat = make_chat(repo, webhook="")
-    message = make_message(chat)
-    repo.save_message(message)
-    sender = FakeSender()
-
-    asyncio.run(build_pipeline(repo, sender).process(chat, message))
-
-    assert sender.sent == []
-    assert message.status == "ignored"
-    assert "no webhook" in chat.last_webhook_status
 
 
 # ---------------------------------------------------------------------------
@@ -317,3 +226,54 @@ def test_automation_off_stores_without_processing(repo: Repository):
 
     assert pending == []
     assert [m.status for m in repo.messages_for(chat.chat_id)] == ["ignored"]
+
+
+# ---------------------------------------------------------------------------
+# Inbound is collect-only
+# ---------------------------------------------------------------------------
+
+
+def test_receiving_a_message_never_sends_anything(repo: Repository):
+    """The architecture, as an assertion.
+
+    winSpark collects on the inbound side: WhatsApp -> reader -> wa_events, and
+    a separate monitoring application reads that. It used to POST each incoming
+    message to the chat's webhook and send whatever came back, which was never
+    part of the product and made an accidental reply loop possible. Removing it
+    makes the loop structurally impossible rather than merely guarded."""
+    chat = make_chat(repo, "https://x.test/hook")
+    message = make_message(chat, "hello there")
+    repo.save_message(message)
+    sender = FakeSender()
+    pipeline = build_pipeline(repo, sender)
+
+    asyncio.run(pipeline.process(chat, message))
+
+    assert sender.sent == [], "an incoming message must not send anything"
+    assert repo.messages_for(chat.chat_id)[0].text == "hello there"
+
+
+def test_the_raw_message_is_what_gets_kept(repo: Repository):
+    chat = make_chat(repo, "https://x.test/hook")
+    raw = "  spaced   text  éè  "
+    message = make_message(chat, raw)
+    repo.save_message(message)
+    pipeline = build_pipeline(repo, FakeSender())
+
+    asyncio.run(pipeline.process(chat, message))
+
+    assert repo.messages_for(chat.chat_id)[0].text == raw
+
+
+def test_a_chat_with_no_webhook_is_collected_just_the_same(repo: Repository):
+    """A webhook URL is irrelevant to collection now — it addresses the
+    OUTBOUND bridge, and inbound does not use it."""
+    chat = make_chat(repo, "")
+    message = make_message(chat, "still collected")
+    repo.save_message(message)
+    sender = FakeSender()
+
+    asyncio.run(build_pipeline(repo, sender).process(chat, message))
+
+    assert sender.sent == []
+    assert repo.messages_for(chat.chat_id)[0].text == "still collected"

@@ -196,6 +196,21 @@ class DeliveryService:
         seen = await self._verifier.confirm_many(chat.chat_name, expected, before)
         elapsed_ms = int((time.monotonic() - started) * 1000)
 
+        # Enough to tell a LOST message from an UNSEEN one without guessing.
+        # A real run produced two identical sends, both reporting transport
+        # success, and one bubble. These three numbers separate the cases:
+        # before == after means nothing landed at all; after == before + 1 with
+        # two sent means WhatsApp accepted one and dropped the other; a later
+        # manual read disagreeing with `after` means the READER missed it.
+        for key, need in expected.items():
+            self._repo.log(
+                "INFO", "outgoing.census", chat_id=chat.chat_id,
+                chat_name=chat.chat_name, direction="out",
+                message=(f"census {key[:40]!r}: before={before.get(key, 0)} "
+                         f"expected={need} after={seen.get(key, 0)} "
+                         f"sent_this_batch={sum(1 for m in sent if normalise(m.text) == key)}"),
+            )
+
         # Attribute the result per message. For repeated identical text the
         # nth copy needs the count to have reached baseline + n, so a batch that
         # delivered two of three "OK"s marks exactly one as unverified.
