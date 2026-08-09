@@ -679,3 +679,50 @@ complete pipeline has never been observed working end to end against a real
 message. Everything upstream and downstream is verified separately.
 
 Tests: 410.
+
+
+---
+
+## 16. Inbound collector proven end to end (2026-08-09)
+
+The chain the audit set out to establish, observed rather than inferred, with
+each link measured from its own evidence source:
+
+```
+2 UIA bubbles  ->  2 reader messages  ->  2 unique keys  ->  2 MongoDB records
+                                                        ->  second poll adds 0
+```
+
+Measured on `WINSPARK_TWOSEND_DIAG`, which had no pre-existing rows and is
+therefore the uncontaminated case. Both invariants hold:
+
+| Invariant | Result |
+|---|---|
+| distinct bubbles reading alike -> distinct records | **PASS** |
+| same physical bubble re-read -> no new record | **PASS** |
+
+### What was wrong, and where
+
+The loss was at two independent points, either of which alone would have caused
+it:
+
+1. **The reader** returned four of seven bubbles. `_read_labeled_messages`
+   iterates sender *labels*, and WhatsApp draws one per run of consecutive
+   messages from the same person. The selection rule only consulted the
+   bubble parser when the labelled one found no incoming message — never true
+   in an active conversation.
+2. **The storage key** hashed content only, so two identical messages in the
+   same minute collapsed at `has_message()`.
+
+### Known migration concern
+
+Message keys changed format. Expect at most one extra row per repeated message
+still in the visible tail, once. See
+[MIGRATION.md](MIGRATION.md#message-keys-change-format--plan-for-one-duplicate-per-repeated-message).
+Not reconciled during validation, deliberately: altering stored data mid-audit
+destroys the evidence.
+
+### Outstanding
+
+Outbound verification only — the two-send diagnostic. The collector is no longer
+entangled with it.

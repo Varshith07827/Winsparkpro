@@ -142,3 +142,67 @@ Moving over by hand takes a few minutes:
 winSpark's data is untouched, so both can be run side by side while you switch.
 Not at the same moment, though: two processes driving one WhatsApp window will
 fight over the foreground.
+
+
+---
+
+# Upgrading an existing installation
+
+## Message keys change format — plan for one duplicate per repeated message
+
+**Applies to:** any database written before the occurrence-aware message key.
+**Impact:** low, one-time, and only for messages whose text repeats.
+**Action required:** none for correctness. Read this before deciding whether to
+reconcile.
+
+### What changed
+
+A message's identity used to be a hash of chat + sender + text + timestamp +
+direction. Two identical messages in the same minute therefore produced the
+**same** key, and the second was silently dropped at storage — it never reached
+`wa_events` at all. That was a data-loss defect and it is fixed: the key now
+carries an `occurrence` index, the position among identical bubbles in one
+read, so a genuine repeat is its own record.
+
+Two things follow, and only the second needs thought.
+
+**Old rows keep their old keys.** They are correct rows; nothing is wrong with
+them. But a row written under the old formula will not collide with the key the
+new formula computes for the same bubble, so that bubble can be stored **once
+more** the next time it is read.
+
+**A second, smaller cause.** The key hash briefly joined its parts with a stray
+`` control character, introduced by an editing mistake and fixed in the same
+change. Rows written during that window carry keys from a third formula. Same
+consequence, same size.
+
+### What you will actually see
+
+At most **one extra row per repeated message that is still on screen**. Messages
+that have scrolled out of the read window are never re-read and are unaffected,
+so this does not touch history in bulk.
+
+Measured on the development machine: a conversation with two identical
+`WINSPARK_DUPLICATE_TEST` bubbles held four rows afterwards — one legitimate
+outgoing record from the send, two correct read-back records, and one orphan
+from the old formula. A conversation with no pre-existing rows
+(`WINSPARK_TWOSEND_DIAG`) produced exactly two records and a second poll added
+none, which is the behaviour to expect from here on.
+
+### Options
+
+1. **Do nothing.** The duplicate is bounded, one-off, and only affects repeated
+   text still in the visible tail. Everything written from now on is correct.
+2. **Reconcile before going live.** If the monitoring application counts
+   messages and an extra row would mislead it, deduplicate
+   `wa_events.messages` on `(chat_id, sender, text, time_text, direction)`
+   keeping the **newest** row per group, once, before the collector runs
+   against production traffic.
+
+Option 2 was deliberately **not** performed during validation: changing stored
+data mid-audit destroys the evidence the audit exists to produce.
+
+### What is NOT affected
+
+Outgoing queue records (`outgoing_id` is a uuid4 and never derived from
+content), chat records, webhook records, and the JSON mirror's structure.
