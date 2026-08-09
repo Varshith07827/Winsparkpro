@@ -26,7 +26,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
-from wadam.domain.models import ChatConfig, contact_id_for
+from wadam.domain.models import ChatConfig, contact_id_for, phone_digits
 
 
 @dataclass(frozen=True)
@@ -44,6 +44,15 @@ class Resolution:
         return self.chat is None and len(self.candidates) > 1
 
 
+def _last4(chat: ChatConfig) -> str:
+    """A chat's last four digits, from its stored number if it has one and from
+    its name otherwise.
+
+    The stored number comes first because it is the one somebody typed in
+    deliberately; the name is only a number at all for an unsaved contact."""
+    return contact_id_for(chat.phone_number) or contact_id_for(chat.chat_name)
+
+
 def resolve_chat(chats: Iterable[ChatConfig], identifier: str) -> Resolution:
     wanted = (identifier or "").strip()
     if not wanted:
@@ -51,10 +60,16 @@ def resolve_chat(chats: Iterable[ChatConfig], identifier: str) -> Resolution:
     lowered = wanted.casefold()
     all_chats = list(chats)
 
+    digits = phone_digits(wanted)
+
     tiers = (
         ("external_id", lambda c: (c.external_id or "").strip().casefold() == lowered),
-        ("contact_last4", lambda c: bool(contact_id_for(c.chat_name))
-                                    and contact_id_for(c.chat_name) == wanted),
+        # A full number is the most specific thing anyone can send, so it ranks
+        # above every abbreviation. Compared as digits on both sides:
+        # "+91 94231 55555" and "919423155555" are the same contact, and a
+        # caller should not have to know which spelling this application stores.
+        ("phone_number", lambda c: bool(digits) and phone_digits(c.phone_number) == digits),
+        ("contact_last4", lambda c: bool(_last4(c)) and _last4(c) == wanted),
         ("chat_id", lambda c: c.chat_id == wanted),
         ("chat_name", lambda c: c.chat_name.strip().casefold() == lowered),
     )
@@ -72,6 +87,7 @@ def resolve_chat(chats: Iterable[ChatConfig], identifier: str) -> Resolution:
 
 
 def suggest_external_id(chat: ChatConfig) -> str:
-    """What this chat's contact ID should default to — its number's last four
-    digits, or "" when the name gives us nothing to work with."""
-    return contact_id_for(chat.chat_name)
+    """What this chat's contact ID should default to — the last four digits of
+    its number, or "" when neither the stored number nor the name gives us
+    anything to work with."""
+    return _last4(chat)

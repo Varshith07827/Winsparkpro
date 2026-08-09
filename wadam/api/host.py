@@ -98,9 +98,9 @@ class SendApiHost:
         if not resolution.ok:
             return SendResponse(404, {
                 "ok": False, "code": "chat_not_found",
-                "error": f"No chat matches '{identifier}'. The contact ID is the last four "
-                         f"digits of the number; for a saved contact, set it in the "
-                         f"configuration panel.",
+                "error": f"No chat matches '{identifier}'. Use the chat's name as "
+                         f"shown in WhatsApp, its phone number, or the last four "
+                         f"digits of that number.",
             })
 
         chat = resolution.chat

@@ -54,3 +54,73 @@ def test_row_with_no_anchor_is_all_name():
 def test_own_message_preview_is_not_a_group_hint():
     parsed = parse_chat_row("Alice 09:15 am You: on my way")
     assert parsed["looks_like_group"] is False
+
+
+# ---------------------------------------------------------------------------
+# Sender name / role badge inside a bubble
+# ---------------------------------------------------------------------------
+
+
+class _FakePart:
+    """The shape `_iter_message_parts` yields for a plain text control."""
+
+    def __init__(self, name: str) -> None:
+        self.Name = name
+
+
+class _FakeChild:
+    def __init__(self, name: str) -> None:
+        self.Name = name
+        self.ControlTypeName = "TextControl"
+
+    def GetChildren(self):
+        return []
+
+
+class _FakeRow:
+    def __init__(self, names) -> None:
+        self._children = [_FakeChild(n) for n in names]
+
+    def GetChildren(self):
+        return list(self._children)
+
+
+class _FakeLabel:
+    def __init__(self, row) -> None:
+        self._row = row
+
+    def GetParentControl(self):
+        return self._row
+
+
+def _bubble(names, sender_label="You:"):
+    from wadam.whatsapp.reader import _extract_bubble_text
+
+    return _extract_bubble_text(_FakeLabel(_FakeRow(names)), sender_label)
+
+
+def test_a_role_badge_is_not_part_of_the_message():
+    """Measured live in a Community chat: a delivered message read back as
+    "You Community admin Resolver check by name", so the census never matched
+    it and every send to that chat was marked UNVERIFIED despite arriving."""
+    assert _bubble(["You", "Community admin", "Resolver check by name"]) == \
+        "Resolver check by name"
+
+
+def test_a_bare_sender_name_is_dropped_too():
+    assert _bubble(["You", "Hello there"]) == "Hello there"
+
+
+def test_an_ordinary_bubble_is_untouched():
+    assert _bubble(["Hello there"]) == "Hello there"
+
+
+def test_a_message_that_is_only_a_badge_word_survives():
+    """Stripping is from the FRONT and never takes the last part, so a message
+    whose entire text is "Admin" is still readable."""
+    assert _bubble(["Admin"]) == "Admin"
+    assert _bubble(["You", "Admin"]) == "Admin"
+
+
+def test_the_group_senders_own_name_is_dropped():
+    assert _bubble(["Manohar", "Sure sir"], sender_label="Manohar:") == "Sure sir"

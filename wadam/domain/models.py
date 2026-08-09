@@ -156,7 +156,7 @@ class ChatConfig:
     # the last four digits of the contact's number, auto-filled at discovery
     # when the chat name is itself a number. For a saved contact the sidebar
     # only ever shows the name, so there is nothing to derive and this is typed
-    # in once from the configuration panel.
+    # in once from the chat details panel.
     external_id: str = ""
 
     # --- sidebar mirror (what the chat list renders) -----------------------

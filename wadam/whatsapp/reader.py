@@ -563,7 +563,7 @@ def _read_labeled_messages(root) -> list[WhatsAppMessage]:
     seen: set[tuple[int, str]] = set()
     for label, sender_label in labels:
         sender_label = sender_label.strip()
-        base_text = _extract_bubble_text(label)
+        base_text = _extract_bubble_text(label, sender_label)
         # Media and the timestamp live on the whole bubble row (the label's
         # parent), not on the sender-label group.
         try:
@@ -856,7 +856,10 @@ def _bubble_item_content(item):
         except Exception:  # noqa: BLE001
             pass
 
-    text = " ".join(parts).strip()
+    # The same preamble strip the label-based parser does. A Community bubble
+    # carries "You" and "Community admin" as their own TextControls, and
+    # leaving them in made a delivered message unverifiable.
+    text = " ".join(_strip_sender_preamble(parts, _bubble_item_sender(item))).strip()
     if text.startswith(_SYSTEM_NOTICE_PREFIXES):
         return None
     display, media_kind, media_note, time_text = _enrich_media(item, text)
@@ -871,10 +874,34 @@ def _bubble_item_content(item):
             _bubble_item_is_ours(item), media_kind, media_note, time_text)
 
 
-def _extract_bubble_text(sender_label_control) -> str:
+#: Role badges WhatsApp paints beside a sender's name inside a bubble. They are
+#: separate TextControls, they do not end in ":", and they are NOT part of the
+#: message. Left in, they made a delivered message read back as
+#: "You Community admin Hello" and fail verification forever — the send had
+#: worked, so it was never retried, and the chat sat in "needs review".
+_SENDER_BADGES = {
+    "community admin", "group admin", "admin", "business account",
+    "you", "~",
+}
+
+
+def _strip_sender_preamble(parts: list, sender_name: str = "") -> list:
+    """Drop a leading name/badge preamble from a bubble's text fragments.
+
+    Only from the FRONT, only exact matches, and never the last fragment, so a
+    message whose own text is "Admin" survives."""
+    skippable = set(_SENDER_BADGES)
+    if sender_name:
+        skippable.add(sender_name.strip().rstrip(":").casefold())
+    while len(parts) > 1 and parts[0].strip().casefold() in skippable:
+        parts.pop(0)
+    return parts
+
+
+def _extract_bubble_text(sender_label_control, sender_name: str = "") -> str:
     """Join the message TextControls alongside a sender label in its parent row,
-    skipping the label itself, the timestamp, the "Read" marker and any
-    quoted-reply preview."""
+    skipping the label itself, the sender's name and role badge, the timestamp,
+    the "Read" marker and any quoted-reply preview."""
     try:
         row = sender_label_control.GetParentControl()
     except Exception:  # noqa: BLE001
@@ -897,4 +924,4 @@ def _extract_bubble_text(sender_label_control) -> str:
             if not value or value in _MARKER_TEXTS or _MESSAGE_TIME_RE.match(value):
                 continue
             parts.append(value)
-    return " ".join(parts).strip()
+    return " ".join(_strip_sender_preamble(parts, sender_name)).strip()
