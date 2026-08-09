@@ -93,17 +93,36 @@ def contact_id_for(value: str) -> str:
     return digits[-4:] if digits else ""
 
 
-def message_key_for(chat_id: str, sender: str, text: str, time_text: str, direction: str) -> str:
+def message_key_for(chat_id: str, sender: str, text: str, time_text: str,
+                    direction: str, occurrence: int = 0) -> str:
     """The deduplication key for a message bubble.
 
     Every poll re-reads the same visible tail of the conversation, so identity
     has to come from content: which chat, who sent it, what it said, the
-    bubble's own clock label, and which way it went. Two genuinely identical
-    messages sent in the same minute collapse into one — accepted deliberately,
-    because the alternative (treating a re-read of the same bubble as new)
-    would webhook and reply to the same message on every three-second cycle.
+    bubble's own clock label, and which way it went.
+
+    `occurrence` is what makes two IDENTICAL messages two messages. It is the
+    index of this bubble among the identical ones in the same read — the first
+    "OK" is 0, the second is 1 — so:
+
+        the same physical bubble, re-read every 3 seconds  -> the same key
+        two distinct bubbles that happen to read alike     -> different keys
+
+    Both halves matter. Without the index, a genuine repeat is silently dropped
+    at storage and never reaches `wa_events`; measured live, two "OK"s sent
+    seconds apart produced one database record. Without the content hash, every
+    poll would store the visible tail again and answer it again.
+
+    Deliberately NOT a UIA RuntimeId. Those are unique per element now but are
+    re-issued when the tree is virtualised, so a scrolled conversation would
+    hand back new ids for the same bubbles and store them all a second time.
+
+    The remaining gap: if an older identical bubble scrolls out of the read
+    window the survivor's index shifts, which can store one extra copy. Bounded
+    and visible, unlike the loss it replaces.
     """
-    raw = "".join((chat_id, sender or "", text or "", time_text or "", direction))
+    raw = "".join((chat_id, sender or "", text or "", time_text or "", direction,
+                   f"#{occurrence}" if occurrence else ""))
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 

@@ -524,11 +524,24 @@ def read_recent_messages_sync(window_handle: int, limit: int = 25) -> list[Whats
     if root is None:
         return []
 
-    messages = _read_labeled_messages(root)
-    if not messages or not any(m.is_incoming for m in messages):
-        bubbles = _read_bubble_messages(root)
-        if len(bubbles) > len(messages):
-            messages = bubbles
+    labeled = _read_labeled_messages(root)
+    bubbles = _read_bubble_messages(root)
+
+    # Whichever SEES MORE wins, and the labelled reader loses often.
+    #
+    # It iterates sender LABELS, and WhatsApp draws one label per *run* of
+    # consecutive messages from the same person — so a run of three collapses
+    # into one message and the other two are never seen. Measured live: seven
+    # real bubbles on screen, the labelled reader returned four, the bubble
+    # reader returned all seven. Two identical messages sent seconds apart both
+    # existed in WhatsApp with delivery ticks and only one reached the
+    # database.
+    #
+    # The old rule consulted the bubble reader only when the labelled one found
+    # no INCOMING message, which is never true in an active conversation, so
+    # the loss was permanent and silent. Losing a message is the one thing a
+    # collector must not do.
+    messages = bubbles if len(bubbles) > len(labeled) else labeled
     # Drop WhatsApp's own notices at the one point BOTH shapes pass through, so
     # nothing downstream ever stores or answers them.
     messages = [m for m in messages if not is_system_notice(m.text)]
@@ -641,6 +654,14 @@ def _read_bubble_messages(root) -> list[WhatsAppMessage]:
     messages: list[WhatsAppMessage] = []
     carried_sender = ""
     for _top, text, center_x, sender_hint, is_ours, media_kind, media_note, time_text in rows:
+        if not time_text:
+            # Every real message bubble carries its own clock label. The things
+            # that do not are WhatsApp's cards — the contact-intro panel for an
+            # unsaved number, for instance. Logged rather than dropped quietly,
+            # because a real message losing its timestamp must not become a
+            # message losing itself.
+            logger.debug("bubble without a timestamp, not a message: %r", text[:60])
+            continue
         if is_ours is True:  # a definitive "You:" label beats the alignment guess
             is_incoming = False
         else:

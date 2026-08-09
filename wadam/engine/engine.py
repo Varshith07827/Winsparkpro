@@ -699,10 +699,20 @@ class AutomationEngine:
         pending: list[StoredMessage] = []
         changed = False
 
+        # How many identical bubbles have already been seen in THIS read, so
+        # the second "OK" gets its own identity instead of colliding with the
+        # first. Counted over the read rather than over the database: the same
+        # two bubbles produce the same two indexes on every poll, which is what
+        # keeps a re-read from storing them again.
+        occurrences: dict = {}
+
         for message in messages:
             direction = "in" if message.is_incoming else "out"
+            signature = (message.sender, message.text, message.time_text, direction)
+            occurrence = occurrences.get(signature, 0)
+            occurrences[signature] = occurrence + 1
             key = message_key_for(chat.chat_id, message.sender, message.text,
-                                  message.time_text, direction)
+                                  message.time_text, direction, occurrence)
             if self._repo.has_message(key):
                 continue
             if self._repo.recently_originated(chat.chat_id, message.text):
