@@ -103,6 +103,34 @@ verification everything else in this application does.
 | 401 | `unauthorized` | missing or wrong token (only when one is configured) |
 | 404 | `chat_not_found` | no chat answers to that `id` |
 | **409** | **`ambiguous_id`** | **two or more chats answer to it — nothing was sent** |
+
+### Four digits collide, and that is by design
+
+`id` defaults to the **last four digits** of a contact's number. Four digits is
+10,000 values, so with enough chats two will eventually share one — the
+identifier is convenient, not unique.
+
+When that happens the API returns **409 and sends nothing**. It does not pick
+one. Sending to the wrong person is the single failure this refuses to produce
+quietly, and there is no ordering rule that would make a guess defensible.
+
+The response names the colliding chats and the identifiers that are
+unambiguous:
+
+```json
+{
+  "ok": false,
+  "code": "ambiguous_id",
+  "candidates": ["+91 81069 72933", "+44 7700 902933"],
+  "resolves_by": ["external_id", "phone_number", "chat_id", "chat_name"]
+}
+```
+
+Address such a chat by its **full phone number** or its **exact chat name**;
+both are accepted by `id` and neither collides.
+
+A caller that must use four-digit ids should treat 409 as "use a longer
+identifier", not as a transient error to retry.
 | 413 | `too_large` | body over 256 KB |
 | 500 | `internal` | a bug here; the error text says what |
 | 502 | `send_failed` | WhatsApp did not deliver it. Retry this one |

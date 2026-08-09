@@ -174,3 +174,34 @@ def test_the_identifiers_survive_a_restart(repo, tmp_path: Path):
         assert resolve_chat(restarted.list_chats(), "2933").ok
     finally:
         restarted.stop()
+
+
+def test_the_ambiguity_response_tells_the_caller_what_to_use_instead(tmp_path: Path):
+    """A 409 that said "set a distinct contact ID" pointed at a configuration
+    field the simplified product no longer has. The advice has to be something
+    the caller can actually act on, so it names the identifiers that do not
+    collide."""
+    from tests.test_send_api import FakeEngine
+    from wadam.api.host import SendApiHost
+
+    settings = Settings(mongodb_uri="mongodb://localhost:27017",
+                        json_backup_folder=tmp_path, json_autosave_interval=0)
+    backup = JsonBackupStore(tmp_path, autosave_interval=0)
+    backup.ensure_folder()
+    repository = Repository(settings, FakeMongo(), backup)
+    repository.start()
+    try:
+        repository.save_chat(_chat("+91 81069 72933", "918106972933", "2933"))
+        repository.save_chat(_chat("+44 7700 902933", "447700902933", "2933"))
+        host = SendApiHost(settings, repository, FakeEngine())
+
+        response = host._send("2933", "must not be sent")
+
+        assert response.status == 409
+        assert response.payload["code"] == "ambiguous_id"
+        assert len(response.payload["candidates"]) == 2
+        assert "phone_number" in response.payload["resolves_by"]
+        assert "full phone number" in response.payload["error"]
+        assert "LAST FOUR DIGITS" in response.payload["error"]
+    finally:
+        repository.stop()

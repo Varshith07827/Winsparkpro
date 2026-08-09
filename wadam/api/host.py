@@ -90,9 +90,18 @@ class SendApiHost:
             )
             return SendResponse(409, {
                 "ok": False, "code": "ambiguous_id",
-                "error": f"'{identifier}' matches {len(resolution.candidates)} chats. "
-                         f"Set a distinct contact ID on one of them.",
+                # The advice has to be something the caller can actually do.
+                # It used to say "set a distinct contact ID", which pointed at a
+                # configuration field the simplified UI no longer has. The two
+                # unambiguous identifiers the resolver accepts are the full
+                # number and the exact chat name.
+                "error": f"'{identifier}' matches {len(resolution.candidates)} chats "
+                         f"and nothing was sent. A four-digit id is the LAST FOUR "
+                         f"DIGITS of a number, so contacts can share one. Address "
+                         f"this chat by its full phone number or its exact name "
+                         f"instead.",
                 "candidates": list(resolution.candidates),
+                "resolves_by": ["external_id", "phone_number", "chat_id", "chat_name"],
             })
 
         if not resolution.ok:
