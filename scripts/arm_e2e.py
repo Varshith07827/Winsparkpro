@@ -22,6 +22,9 @@ from __future__ import annotations
 
 import socket
 import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from wadam.config import load_settings
 from wadam.domain.models import phone_digits
