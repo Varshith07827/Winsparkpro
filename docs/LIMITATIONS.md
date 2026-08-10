@@ -5,72 +5,55 @@ obvious, and finding them out during an incident is expensive.
 
 ---
 
-## A saved contact's phone number cannot be discovered
+## Phone numbers, and a limitation that turned out not to be one
 
-**This is the single most consequential limitation in the product**, because the
-webhook URL is built from the phone number.
+### Corrected 2026-08-09
 
-### What works
+An earlier version of this document stated that a saved contact's phone number
+was "not reachable through UI Automation anywhere", citing four probes. **That
+was wrong, and the probes were faulty.** The number is readable. It is recorded
+here rather than quietly deleted, because how the mistake was made is more
+useful than the conclusion it produced.
 
-A contact who is **not** in the address book appears in WhatsApp's sidebar with
-their number as the chat name. Discovery reads it, normalises it and persists
-it, with no configuration and nothing to type:
+WhatsApp's accessibility tree materialises in stages, and every probe caught it
+before it was ready:
 
-```
-chat name     '+91 81069 72933'
-phone_number  918106972933
-webhook       https://noteify.org/ntext/whook/?918106972933
-```
+| Probe | Distinct names | What it actually saw |
+|---|---:|---|
+| The original "limitation" scan | 37 | almost entirely browser chrome |
+| Scan without foregrounding the window | 38 | `Chrome Legacy Window`, `Save card`, `Tab bar` |
+| Scan with the window foregrounded | 55 | sidebar and header, no message bubbles |
+| After invoking `Profile details` | 67 | the panel's header only |
+| **After a further 2-second settle** | **159** | **the number** |
 
-### What does not
+Two compounding mistakes: scanning without bringing the window to the
+foreground, and scanning immediately rather than letting the WebView2 content
+render. The claim that "the entire window offers eight clickable elements and
+none is a contact affordance" was measured against an almost-empty tree.
+`Profile details` and the conversation title are both real, invokable buttons.
 
-A **saved** contact shows only their name. Their number is not reachable
-through UI Automation anywhere. Established by four read-only probes against
-WhatsApp Beta `2.2630.102.0`:
+The general lesson is the one this whole audit kept relearning: **an instrument
+has to be validated before its output becomes a finding.** A scan that returns
+nothing is not evidence of absence until you have shown the scan can see
+anything at all.
 
-| Probe | Result |
-|---|---|
-| Deep tree scan with the chat open, 18 levels | 37 distinct accessible names, **0 phone-shaped strings** |
-| Element carrying the conversation title | **None.** The title is not an accessible element; the app derives the name from the compose box placeholder, `"Type a message to <name>"` |
-| `"Open chat details for …"` button | Present on **group** bubbles only, to identify a sender. Absent in a 1:1 chat |
-| Every `ButtonControl` with a real rectangle in the whole window | **Eight**: `Close`, `Minimize`, `Restore`, `New Tab` ×2, `Close tab` ×2, `Resize the chat list panel` |
+### How a number is obtained
 
-That last row is the finding. The entire window exposes eight clickable
-elements with geometry, and not one of them is a contact header, profile or
-info affordance. There is nothing to invoke, and nothing to read.
+Two sources, in order:
 
-### What the application does instead
+1. **The chat name**, when the contact is not in the address book. WhatsApp
+   shows the number as the chat title and discovery persists it with no
+   interaction at all.
+2. **The contact-info panel**, for a saved contact. `Profile details` is
+   invoked through `InvokePattern` — no coordinates, no mouse — the panel is
+   given time to render, the number is read from it, and the panel is closed.
 
-A chat with no resolvable number is addressed by **name**, URL-encoded:
+Source 2 is an **interaction**, so it obeys the same rule as switching chats:
+it never runs from the passive three-second poll, and it runs once. Once a
+number is stored it is never probed for again.
 
-```
-https://noteify.org/ntext/whook/?Novus%20Tech%20Group
-```
-
-The alternative — refusing to build a URL — meant a saved contact could never
-forward anything at all, which was the behaviour before this fallback existed.
-A number always wins when one is known, and the name is replaced the moment it
-becomes available.
-
-### What was deliberately NOT done
-
-Clicking a hardcoded pixel offset where the contact header is believed to be.
-It would work today and break on any layout change, and it is the same class of
-assumption as the alignment threshold that once made every outgoing message
-read back as incoming. A guess that happens to be right is still a guess.
-
-### If number-based addressing is required
-
-Four options, in the order they preserve the current architecture:
-
-1. **Accept name-based URLs for saved contacts.** What ships today.
-2. **Require unsaved-number chats** for automated conversations. Reliable, and
-   restricts who can be automated.
-3. **Find a non-UIA source** — WhatsApp's own local storage, or an export.
-   Unexplored, and outside the accessibility layer this application is built on.
-4. **The WhatsApp Business Platform.** Phone numbers are first-class there, and
-   it removes the desktop dependency entirely. See
-   [SENDING.md](SENDING.md), Option D.
+A number is still never invented. A chat with no resolvable number is addressed
+by name, and says so.
 
 ---
 

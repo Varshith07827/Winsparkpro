@@ -64,6 +64,9 @@ from typing import Optional
 from wadam.whatsapp.name_rules import chat_names_match, is_system_or_list_view_title
 from wadam.whatsapp.reader import (
     RECENTS_GRID,
+    _safe_children,
+    _safe_control_type,
+    _safe_name,
     SEARCH_RESULTS_GRID,
     ChatRow,
     WhatsAppReader,
@@ -948,6 +951,145 @@ def _click_item(item) -> bool:
                 logger.debug("could not restore the cursor position", exc_info=True)
 
 
+#: WhatsApp's affordance for the contact-info panel, in the conversation
+#: header. A real ButtonControl with InvokePattern — no coordinates needed.
+PROFILE_DETAILS_BUTTON = "Profile details"
+
+#: How long the panel is given to render. The tree materialises in stages and
+#: the number is among the last things to appear: measured, the window went
+#: 55 names -> 67 (panel header) -> 159 (the number) with the last step taking
+#: about two seconds. Polled rather than slept, so a fast machine does not wait.
+PROFILE_PANEL_TIMEOUT = 6.0
+PROFILE_PANEL_POLL = 0.4
+
+_PHONE_TEXT_RE = re.compile(r"\+?\d[\d\s\-().]{7,}\d")
+
+
+def _find_profile_button(window_handle: int):
+    root = auto.ControlFromHandle(window_handle)
+    if root is None:
+        return None
+
+    def walk(ctrl, depth=0):
+        if depth > 22:
+            return None
+        for child in _safe_children(ctrl):
+            if (_safe_control_type(child) == "ButtonControl"
+                    and _safe_name(child).strip() == PROFILE_DETAILS_BUTTON):
+                return child
+            found = walk(child, depth + 1)
+            if found is not None:
+                return found
+        return None
+
+    return walk(root)
+
+
+def _scan_for_phone(window_handle: int) -> str:
+    """Any phone-shaped accessible name currently in the window."""
+    root = auto.ControlFromHandle(window_handle)
+    if root is None:
+        return ""
+    seen: set = set()
+
+    def walk(ctrl, depth=0) -> str:
+        if depth > 30:
+            return ""
+        for child in _safe_children(ctrl):
+            name = _safe_name(child).strip()
+            if name and name not in seen:
+                seen.add(name)
+                if _PHONE_TEXT_RE.fullmatch(name):
+                    return name
+            found = walk(child, depth + 1)
+            if found:
+                return found
+        return ""
+
+    return walk(root)
+
+
+CONTACT_PANEL_TITLE = "Contact info"
+
+
+def _contact_panel_open(window_handle: int) -> bool:
+    """Is the contact-info panel already showing?
+
+    Needed because `Profile details` TOGGLES. Without this the probe closed a
+    panel the user had open, and an unconditional Escape "to normalise first"
+    was worse still — with no panel open, Escape closes the CONVERSATION, and
+    the next step then found no chat and no button at all. Measured, both."""
+    root = auto.ControlFromHandle(window_handle)
+    if root is None:
+        return False
+
+    def walk(ctrl, depth=0) -> bool:
+        if depth > 24:
+            return False
+        for child in _safe_children(ctrl):
+            if _safe_name(child).strip() == CONTACT_PANEL_TITLE:
+                return True
+            if walk(child, depth + 1):
+                return True
+        return False
+
+    return walk(root)
+
+
+def read_contact_number_sync(window_handle: int) -> str:
+    """The open chat's phone number, from the contact-info panel, or "".
+
+    An INTERACTION: it opens a panel. It must never run from the passive poll,
+    and it runs once per chat — a stored number is never probed for again.
+
+    Opened through `InvokePattern` on the header's own button, so there are no
+    coordinates and no mouse. The panel is then POLLED rather than slept on,
+    because the accessibility tree materialises in stages and the number is
+    among the last things to appear; scanning too early is exactly the mistake
+    that produced a documented "limitation" which did not exist.
+
+    The panel is closed again with Escape, so the user's view is left as it was
+    found."""
+    _require_uia()
+    button = _find_profile_button(window_handle)
+    if button is None:
+        logger.debug("no %r button — cannot read the contact number",
+                     PROFILE_DETAILS_BUTTON)
+        return ""
+
+    # The button TOGGLES, so open it only if it is not already open — and put
+    # back exactly what was found. Closing a panel the user was reading, or
+    # closing their conversation, are both worse than not reading a number.
+    opened_here = False
+    if not _contact_panel_open(window_handle):
+        try:
+            pattern = button.GetPattern(auto.PatternId.InvokePattern)
+            if pattern is None:
+                return ""
+            pattern.Invoke()
+            opened_here = True
+        except Exception:  # noqa: BLE001
+            logger.debug("could not open the contact-info panel", exc_info=True)
+            return ""
+
+    # Polled, not slept: the tree materialises in stages and the number is
+    # among the last things to appear.
+    found = ""
+    deadline = time.monotonic() + PROFILE_PANEL_TIMEOUT
+    while time.monotonic() < deadline:
+        found = _scan_for_phone(window_handle)
+        if found:
+            break
+        time.sleep(PROFILE_PANEL_POLL)
+
+    if opened_here:
+        try:
+            auto.SendKeys("{Esc}", waitTime=0.1)
+        except Exception:  # noqa: BLE001
+            logger.debug("could not close the contact-info panel", exc_info=True)
+    return found
+
+
 def chat_already_open(window_handle: int, target: str) -> bool:
     """Is `target` ALREADY the open conversation? A cheap accessibility read
     with no foreground change, so an open/send can short-circuit instead of
@@ -1142,6 +1284,35 @@ class WhatsAppSender:
 
         await self._sta.invoke_async(lambda: clear_search_sync(window_handle))
         return window_handle, None
+
+    async def resolve_phone_number_async(self, chat_name: str) -> str:
+        """Open a chat's contact-info panel and read its number. "" if none.
+
+        Holds the action lock for the whole sequence, exactly like a send: it
+        opens a chat and a panel, and doing that while a message is being typed
+        is how text lands in the wrong conversation. Restores the foreground
+        afterwards so the desktop is handed back."""
+        window_handle, row = await self.resolve_chat_row_async(chat_name)
+        if window_handle is None or row is None:
+            return ""
+        async with self._sta.action_lock:
+            previous = await self._sta.invoke_async(previous_foreground)
+            try:
+                if not await self._sta.invoke_async(
+                        lambda: ensure_foreground(window_handle)):
+                    return ""
+                opened = await self._sta.invoke_async(
+                    lambda: open_chat_sync(window_handle, row.raw_text, chat_name))
+                if not opened:
+                    return ""
+                await asyncio.sleep(0.4)
+                return await self._sta.invoke_async(
+                    lambda: read_contact_number_sync(window_handle))
+            finally:
+                restored = await self._sta.invoke_async(
+                    lambda: restore_foreground(previous))
+                if self._metrics:
+                    self._metrics.record_focus_restore(restored)
 
     async def open_and_read_async(self, chat_name: str, limit: int = 25):
         """Open a chat and read its recent messages. Holds the action lock for

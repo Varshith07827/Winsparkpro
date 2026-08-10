@@ -783,7 +783,7 @@ operation, for the reasons below.
 
 | Limitation | Impact | Documented |
 |---|---|---|
-| **A saved contact's phone number cannot be discovered.** WhatsApp exposes it nowhere reachable — the whole window offers eight clickable elements and none is a contact affordance | Such a chat has no `external_id` and cannot be addressed by number through `/wam/`; it is addressed by name | [LIMITATIONS.md](LIMITATIONS.md) |
+| ~~A saved contact's phone number cannot be discovered~~ — **withdrawn, the finding was wrong** | The number IS readable from the contact-info panel; the original probes scanned an unrendered tree. See the correction | [LIMITATIONS.md](LIMITATIONS.md) |
 | **Stale message keys from before the occurrence-aware format** | At most one extra row per repeated message still in the visible tail, once | [MIGRATION.md](MIGRATION.md) |
 | **Sending requires an interactive desktop** | Over a disconnected RDP session or a locked workstation, messages queue and wait; reading continues | [LIMITATIONS.md](LIMITATIONS.md) |
 | **`external_id` is four digits and can collide** | An ambiguous id is refused with `409`, never guessed; use the full number or exact name | [SEND_API.md](SEND_API.md) |

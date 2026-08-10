@@ -48,6 +48,7 @@ from wadam.domain.models import (
     OutgoingStatus,
     PollState,
     StoredMessage,
+    contact_id_for,
     message_key_for,
     outgoing_key_for,
     phone_digits,
@@ -525,6 +526,14 @@ class AutomationEngine:
         """Open a chat, read it, persist what's new, and run anything that
         needs running. This is the only path that switches the user's open
         conversation."""
+        # A chat with no number, the one time it is opened anyway. The panel
+        # costs a couple of seconds, so it is read here — on the path that was
+        # already going to switch conversations — and never again once a number
+        # is stored. Deliberately not in the 3-second poll, which stays passive.
+        if not chat.phone_number:
+            await self.discover_phone_number(chat.chat_id)
+            chat = self._repo.get_chat(chat.chat_id) or chat
+
         read_started = time.monotonic()
         _hwnd, messages = await self._sender.open_and_read_async(
             chat.chat_name, constants.MESSAGE_READ_LIMIT
@@ -822,6 +831,36 @@ class AutomationEngine:
             return future
         return asyncio.run_coroutine_threadsafe(coroutine_factory(), self._loop)
 
+    async def discover_phone_number(self, chat_id: str) -> str:
+        """Read a chat's number from WhatsApp's contact-info panel, once.
+
+        Only for a chat that has none. A stored number is never re-probed —
+        opening the panel is an interaction, and repeating it every cycle would
+        make the application unusable to sit in front of.
+
+        Never reached from the passive poll: it is called from the worker, on
+        the same path that already opens chats, under the action lock."""
+        chat = self._repo.get_chat(chat_id)
+        if chat is None or chat.phone_number:
+            return chat.phone_number if chat else ""
+        try:
+            raw = await self._sender.resolve_phone_number_async(chat.chat_name)
+        except Exception as ex:  # noqa: BLE001 - discovery must never break a scan
+            logger.warning("contact-number lookup failed for %s: %s",
+                           chat.chat_name, ex)
+            return ""
+        digits = phone_digits(raw)
+        if not digits:
+            self._repo.log("INFO", "chat.number_unavailable", chat_id=chat_id,
+                           chat_name=chat.chat_name,
+                           message="No number in the contact panel — addressed by name.")
+            return ""
+        await self.set_chat_phone_number(chat_id, digits)
+        self._repo.log("INFO", "chat.number_discovered", chat_id=chat_id,
+                       chat_name=chat.chat_name,
+                       message=f"Number read from the contact panel: {digits}")
+        return digits
+
     async def set_chat_phone_number(self, chat_id: str, phone_number: str) -> None:
         """Record a chat's number and rebuild its webhook URL from the template.
 
@@ -834,6 +873,12 @@ class AutomationEngine:
             return
         digits = phone_digits(phone_number)
         chat.phone_number = digits
+        # Derive the short id the send API addresses chats by, unless somebody
+        # set one deliberately — an explicit assignment outranks a derived one.
+        if digits and not chat.external_id:
+            chat.external_id = contact_id_for(digits)
+        elif not digits and chat.external_id == contact_id_for(chat.phone_number or ""):
+            chat.external_id = ""
         chat.webhook_url = webhook_url_for(self._settings.webhook_template,
                                            digits, chat.webhook_override,
                                            chat.chat_name)
