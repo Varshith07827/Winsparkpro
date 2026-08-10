@@ -843,6 +843,10 @@ class AutomationEngine:
         chat = self._repo.get_chat(chat_id)
         if chat is None or chat.phone_number:
             return chat.phone_number if chat else ""
+        if chat.phone_probed_at is not None:
+            # Already looked, and there was nothing. Opening the panel again on
+            # every scan costs seconds and flashes the UI to re-learn it.
+            return ""
         # Deliberately NOT skipped on `chat.is_group`. That flag is inferred
         # from whether a sidebar preview carries a speaker prefix, and it is
         # wrong often enough to matter — measured: a 1:1 chat whose number was
@@ -855,6 +859,11 @@ class AutomationEngine:
             logger.warning("contact-number lookup failed for %s: %s",
                            chat.chat_name, ex)
             return ""
+        # Recorded before anything else, so a chat is never probed twice even
+        # if the number turns out to be unreadable.
+        chat.phone_probed_at = utcnow()
+        await asyncio.to_thread(self._repo.save_chat, chat)
+
         digits = phone_digits(raw)
         if not digits:
             self._repo.log("INFO", "chat.number_unavailable", chat_id=chat_id,
@@ -879,6 +888,9 @@ class AutomationEngine:
             return
         digits = phone_digits(phone_number)
         chat.phone_number = digits
+        # Clearing the number re-arms discovery; setting one makes the question
+        # settled either way.
+        chat.phone_probed_at = utcnow() if digits else None
         # Derive the short id the send API addresses chats by, unless somebody
         # set one deliberately — an explicit assignment outranks a derived one.
         if digits and not chat.external_id:

@@ -162,3 +162,128 @@ def test_a_contact_panel_is_not_treated_as_groupish(monkeypatch):
                         lambda _h: _tree("Contact info", "+91 79811 49423"))
     assert S._panel_title(0) == "Contact info"
     assert S._panel_title(0) not in S.GROUPISH_PANEL_TITLES
+
+
+# ---------------------------------------------------------------------------
+# "We looked and there was nothing" is worth remembering
+# ---------------------------------------------------------------------------
+
+
+class _Recorder:
+    """A sender that counts how many times the panel was opened."""
+
+    def __init__(self, answer=""):
+        self.answer = answer
+        self.probes = 0
+
+    async def resolve_phone_number_async(self, _chat_name):
+        self.probes += 1
+        return self.answer
+
+
+def _engine_with(monkeypatch, tmp_path, sender):
+    import asyncio
+
+    from wadam.config import Settings
+    from wadam.engine.engine import AutomationEngine
+    from wadam.storage.json_backup import JsonBackupStore
+    from wadam.storage.repository import Repository
+    from tests.test_storage import FakeMongo
+
+    settings = Settings(mongodb_uri="mongodb://localhost:27017",
+                        json_backup_folder=tmp_path, json_autosave_interval=0)
+    backup = JsonBackupStore(tmp_path, autosave_interval=0)
+    backup.ensure_folder()
+    repo = Repository(settings, FakeMongo(), backup)
+    repo.start()
+    engine = AutomationEngine(settings, repo, lambda _s: None)
+    engine._sender = sender
+    return engine, repo
+
+
+def _chat(repo, name="Noteify"):
+    from wadam.domain.models import ChatConfig, chat_id_for
+
+    chat = ChatConfig(chat_id=chat_id_for(name), chat_name=name, seeded=True)
+    repo.save_chat(chat)
+    return chat
+
+
+def test_a_chat_with_no_number_is_probed_once_not_every_scan(monkeypatch, tmp_path):
+    """A community has no number. Without a marker its panel was opened and
+    closed on every scan — measured at ~9 seconds a time, visible on screen."""
+    import asyncio
+
+    sender = _Recorder(answer="")
+    engine, repo = _engine_with(monkeypatch, tmp_path, sender)
+    try:
+        chat = _chat(repo)
+        for _ in range(5):
+            asyncio.run(engine.discover_phone_number(chat.chat_id))
+        assert sender.probes == 1, "the panel must be opened once, not five times"
+        assert repo.get_chat(chat.chat_id).phone_probed_at is not None
+    finally:
+        repo.stop()
+
+
+def test_a_found_number_also_stops_further_probing(monkeypatch, tmp_path):
+    import asyncio
+
+    sender = _Recorder(answer="+91 79811 49423")
+    engine, repo = _engine_with(monkeypatch, tmp_path, sender)
+    try:
+        chat = _chat(repo, "Varshith")
+        assert asyncio.run(engine.discover_phone_number(chat.chat_id)) == "917981149423"
+        asyncio.run(engine.discover_phone_number(chat.chat_id))
+        assert sender.probes == 1
+        assert repo.get_chat(chat.chat_id).phone_number == "917981149423"
+    finally:
+        repo.stop()
+
+
+def test_clearing_the_number_re_arms_discovery(monkeypatch, tmp_path):
+    """Emptying the field must not leave the chat permanently given up on."""
+    import asyncio
+
+    sender = _Recorder(answer="+91 79811 49423")
+    engine, repo = _engine_with(monkeypatch, tmp_path, sender)
+    try:
+        chat = _chat(repo, "Varshith")
+        asyncio.run(engine.discover_phone_number(chat.chat_id))
+        assert sender.probes == 1
+
+        asyncio.run(engine.set_chat_phone_number(chat.chat_id, ""))
+        assert repo.get_chat(chat.chat_id).phone_probed_at is None
+
+        asyncio.run(engine.discover_phone_number(chat.chat_id))
+        assert sender.probes == 2, "clearing the number should allow another look"
+    finally:
+        repo.stop()
+
+
+def test_the_marker_survives_a_restart(tmp_path):
+    """Otherwise every restart re-probes every group."""
+    from wadam.config import Settings
+    from wadam.domain.models import ChatConfig, chat_id_for, utcnow
+    from wadam.storage.json_backup import JsonBackupStore
+    from wadam.storage.repository import Repository
+    from tests.test_storage import FakeMongo
+
+    settings = Settings(mongodb_uri="mongodb://localhost:27017",
+                        json_backup_folder=tmp_path, json_autosave_interval=0)
+    backup = JsonBackupStore(tmp_path, autosave_interval=0)
+    backup.ensure_folder()
+    repo = Repository(settings, FakeMongo(), backup)
+    repo.start()
+    chat = ChatConfig(chat_id=chat_id_for("Noteify"), chat_name="Noteify",
+                      phone_probed_at=utcnow(), seeded=True)
+    repo.save_chat(chat)
+    repo.flush_json(force=True)
+
+    restarted = Repository(settings, repo._mongo, JsonBackupStore(tmp_path, 0))
+    restarted.start()
+    try:
+        assert restarted.get_chat(chat.chat_id).phone_probed_at is not None
+    finally:
+        restarted.stop()
+        repo.stop()

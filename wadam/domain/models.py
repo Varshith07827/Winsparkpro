@@ -158,6 +158,13 @@ class ChatConfig:
     #: means "not resolved" and is never guessed at — a wrong number would send
     #: someone else's conversation to a webhook.
     phone_number: str = ""
+    #: When the contact-info panel was last opened to look for a number.
+    #: Set whether or not one was found, because "we looked and there was
+    #: nothing" is the answer worth remembering: a community has no number, and
+    #: without this its panel was opened and closed on every single scan.
+    #: Cleared when the number is cleared, so emptying the field re-arms the
+    #: search rather than leaving it permanently given up on.
+    phone_probed_at: Optional[datetime] = None
 
     # --- configuration -----------------------------------------------------
     #: The URL actually called for this chat. **Derived**, not typed in:
