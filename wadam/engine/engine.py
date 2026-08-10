@@ -843,6 +843,12 @@ class AutomationEngine:
         chat = self._repo.get_chat(chat_id)
         if chat is None or chat.phone_number:
             return chat.phone_number if chat else ""
+        # Deliberately NOT skipped on `chat.is_group`. That flag is inferred
+        # from whether a sidebar preview carries a speaker prefix, and it is
+        # wrong often enough to matter — measured: a 1:1 chat whose number was
+        # successfully read from a "Contact info" panel was flagged as a group.
+        # Skipping on it would have refused to discover that number. What the
+        # panel says about itself is reliable; a guess about the chat is not.
         try:
             raw = await self._sender.resolve_phone_number_async(chat.chat_name)
         except Exception as ex:  # noqa: BLE001 - discovery must never break a scan

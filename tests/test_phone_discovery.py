@@ -118,3 +118,47 @@ def test_a_missing_button_is_not_an_error(monkeypatch):
     lookup failure can never be allowed to break a scan."""
     monkeypatch.setattr(S, "_find_profile_button", lambda _h: None)
     assert S.read_contact_number_sync(0) == ""
+
+
+def test_a_group_panel_is_recognised_as_open(monkeypatch):
+    """A community's panel is titled "Community info", not "Contact info".
+    Measured live on Noteify. Recognising only the contact title meant an
+    already-open group panel looked closed, so the probe invoked the toggle and
+    closed it — the defect fixed for contacts, still live for groups."""
+    for title in ("Contact info", "Group info", "Community info", "Channel info"):
+        monkeypatch.setattr(S.auto, "ControlFromHandle",
+                            lambda _h, t=title: _tree(t, "+91 79811 49423"))
+        assert S._contact_panel_open(0) is True, f"{title} should count as open"
+
+
+def test_the_panel_decides_whether_a_number_exists_not_the_is_group_flag():
+    """`is_group` is inferred from whether a sidebar preview carries a speaker
+    prefix, and it is wrong often enough to matter — measured, a 1:1 chat whose
+    number was successfully read from a "Contact info" panel was flagged as a
+    group. Skipping discovery on that flag would have refused a number the
+    application had already proved it could read."""
+    import inspect
+
+    from wadam.engine.engine import AutomationEngine
+
+    source = inspect.getsource(AutomationEngine.discover_phone_number)
+    assert "if chat.is_group:" not in source, (
+        "the decision must come from the panel, not from a guess about the chat"
+    )
+
+
+def test_a_groupish_panel_stops_the_probe_early(monkeypatch):
+    """A community panel names itself. Waiting out the full timeout to learn
+    there is no number would cost seconds on every group scan."""
+    assert set(S.GROUPISH_PANEL_TITLES) <= set(S.CONTACT_PANEL_TITLES)
+    for title in S.GROUPISH_PANEL_TITLES:
+        monkeypatch.setattr(S.auto, "ControlFromHandle",
+                            lambda _h, t=title: _tree(t, "Add members"))
+        assert S._panel_title(0) == title
+
+
+def test_a_contact_panel_is_not_treated_as_groupish(monkeypatch):
+    monkeypatch.setattr(S.auto, "ControlFromHandle",
+                        lambda _h: _tree("Contact info", "+91 79811 49423"))
+    assert S._panel_title(0) == "Contact info"
+    assert S._panel_title(0) not in S.GROUPISH_PANEL_TITLES

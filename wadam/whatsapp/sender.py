@@ -1009,7 +1009,39 @@ def _scan_for_phone(window_handle: int) -> str:
     return walk(root)
 
 
-CONTACT_PANEL_TITLE = "Contact info"
+#: The panel's title depends on what the chat IS. Measured live: a 1:1 chat
+#: shows "Contact info", a community shows "Community info". Recognising only
+#: the first meant a group's already-open panel looked closed, so the probe
+#: invoked the toggle and CLOSED it — the same defect that was fixed for
+#: contacts, still live for groups until this list existed.
+CONTACT_PANEL_TITLES = ("Contact info", "Group info", "Community info",
+                        "Channel info")
+
+#: Of those, the ones that describe a chat with no single contact number. Seen
+#: live on a community: "Add members", "Report announcements from …" and no
+#: number anywhere, because there is no one person to have one.
+GROUPISH_PANEL_TITLES = ("Group info", "Community info", "Channel info")
+
+
+def _panel_title(window_handle: int) -> str:
+    """Which info panel is showing, or "" if none is."""
+    root = auto.ControlFromHandle(window_handle)
+    if root is None:
+        return ""
+
+    def walk(ctrl, depth=0) -> str:
+        if depth > 24:
+            return ""
+        for child in _safe_children(ctrl):
+            name = _safe_name(child).strip()
+            if name in CONTACT_PANEL_TITLES:
+                return name
+            found = walk(child, depth + 1)
+            if found:
+                return found
+        return ""
+
+    return walk(root)
 
 
 def _contact_panel_open(window_handle: int) -> bool:
@@ -1027,7 +1059,7 @@ def _contact_panel_open(window_handle: int) -> bool:
         if depth > 24:
             return False
         for child in _safe_children(ctrl):
-            if _safe_name(child).strip() == CONTACT_PANEL_TITLE:
+            if _safe_name(child).strip() in CONTACT_PANEL_TITLES:
                 return True
             if walk(child, depth + 1):
                 return True
@@ -1079,6 +1111,11 @@ def read_contact_number_sync(window_handle: int) -> str:
     while time.monotonic() < deadline:
         found = _scan_for_phone(window_handle)
         if found:
+            break
+        # A group or community has no single number, so stop as soon as the
+        # panel says which kind it is rather than waiting out the timeout.
+        # Read from the panel, not from a guess about the chat.
+        if _panel_title(window_handle) in GROUPISH_PANEL_TITLES:
             break
         time.sleep(PROFILE_PANEL_POLL)
 
