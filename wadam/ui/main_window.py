@@ -17,6 +17,13 @@ selects it and never changes it. The badge counts messages that have arrived
 and not yet finished the round trip — not WhatsApp's unread count, which the
 user can already see in WhatsApp.
 
+The two directions are not symmetrical, and the window is where that shows.
+Chats arrive already ticked, so ticking is usually just switching one back on
+and stays instant and silent. **Unticking deletes that chat's stored records**,
+which is the only irreversible thing a user can do here, so it is the only
+thing that asks — naming what will be destroyed rather than saying "all
+records", and refusing outright when the database is unreachable.
+
 What used to be here and is not any more: a global automation switch, a rescan
 button, and a right-hand panel of six cards carrying activity history, session
 health, operations counters, storage status and Export/Reset/Delete. The
@@ -210,7 +217,55 @@ class MainWindow(QMainWindow):
         self._config.set_chat(self._repository.get_chat(chat_id))
 
     def _on_automation_toggled(self, chat_id: str, enabled: bool) -> None:
+        if not enabled and not self._confirm_purge(chat_id):
+            return
         self._host.submit(lambda: self._host.engine.set_chat_automation(chat_id, enabled))
+
+    def _confirm_purge(self, chat_id: str) -> bool:
+        """Unticking deletes the chat's stored history, so it asks first.
+
+        The one dialog in an interface that deliberately has none. Ticking a box
+        is still immediate and silent; this is the other direction, where a
+        stray click on a 14-pixel target would otherwise destroy a history that
+        nothing can restore. It names the counts rather than saying "all
+        records", because "delete everything?" tells a user nothing about what
+        they are about to lose."""
+        chat = self._repository.get_chat(chat_id)
+        if chat is None:
+            return False
+
+        # Refused rather than half-done. The purge deletes from MongoDB and from
+        # the JSON backup; with the database unreachable only the backup would
+        # go, and the UI would report a deletion that did not happen.
+        if self._snapshot is not None and not self._snapshot.mongo_ok:
+            QMessageBox.warning(
+                self, "Database unreachable",
+                f"Turning automation off deletes this chat's stored records, and "
+                f"{self._snapshot.mongo_status}.\n\n"
+                "Nothing was changed. Try again once the database is back.",
+            )
+            return False
+
+        with _busy_cursor():
+            counts = self._repository.chat_record_counts(chat_id)
+        total = sum(counts.values())
+        if not total:
+            return True      # nothing to lose, so nothing to ask about
+        confirm = QMessageBox(self)
+        confirm.setIcon(QMessageBox.Warning)
+        confirm.setWindowTitle("Turn off automation")
+        confirm.setText(f"Delete everything stored for {chat.chat_name}?")
+        confirm.setInformativeText(
+            f"{counts['messages']} message(s), {counts['webhooks']} webhook call(s) "
+            f"and {counts['outgoing']} queued send(s) will be removed from "
+            f"{self._settings.database_name}.\n\n"
+            "The chat stays in the list and can be switched back on, but this "
+            "history cannot be recovered."
+        )
+        confirm.setStandardButtons(QMessageBox.Cancel | QMessageBox.Yes)
+        confirm.setDefaultButton(QMessageBox.Cancel)
+        confirm.button(QMessageBox.Yes).setText("Turn off and delete")
+        return confirm.exec() == QMessageBox.Yes
 
 
 

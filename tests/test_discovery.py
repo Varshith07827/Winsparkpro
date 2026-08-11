@@ -44,13 +44,27 @@ def row(name: str, message: str = "hi", unread: int = 0, timestamp: str = "12:00
     return ChatRow(**parse_chat_row(f"{prefix}{name} {timestamp} {message}"))
 
 
-def test_a_new_chat_arrives_inert(discovery):
+def test_a_new_chat_arrives_watched(discovery):
+    """A tool for watching chats that watches none of them until every box is
+    ticked is a tool nobody has switched on yet."""
     engine_discovery, _repo = discovery
     result = engine_discovery.sync([row("Alice")])
 
     assert len(result.new) == 1
     chat = result.new[0]
-    assert chat.automation_enabled is False, "discovery must never enable automation"
+    assert chat.automation_enabled is True
+
+
+def test_a_new_chat_is_watched_but_not_yet_baselined(discovery):
+    """The pair that makes automation-on-by-default safe.
+
+    `seeded` false means the first read stores the whole visible backlog as
+    SEEDED and automates none of it. Enable the first without the second and
+    installing this would webhook every conversation already on screen."""
+    engine_discovery, _repo = discovery
+    chat = engine_discovery.sync([row("Alice")]).new[0]
+
+    assert chat.automation_enabled is True
     assert chat.seeded is False, "the backlog must not count as processed yet"
 
 
@@ -64,8 +78,6 @@ def test_a_new_chat_stores_no_webhook_of_its_own(tmp_path: Path):
     engine_discovery = ChatDiscovery(repository, settings)
     chat = engine_discovery.sync([row("Alice")]).new[0]
     assert chat.webhook_override == "", "a chat only stores a URL when overriding"
-    # Still off: a webhook is a destination, not permission to use it.
-    assert chat.automation_enabled is False
     repository.stop()
 
 

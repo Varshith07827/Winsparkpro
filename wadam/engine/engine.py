@@ -943,10 +943,35 @@ class AutomationEngine:
         self.publish()
 
     async def set_chat_automation(self, chat_id: str, enabled: bool) -> None:
+        """The checkbox. Ticking it starts watching a chat; unticking it stops,
+        and discards everything that chat has stored.
+
+        The deletion is deliberate and irreversible: unticking means "I do not
+        want this chat automated", and leaving its messages behind would keep
+        them in `wa_events` for a chat nobody is watching. The UI confirms first,
+        because a stray click on a 14-pixel box is not consent to destroy a
+        history."""
         chat = self._repo.get_chat(chat_id)
         if chat is None:
             return
         chat.automation_enabled = enabled
+        if not enabled:
+            # Cancelled before deleted, so a queued send ends as CANCELLED with
+            # a reason rather than vanishing mid-flight.
+            cancelled = await asyncio.to_thread(
+                self._repo.cancel_outgoing_for_chat, chat_id)
+            counts = await asyncio.to_thread(self._repo.purge_chat_records, chat_id)
+            # No records means no baseline. Without this, ticking the box again
+            # would read the chat with `seeded` still true and treat the entire
+            # visible backlog as newly arrived — webhooking conversations that
+            # happened while the automation was off.
+            chat.seeded = False
+            self._repo.log("INFO", "chat.purged", chat_id=chat_id, chat_name=chat.chat_name,
+                           message=f"Automation turned OFF — deleted "
+                                   f"{counts['messages']} message(s), "
+                                   f"{counts['webhooks']} webhook call(s) and "
+                                   f"{counts['outgoing']} queued send(s)"
+                                   + (f", cancelling {cancelled} first." if cancelled else "."))
         await asyncio.to_thread(self._repo.save_chat, chat)
         self._repo.log("INFO", "automation.toggled", chat_id=chat_id, chat_name=chat.chat_name,
                        message=f"Automation turned {'ON' if enabled else 'OFF'}.")

@@ -3,17 +3,24 @@
 Every polling cycle:
 
     detect chats → compare with MongoDB → new chat? → create configuration
-    (automation OFF, webhook empty) → save to MongoDB → write JSON →
+    (automation ON, webhook derived) → save to MongoDB → write JSON →
     appear immediately
 
 No dialogs, no confirmation, no "add chat" button. A chat exists in this
 application because it exists in WhatsApp.
 
-A newly discovered chat is deliberately inert: automation OFF and — unless
-`DEFAULT_WEBHOOK` is configured — no webhook. Discovery is not consent. The
-`seeded` flag carries the same idea to messages: the first read of a chat
-records its visible backlog without triggering anything, so turning automation
-on tomorrow doesn't fire a webhook at every message already on screen.
+A newly discovered chat is **watched**. This used to be off, on the principle
+that discovery is not consent, and the result was an application that did
+nothing at all until every box had been ticked by hand — for a tool whose only
+job is watching chats, an off switch disguised as a default.
+
+What makes that safe is `seeded`, which is unchanged and now carries the whole
+weight of it: the first read of a chat records its entire visible backlog
+without triggering anything. So a chat is watched from the moment it appears,
+and the conversation that was already on screen when it appeared is not.
+
+Unticking a chat is therefore the deliberate act, and it deletes what the chat
+stored — see `Repository.purge_chat_records`.
 """
 
 from __future__ import annotations
@@ -90,7 +97,15 @@ class ChatDiscovery:
                     # webhook URL is built from it.
                     phone_number=phone_digits(name),
                     webhook_url="",
-                    automation_enabled=False,   # never on by discovery
+                    # ON. A chat is discovered because it is in the sidebar, and
+                    # a tool whose whole job is watching chats that starts by
+                    # watching none of them makes every user tick every box.
+                    #
+                    # Safe only because of seeding: the first read of a new chat
+                    # records its entire visible backlog as SEEDED and returns
+                    # nothing to automate, so switching this on cannot fire a
+                    # webhook for a conversation that happened before install.
+                    automation_enabled=True,
                     # The send API's default addressing: the last four digits of
                     # the contact's number. Derivable only when the chat name IS
                     # the number, which is the case for an unsaved contact; a
@@ -120,7 +135,7 @@ class ChatDiscovery:
             self._repo.save_chats(changed)
         for chat in new:
             self._repo.log("INFO", "chat.discovered", chat_id=chat.chat_id, chat_name=chat.chat_name,
-                           message="New chat discovered — automation OFF, number "
+                           message="New chat discovered — automation ON, number "
                                    + (chat.phone_number or "unresolved"))
         if seen:
             self._repo.touch_last_poll([c.chat_id for c in seen], utcnow())

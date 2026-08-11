@@ -146,9 +146,9 @@ def test_a_new_chat_is_registered_within_one_cycle(engine):
 
     assert {c.chat_name for c in repo.list_chats()} == {"Alice", "Bob"}
     for chat in repo.list_chats():
-        assert chat.automation_enabled is False, "discovery never switches a chat on"
-        # Addressed by name until a number is supplied, so it can forward the
-        # moment it is ticked.
+        assert chat.automation_enabled is True, "a discovered chat is watched"
+        # Addressed by name until a number is supplied, so it can forward
+        # straight away.
         assert chat.webhook_url.endswith(f"?{chat.chat_name}")
 
 
@@ -186,11 +186,16 @@ def test_only_automated_chats_are_opened(engine):
     instance, reader, repo = engine
     reader.rows = [row("Alice"), row("Bob")]
     asyncio.run(instance._cycle())
+    asyncio.run(drain(instance))       # the seeding read every new chat gets
 
     alice = repo.get_chat(chat_id_for("Alice"))
-    alice.automation_enabled = True
     alice.seeded = True
     repo.save_chat(alice)
+    bob = repo.get_chat(chat_id_for("Bob"))
+    bob.automation_enabled = False     # unticked by the user
+    bob.seeded = True
+    repo.save_chat(bob)
+    instance._sender.opened.clear()
 
     # Both chats change; only the automated one is worth interrupting the user's
     # WhatsApp window for.
@@ -205,10 +210,8 @@ def test_an_unchanged_chat_is_never_opened(engine):
     instance, reader, repo = engine
     reader.rows = [row("Alice")]
     asyncio.run(instance._cycle())
-    alice = repo.get_chat(chat_id_for("Alice"))
-    alice.automation_enabled = True
-    alice.seeded = True
-    repo.save_chat(alice)
+    asyncio.run(drain(instance))       # the seeding read a new chat gets
+    instance._sender.opened.clear()
 
     for _ in range(3):
         asyncio.run(instance._cycle())
@@ -221,10 +224,11 @@ def test_the_open_conversation_is_read_without_switching_chats(engine):
     instance, reader, repo = engine
     reader.rows = [row("Alice")]
     asyncio.run(instance._cycle())
+    asyncio.run(drain(instance))       # the seeding read a new chat gets
     alice = repo.get_chat(chat_id_for("Alice"))
-    alice.automation_enabled = True
     alice.seeded = True
     repo.save_chat(alice)
+    instance._sender.opened.clear()
 
     reader.active_name = "Alice"
     reader.messages = [WhatsAppMessage(sender="Alice", text="are you there?",

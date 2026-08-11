@@ -113,9 +113,17 @@ Instant, as-you-type, across name and preview.
 
 ![Empty state](screens/main-empty.png)
 
-States the model plainly: chats appear automatically, and new ones start with
-automation OFF and no webhook. There is no "add chat" button because there is no
-way to add a chat — WhatsApp decides what exists.
+States the model plainly: chats appear automatically, and new ones arrive
+watched. There is no "add chat" button because there is no way to add a chat —
+WhatsApp decides what exists.
+
+Unticking a chat is the one action in this window that asks first. It stops the
+automation **and deletes that chat's stored records**, so the confirmation names
+the counts — "12 message(s), 4 webhook call(s) and 0 queued send(s)" — rather
+than asking about "all records". Ticking a chat on stays instant and silent.
+If MongoDB is unreachable the untick is refused outright, because only the JSON
+backup would be cleared and the window would be reporting a deletion that had
+not happened.
 
 ---
 

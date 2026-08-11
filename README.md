@@ -27,8 +27,8 @@ deep-scan the WhatsApp chat list, register everything found
   ↓
 ┌─ every 3 seconds ────────────────────────────────────────────┐
 │  read the chat list                                          │
-│  compare with MongoDB → new chat? create it (automation OFF, │
-│                          webhook empty) → save → write JSON  │
+│  compare with MongoDB → new chat? create it (automation ON,  │
+│                          webhook derived) → save → write JSON│
 │  read the open conversation when it's worth reading          │
 │  queue automated chats whose sidebar row changed             │
 └────────────────────────┬─────────────────────────────────────┘
@@ -273,8 +273,16 @@ row, which costs nothing and disturbs nothing.
 delivery; that empty box is the only accepted proof.
 
 **A chat's identity is its name.** WhatsApp exposes no durable chat id, so
-renaming a contact produces a new chat here — which fails safe, since it starts
-with automation OFF.
+renaming a contact produces a new chat here — watched from the moment it
+appears, and seeded from scratch so the conversation already on screen is not
+answered.
+
+**A discovered chat is watched; unticking it deletes what it stored.** New
+chats arrive with automation ON, because a tool for watching chats that watches
+none of them is off. Unticking is the deliberate act: it stops the automation
+and removes that chat's messages, webhook calls and queued sends from
+`wa_events`. The row stays in the list; the history does not, and cannot be
+recovered. The UI confirms first and names the counts.
 
 ---
 

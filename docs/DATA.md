@@ -192,7 +192,7 @@ is safe.
 ```
         detected
            │
-     ┌─────▼─────┐  automation off / no webhook / backlog
+     ┌─────▼─────┐  automation unticked / no webhook / backlog
      │  PENDING  │────────────────────────────────▶ IGNORED · SEEDED
      └─────┬─────┘
            │ persisted BEFORE the call

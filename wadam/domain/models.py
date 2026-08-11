@@ -51,9 +51,14 @@ def chat_id_for(chat_name: str) -> str:
     which change. The name is the only stable part, so the id is a hash of it.
 
     The consequence, stated plainly: renaming a contact or group produces a NEW
-    chat here, with its own configuration. That's the honest trade for having
-    no real id, and it fails safe — a renamed chat starts with automation OFF
-    rather than inheriting a webhook meant for a different conversation.
+    chat here, with its own configuration. That's the honest trade for having no
+    real id.
+
+    Since a discovered chat now arrives with automation ON, a rename no longer
+    quietly stops the automation — it re-baselines it. The renamed chat is
+    seeded from scratch (so nothing already on screen is answered) and any
+    number or webhook override typed against the old name is left behind on the
+    old row, which stays in the list until deleted.
     """
     normalized = _ID_CLEAN_RE.sub(" ", (chat_name or "").strip()).casefold()
     return hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:24]
@@ -148,7 +153,10 @@ class ChatConfig:
     """One WhatsApp chat and its automation configuration + live status.
 
     Created automatically the first time a chat is seen in the sidebar, with
-    automation OFF and no webhook — never through a dialog.
+    automation ON and a webhook derived from the template — never through a
+    dialog. Unticking the box switches it off and deletes everything the chat
+    stored; the row itself stays, which is what stops discovery from switching
+    it back on.
     """
 
     chat_id: str = ""

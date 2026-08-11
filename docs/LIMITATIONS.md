@@ -98,9 +98,10 @@ WhatsApp exposes no durable identifier, so `chat_id` is a hash of the display
 name. Consequences:
 
 * **Renaming a contact or group creates a new chat here**, with a fresh
-  configuration. This fails safe — the new one starts with automation OFF rather
-  than inheriting a webhook meant for a different conversation — but the old
-  configuration is orphaned and its history stays under the old id.
+  configuration. The new one is watched immediately (automation is ON by
+  default) and seeded from scratch, so nothing already on screen is answered —
+  but any number or webhook override typed against the old name does not follow
+  it, the old configuration is orphaned, and its history stays under the old id.
 * **Two chats with identical names collide.** Rare, but real for groups.
 * An unsaved number saved as a contact mid-run appears as a new chat.
 

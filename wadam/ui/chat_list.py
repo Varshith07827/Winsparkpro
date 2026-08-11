@@ -223,6 +223,10 @@ class ChatListPanel(QWidget):
         if chat.last_webhook_status:
             lines.append("Last webhook: " + chat.last_webhook_status)
         lines.append("Messages stored: " + str(chat.messages_stored))
+        if chat.automation_enabled:
+            # Said before the click, not only in the dialog after it. A user who
+            # hovers a ticked box should already know what unticking costs.
+            lines.append("Unticking deletes this chat's stored records.")
         return "\n".join(lines)
 
     # -- selection ---------------------------------------------------------

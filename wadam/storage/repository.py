@@ -258,6 +258,66 @@ class Repository:
         self._rebuild_all_sections()
         self._backup.flush(force=True)
 
+    def purge_chat_records(self, chat_id: str) -> dict:
+        """Delete everything a chat produced, and keep the chat itself.
+
+        `delete_chat` above also removes the ChatConfig, which is right for a
+        chat that is gone. This is for one that is still in the sidebar and has
+        simply been switched off: the row stays, its history does not.
+
+        Keeping the row is not a detail. A discovered chat now arrives with
+        automation ON, so deleting the config here would have it rediscovered on
+        the next poll and switched straight back on — unticking a box would turn
+        it into a tick.
+
+        Returns what was destroyed, per collection, so the caller can say so
+        rather than report a silent success."""
+        counts = self.chat_record_counts(chat_id)
+        with self._lock:
+            self._messages = deque(
+                (m for m in self._messages if m.chat_id != chat_id),
+                maxlen=constants.JSON_MESSAGE_LIMIT,
+            )
+            # Rebuilt, not discarded: the key set is the fast duplicate check
+            # for every OTHER chat too.
+            self._message_keys = {m.message_key for m in self._messages}
+            self._webhooks = deque(
+                (w for w in self._webhooks if w.chat_id != chat_id),
+                maxlen=constants.JSON_WEBHOOK_LIMIT,
+            )
+            self._outgoing = {k: v for k, v in self._outgoing.items()
+                              if v.chat_id != chat_id}
+        try:
+            self._mongo.messages.delete_many({"chat_id": chat_id})
+            self._mongo.outgoing.delete_many({"chat_id": chat_id})
+            self._mongo.webhooks.delete_many({"chat_id": chat_id})
+            self._mongo.note_success()
+        except Exception as ex:  # noqa: BLE001
+            self._mongo.note_failure(ex)
+            logger.error("Purging chat %s in MongoDB failed: %s", chat_id, ex)
+        self._rebuild_all_sections()
+        self._backup.flush(force=True)
+        return counts
+
+    def chat_record_counts(self, chat_id: str) -> dict:
+        """How much a chat has stored, without touching any of it. The UI asks
+        before it offers to delete, so the confirmation can name a number."""
+        return {
+            "messages": self.message_count(chat_id),
+            "webhooks": self._count(self._mongo.webhooks, chat_id, self._webhooks),
+            "outgoing": self._count(self._mongo.outgoing, chat_id,
+                                    self._outgoing.values()),
+        }
+
+    def _count(self, collection, chat_id: str, fallback) -> int:
+        """How many records a chat has. MongoDB is the authority; the in-memory
+        copy is capped and would undercount, so it is only the fallback."""
+        try:
+            return int(collection.count_documents({"chat_id": chat_id}))
+        except Exception:  # noqa: BLE001
+            with self._lock:
+                return sum(1 for record in list(fallback) if record.chat_id == chat_id)
+
     def _mongo_upsert_chat(self, chat: ChatConfig) -> None:
         try:
             self._mongo.chat_configs.update_one(
