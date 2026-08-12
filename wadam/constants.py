@@ -12,6 +12,13 @@ APP_VERSION = "1.0.0"
 # reply) happens on a separate worker so a slow send never stretches this.
 POLL_INTERVAL_SECONDS = 3
 
+# Most messages one relay tick takes from a chat's webhook before giving the
+# loop its turn back. A webhook hands over one message per request, so without
+# this a burst arrives one message per poll interval. Bounded so an endpoint
+# that returns something new on every request cannot hold the tick open.
+MAX_RELAY_DRAIN = 10
+
+
 # How many message bubbles are read out of a conversation per pass. WhatsApp
 # only realizes the visible tail into the accessibility tree anyway, so a
 # larger number costs nothing but doesn't buy history either.

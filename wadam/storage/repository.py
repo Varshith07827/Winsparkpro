@@ -59,6 +59,7 @@ class Repository:
         self._lock = threading.RLock()
 
         self._chats: dict[str, ChatConfig] = {}
+        self._config_baseline: dict[str, dict] = {}
         self._messages: deque[StoredMessage] = deque(maxlen=constants.JSON_MESSAGE_LIMIT)
         self._message_keys: set[str] = set()
         self._webhooks: deque[WebhookRecord] = deque(maxlen=constants.JSON_WEBHOOK_LIMIT)
@@ -111,6 +112,8 @@ class Repository:
                 chat = ChatConfig.from_document(strip_object_id(document))
                 if chat.chat_id:
                     self._chats[chat.chat_id] = chat
+                    self._config_baseline[chat.chat_id] = {
+                        field: getattr(chat, field) for field in self.CONFIG_FIELDS}
             for document in (self._mongo.messages.find({})
                              .sort("detected_at", -1).limit(constants.JSON_MESSAGE_LIMIT)):
                 message = StoredMessage.from_document(strip_object_id(document))
@@ -258,6 +261,55 @@ class Repository:
         self._rebuild_all_sections()
         self._backup.flush(force=True)
 
+    #: What an outside editor owns. Everything else on a ChatConfig is runtime
+    #: state this process is actively mutating — `seeded`, the last_* fields,
+    #: the counters — and copying those back over a live object would undo
+    #: whatever happened since the last save.
+    CONFIG_FIELDS = ("automation_enabled", "webhook_url", "webhook_override",
+                     "phone_number", "external_id")
+
+    def reload_chat_config(self) -> list[str]:
+        """Re-read the configuration fields of every chat from MongoDB.
+
+        The in-memory chats were loaded once at startup, so editing a webhook
+        or an automation flag directly in the database did nothing until a
+        restart — and the next `save_chat` wrote the stale value back over it.
+        A poll loop that never re-reads its own configuration is only
+        configurable through the window that happens to be running.
+
+        Returns the ids that actually changed, so a caller can log a real edit
+        without narrating every quiet pass.
+        """
+        try:
+            documents = list(self._mongo.chat_configs.find(
+                {}, {field: 1 for field in ("chat_id",) + self.CONFIG_FIELDS}))
+            self._mongo.note_success()
+        except Exception as ex:  # noqa: BLE001
+            self._mongo.note_failure(ex)
+            return []
+
+        changed: list[str] = []
+        with self._lock:
+            for document in documents:
+                chat = self._chats.get(document.get("chat_id") or "")
+                if chat is None:
+                    continue          # discovery owns creation, not this
+                baseline = self._config_baseline.setdefault(chat.chat_id, {})
+                for field in self.CONFIG_FIELDS:
+                    if field not in document:
+                        continue
+                    # The baseline moves whether or not memory did: this is now
+                    # what the database says, so a later save has nothing new to
+                    # tell it unless something changes the value locally.
+                    baseline[field] = document[field]
+                    if getattr(chat, field) != document[field]:
+                        setattr(chat, field, document[field])
+                        if chat.chat_id not in changed:
+                            changed.append(chat.chat_id)
+        if changed:
+            self._mark_chats_dirty()
+        return changed
+
     def purge_chat_records(self, chat_id: str) -> dict:
         """Delete everything a chat produced, and keep the chat itself.
 
@@ -321,12 +373,48 @@ class Repository:
     def _mongo_upsert_chat(self, chat: ChatConfig) -> None:
         try:
             self._mongo.chat_configs.update_one(
-                {"chat_id": chat.chat_id}, {"$set": chat.to_document()}, upsert=True
+                {"chat_id": chat.chat_id}, {"$set": self._writable(chat)}, upsert=True
             )
             self._mongo.note_success()
         except Exception as ex:  # noqa: BLE001
             self._mongo.note_failure(ex)
             logger.error("Saving chat %s to MongoDB failed: %s", chat.chat_name, ex)
+
+    def _writable(self, chat: ChatConfig) -> dict:
+        """The document to write, minus config fields this process has nothing
+        new to say about.
+
+        Every save wrote the whole chat, so a routine one — a relay poll
+        recording its status, an ingest updating a counter — carried a full copy
+        of the configuration with it and stamped it over whatever was in the
+        database. An edit made anywhere else survived only until the next such
+        save, which is roughly three seconds.
+
+        Reloading more often does not fix that; it only narrows the window.
+        The rule that does: **do not write back a config field you did not
+        change.** A field still equal to what this process last read or wrote is
+        one it has no opinion about, so it is left out of the `$set` entirely
+        and the database keeps whoever's value is there. A field that differs is
+        a genuine local edit and is written.
+
+        No call site had to be classified as config or runtime, which matters:
+        there are twenty-odd of them and a misclassification would silently
+        drop somebody's change in one direction or the other."""
+        document = chat.to_document()
+        baseline = self._config_baseline.get(chat.chat_id)
+        if baseline is None:
+            # First write for this chat — discovery creating it, and it owns
+            # the initial configuration.
+            self._config_baseline[chat.chat_id] = {
+                field: getattr(chat, field) for field in self.CONFIG_FIELDS}
+            return document
+        for field in self.CONFIG_FIELDS:
+            current = getattr(chat, field)
+            if current == baseline.get(field):
+                document.pop(field, None)     # nothing new to say
+            else:
+                baseline[field] = current     # a real local edit
+        return document
 
     # -- messages ----------------------------------------------------------
 

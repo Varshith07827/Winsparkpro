@@ -386,6 +386,7 @@ class AutomationEngine:
             # real incoming message was never read at all. Sending is more
             # urgent than discovery for a few seconds, never forever.
             return
+        await self._reload_chat_config()
         hwnd = self._hwnd
         if hwnd is None or not await self._reader.window_is_alive_async(hwnd):
             previous = self._hwnd
@@ -644,7 +645,7 @@ class AutomationEngine:
                     for chat in due:
                         self._relay_polled_at[chat.chat_id] = now
                     for chat, poll in await asyncio.gather(*(fetch(c) for c in due)):
-                        await self._handle_relay_poll(chat, poll)
+                        await self._drain_relay(chat, poll)
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 - a bad poll must not end the loop
@@ -654,23 +655,80 @@ class AutomationEngine:
             except asyncio.TimeoutError:
                 pass
 
-    async def _handle_relay_poll(self, chat: ChatConfig, poll) -> None:
+    async def _reload_chat_config(self) -> None:
+        """Pick up configuration edited outside this process.
+
+        The chats were read from MongoDB once, at startup, so changing a
+        webhook or an automation flag in the database did nothing until a
+        restart — and the next `save_chat` wrote the stale in-memory value back
+        over the edit. Anything that is not this window was therefore unable to
+        configure the application.
+
+        Only the configuration fields are taken (see `Repository.CONFIG_FIELDS`);
+        runtime state stays with the process that is mutating it.
+
+        **Every cycle, and before discovery.** A slower reload does not work at
+        all: discovery saves each chat every cycle, so a reload on a longer
+        interval loses the race — the stale in-memory value is written back over
+        the edit and the reload then reads its own overwrite. Measured: at ten
+        seconds against a three-second save, an edit never once took effect."""
+        changed = await asyncio.to_thread(self._repo.reload_chat_config)
+        for chat_id in changed:
+            chat = self._repo.get_chat(chat_id)
+            self._repo.log("INFO", "chat.config_reloaded", chat_id=chat_id,
+                           chat_name=chat.chat_name if chat else "",
+                           message="Configuration changed outside the app and was picked up.")
+
+    async def _drain_relay(self, chat: ChatConfig, poll) -> None:
+        """One tick for one chat: take what the poll returned, then keep asking
+        while messages keep arriving.
+
+        A webhook holds a queue and hands over **one message per request**. A
+        tick that fetched exactly once therefore delivered one message per
+        interval — four posted at the same moment took four intervals to
+        arrive, which reads as an application that is slow rather than one that
+        is polite. Asking again immediately after each accepted message clears
+        a burst at the speed of sending instead of the speed of polling.
+
+        A blank, an error, or a message the dedup rules refuse stops the drain
+        at once. So an idle endpoint is still exactly one request per interval,
+        and one that keeps returning the same thing is asked twice, not
+        MAX_RELAY_DRAIN times.
+        """
+        for attempt in range(constants.MAX_RELAY_DRAIN):
+            # The fetch is inside the bound, and the first one was already made
+            # by the caller. Fetching *after* handling instead would spend an
+            # extra request on the last pass and throw the answer away — and a
+            # discarded fetch against a dequeuing endpoint is not a wasted
+            # request, it is a destroyed message: the endpoint removed it from
+            # its queue to hand it over.
+            if attempt:
+                poll = await self._relay.poll(chat)
+            if not await self._handle_relay_poll(chat, poll):
+                return
+
+    async def _handle_relay_poll(self, chat: ChatConfig, poll) -> bool:
+        """Returns True when something was accepted — i.e. it is worth asking
+        again straight away rather than waiting out the interval."""
         self.metrics.record_relay_poll(len(poll.messages) if poll.ok else 0)
         if not poll.ok:
             await self._relay.record_poll(chat, poll)
             self._repo.log("WARNING", "relay.poll_failed", chat_id=chat.chat_id,
                            chat_name=chat.chat_name, webhook_url=chat.webhook_url,
                            error=poll.error, message="Relay poll failed.")
-            return
+            return False
         if not poll.messages:
             await self._relay.record_poll(chat, poll)
-            return
+            return False
+        accepted = False
         for message in poll.messages:
             send, reason = self._relay.should_send(chat, message)
             if not send:
                 self._relay.note_skipped(chat, message, reason)
                 continue
             self._queue.put_nowait(_Job("relay", chat.chat_id, relay=message))
+            accepted = True
+        return accepted
 
     async def _resume_send(self, chat: ChatConfig, message: StoredMessage) -> None:
         """Finish a reply whose send was never confirmed, without risking a
