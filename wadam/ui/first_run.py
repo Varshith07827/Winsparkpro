@@ -44,6 +44,10 @@ def env_text(mongodb_uri: str, webhook_template: str) -> str:
         "# WhatsApp Automation — configuration\n"
         "# Written by the first-run setup. Two settings; everything else is\n"
         "# fixed (database name, 3s polling) or derived (per-chat webhook URLs).\n"
+        "#\n"
+        "# WEBHOOK_URL carries both directions over one address. A message that\n"
+        "# ARRIVES in a ticked chat is POSTed to it; every few seconds the same\n"
+        "# address is GET, and anything it returns is SENT to that chat.\n"
         f"MONGODB_URI={mongodb_uri}\n"
         f"WEBHOOK_URL={webhook_template}\n"
     )

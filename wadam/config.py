@@ -117,9 +117,16 @@ class Settings:
     log_level: str = "INFO"
 
     # The relay: GET each automated chat's webhook and send what comes back.
-    # Off by default — an endpoint written to receive POSTs should not start
-    # getting GETs because the application was upgraded.
-    relay_enabled: bool = False
+    #
+    # ON by default, because it is the outbound path this product ships with.
+    # First-run setup writes exactly two keys — MONGODB_URI and WEBHOOK_URL —
+    # and the send API needs an API_PORT that nothing writes, so with the relay
+    # off a freshly installed build has NO way to send at all. That is what a
+    # built EXE was doing: reading a two-line .env, listening on nothing, and
+    # polling nothing.
+    #
+    # Set RELAY_ENABLED=false to turn it off.
+    relay_enabled: bool = True
     relay_poll_interval: float = 3.0
 
     # Inbound send API. Off unless a port is set; a token is required whenever
@@ -302,7 +309,11 @@ def load_settings(env_path: Optional[Path] = None) -> Settings:
         log_level = "INFO"
 
     # --- relay -------------------------------------------------------------
-    relay_enabled = (values.get("RELAY_ENABLED") or "").strip().lower() in _TRUE_VALUES
+    # Absent means ON. The two-key .env that first-run setup writes never
+    # mentions RELAY_ENABLED, and that file has to produce a working outbound
+    # path — so silence cannot mean "no way to send".
+    relay_raw = (values.get("RELAY_ENABLED") or "").strip().lower()
+    relay_enabled = True if not relay_raw else relay_raw in _TRUE_VALUES
     relay_poll_interval = _as_float(values, "RELAY_POLL_INTERVAL", 3.0, problems, minimum=1.0)
 
     # --- inbound send API -------------------------------------------------

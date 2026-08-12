@@ -89,32 +89,48 @@ surfaced for a person to resolve.
 
 ---
 
-## Noteify's `/ntext/whook/` is a different system
+## The relay is the outbound path
+
+`WEBHOOK_URL` carries both directions over one address:
 
 ```
-https://noteify.org/ntext/whook/?<WEB_KEY><MESSAGE_ID>
+inbound    message arrives in a ticked chat ──POST {…}──▶  your endpoint
+outbound   every few seconds  ──GET──▶ your endpoint ──body──▶ sent to the chat
 ```
 
-That endpoint belongs to Noteify. winSpark does not call it. Probed live: GET,
-POST and a bare request all answer
-`400 Bad Request: Invalid URL format. Expected format is ?<WEB_KEY><MESSAGE_ID>`.
+One URL, two verbs, one thing to configure — which is what makes the two-key
+`.env` that first-run setup writes a complete configuration. There is no
+`API_PORT` in that file and nothing writes one, so **the relay is the only
+outbound path a fresh install has**, and it is on unless `RELAY_ENABLED=false`
+says otherwise.
 
-It is not the winSpark outbound API and must not be configured as one. The
-winSpark outbound API is `POST /wam/`.
+Pull rather than push is the point: no listening socket, no open port, no token
+crossing the network, and it works from behind NAT or a corporate firewall
+where nothing can reach the machine WhatsApp runs on.
 
----
+See [RELAY.md](RELAY.md) for response shapes and the three deduplication rules.
+Briefly: an `id` in the response is sent once ever; without one, a repeat of the
+last text is suppressed until the endpoint has answered empty at least once,
+which proves it dequeues.
 
-## The relay
+An earlier revision of this document claimed `https://noteify.org/ntext/whook/`
+answered `400 Invalid URL format` to everything and "must not be configured as"
+the outbound API. That was measured against a key-shaped query
+(`?<WEB_KEY><MESSAGE_ID>`). Probed with the number the template actually
+produces, it answers `200` with an empty body — a well-formed "nothing
+waiting":
 
-An **alternative** outbound mechanism, off by default and not used by the
-Noteify integration. Instead of your server pushing to `/wam/`, winSpark polls
-each automated chat's `WEBHOOK_URL` with `GET` and sends whatever comes back.
-It exists for deployments where nothing can reach the machine WhatsApp runs on.
+```
+GET https://noteify.org/ntext/whook/?917981149423  →  200, 0 bytes
+GET https://noteify.org/ntext/whook/?17328358250   →  200, 0 bytes
+```
 
-It is retained and documented, not deleted — see [RELAY.md](RELAY.md) for the
-response shapes and the three deduplication rules. `WEBHOOK_URL` is the relay's
-poll address and **nothing else reads it** now that inbound no longer calls a
-webhook.
+## `POST /wam/` is the second way in, not the way
+
+An external system that *can* reach this machine may POST `{"id","message"}`
+instead of waiting to be polled. It needs `API_PORT` set by hand. Useful when
+you already have a push integration; not required, and not what a built EXE
+uses.
 
 ---
 

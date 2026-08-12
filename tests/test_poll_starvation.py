@@ -156,10 +156,14 @@ def test_the_sequence_survives_a_restart_taken_mid_drain(repo, tmp_path: Path):
 # ---------------------------------------------------------------------------
 
 
-def test_the_relay_is_off_unless_someone_turns_it_on():
-    """Default-off in code. It was on in .env, which is how a GET every three
-    seconds became thirty messages to a real contact."""
-    assert Settings().relay_enabled is False
+def test_the_relay_is_on_by_default_because_it_is_the_outbound_path():
+    """This was default-off after the incident, and the cost showed up in a
+    built EXE: first-run setup writes MONGODB_URI and WEBHOOK_URL and nothing
+    else, no API_PORT, so the install could not send by any route at all.
+
+    What stops a repeat of the incident is not this switch — it is the
+    deduplication rules below, which is where a guard belongs."""
+    assert Settings().relay_enabled is True
 
 
 def test_a_disabled_relay_is_never_polled(tmp_path: Path):

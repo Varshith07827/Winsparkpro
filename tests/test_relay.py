@@ -444,11 +444,35 @@ def write_env(tmp_path: Path, extra: str) -> Path:
     return path
 
 
-def test_the_relay_is_off_by_default(tmp_path: Path):
-    # An endpoint written to receive POSTs should not start getting GETs
-    # because the application was upgraded.
+def test_the_relay_is_on_when_the_file_does_not_mention_it(tmp_path: Path):
+    # The two-key .env first-run setup writes never mentions RELAY_ENABLED, and
+    # that file has to produce a working outbound path, so silence cannot mean
+    # "no way to send".
     settings = load_settings(write_env(tmp_path, ""))
-    assert settings.relay_enabled is False
+    assert settings.relay_enabled is True
+
+
+@pytest.mark.parametrize("value", ["false", "0", "no", "off", "FALSE"])
+def test_the_relay_can_still_be_switched_off(tmp_path: Path, value):
+    assert load_settings(write_env(tmp_path, f"RELAY_ENABLED={value}")).relay_enabled is False
+
+
+def test_the_two_key_setup_file_can_send(tmp_path: Path):
+    """The exact file `first_run.write_env` produces, loaded the way a frozen
+    build loads it. A built EXE was reading one of these, listening on nothing
+    because API_PORT is absent, and polling nothing because the relay was off —
+    so it had no outbound path in either direction."""
+    from wadam.ui.first_run import env_text
+
+    path = tmp_path / ".env"
+    path.write_text(env_text("mongodb://localhost:27017",
+                             "https://noteify.org/ntext/whook/?{phone_number}"),
+                    encoding="utf-8")
+    settings = load_settings(path)
+
+    assert settings.api_port == 0, "nothing writes API_PORT, so there is no listener"
+    assert settings.relay_enabled is True, "so the relay has to be the way out"
+    assert settings.webhook_template.endswith("?{phone_number}")
 
 
 @pytest.mark.parametrize("value", ["true", "1", "yes", "on", "TRUE"])
