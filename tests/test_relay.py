@@ -470,9 +470,45 @@ def test_the_two_key_setup_file_can_send(tmp_path: Path):
                     encoding="utf-8")
     settings = load_settings(path)
 
-    assert settings.api_port == 0, "nothing writes API_PORT, so there is no listener"
+    assert settings.api_port == 0, "the API_PORT line is commented, so no listener"
     assert settings.relay_enabled is True, "so the relay has to be the way out"
     assert settings.webhook_template.endswith("?{phone_number}")
+
+
+def test_the_setup_file_documents_api_port_without_switching_it_on(tmp_path: Path):
+    """A setting nobody can discover may as well not exist.
+
+    API_PORT is the difference between "curl reaches this app" and "curl
+    reaches nothing", and its name appears nowhere a user would look. It is
+    written into the generated .env, commented, so the name and the exact curl
+    are in front of whoever opens the file — and nothing is listening until
+    they mean it to be."""
+    from wadam.ui.first_run import env_text
+
+    text = env_text("mongodb://localhost:27017", "https://x.test/?{phone_number}")
+
+    assert "# API_PORT=8765" in text, "documented"
+    assert "\nAPI_PORT" not in text, "and commented, not live"
+    assert "/wam/" in text, "with the request that uses it"
+
+    path = tmp_path / ".env"
+    path.write_text(text, encoding="utf-8")
+    assert load_settings(path).api_port == 0
+
+
+def test_uncommenting_api_port_is_all_it_takes(tmp_path: Path):
+    """The edit the comment invites, proved to work. A documented switch that
+    did not switch anything would be worse than no documentation."""
+    from wadam.ui.first_run import env_text
+
+    text = env_text("mongodb://localhost:27017", "https://x.test/?{phone_number}")
+    path = tmp_path / ".env"
+    path.write_text(text.replace("# API_PORT=8765", "API_PORT=8765"), encoding="utf-8")
+
+    settings = load_settings(path)
+    assert settings.api_port == 8765
+    assert settings.api_host == "127.0.0.1", "loopback until someone changes it"
+    assert settings.relay_enabled is True, "the webhook keeps working alongside it"
 
 
 @pytest.mark.parametrize("value", ["true", "1", "yes", "on", "TRUE"])

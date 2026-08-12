@@ -39,17 +39,57 @@ _MONGO_PLACEHOLDER = "mongodb://localhost:27017"
 
 
 def env_text(mongodb_uri: str, webhook_template: str) -> str:
-    """The `.env` this writes. Two keys — everything else is fixed or derived."""
+    """The `.env` this writes.
+
+    Two live keys, and one documented-but-commented third. A setting nobody can
+    discover may as well not exist: `API_PORT` is the difference between "curl
+    reaches this app" and "curl reaches nothing", and a user who has never read
+    the source has no way to learn the name. Written commented so it changes
+    nothing until someone means it to — the comment parser drops the line
+    entirely, so `api_port` stays 0 and no socket is opened.
+    """
     return (
         "# WhatsApp Automation — configuration\n"
-        "# Written by the first-run setup. Two settings; everything else is\n"
-        "# fixed (database name, 3s polling) or derived (per-chat webhook URLs).\n"
-        "#\n"
-        "# WEBHOOK_URL carries both directions over one address. A message that\n"
-        "# ARRIVES in a ticked chat is POSTed to it; every few seconds the same\n"
-        "# address is GET, and anything it returns is SENT to that chat.\n"
+        "# Written by the first-run setup. Everything not listed here is fixed\n"
+        "# (database name, 3s polling) or derived (per-chat webhook URLs).\n"
+        "\n"
+        "# Where chats and messages are stored.\n"
         f"MONGODB_URI={mongodb_uri}\n"
+        "\n"
+        "# The webhook, and it carries BOTH directions over one address:\n"
+        "#\n"
+        "#   inbound   a message arrives in a ticked chat  → POST to this URL\n"
+        "#   outbound  every few seconds                   → GET this URL, and\n"
+        "#                                                    send what it returns\n"
+        "#\n"
+        "# {phone_number} is replaced with each chat's own number. Return an\n"
+        "# empty body from the GET when nothing is waiting.\n"
         f"WEBHOOK_URL={webhook_template}\n"
+        "\n"
+        "# ---------------------------------------------------------------------\n"
+        "# Optional: accept messages pushed IN over HTTP\n"
+        "# ---------------------------------------------------------------------\n"
+        "#\n"
+        "# Off while the next line stays commented, and off is the right default:\n"
+        "# the webhook above already sends, and this opens a socket that anything\n"
+        "# on this machine can post to.\n"
+        "#\n"
+        "# Uncomment it if your system can reach this machine and would rather\n"
+        "# push than be polled. Then, from anywhere on this PC:\n"
+        "#\n"
+        '#   curl -X POST http://127.0.0.1:8765/wam/ ^\n'
+        '#        -H "Content-Type: application/json" ^\n'
+        '#        -d "{\\"id\\":\\"919876543210\\",\\"message\\":\\"Hello\\"}"\n'
+        "#\n"
+        "# `id` is the chat name, its full number, or the last four digits.\n"
+        "# The reply is 202 with a message id; the send is queued and verified.\n"
+        "#\n"
+        "# API_PORT=8765\n"
+        "\n"
+        "# Only reachable from this machine. Change it and a token stops being\n"
+        "# optional — off loopback the app refuses to start without one.\n"
+        "# API_HOST=127.0.0.1\n"
+        "# API_TOKEN=\n"
     )
 
 
