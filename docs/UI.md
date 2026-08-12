@@ -68,7 +68,7 @@ the once-a-second refresh, but switching chats always reloads it — the text
 sitting there belongs to the chat you just left.
 
 **Contact ID card** — how the [send API](SEND_API.md) addresses this chat.
-Auto-filled with the last four digits when the chat name is the contact's
+Auto-filled from the contact-info panel when the chat name is the contact's
 number (an unsaved contact); empty and editable for a saved contact, which
 WhatsApp only ever shows by name. The card says out loud that four digits is
 10,000 values and that a collision is refused rather than delivered to a guess.

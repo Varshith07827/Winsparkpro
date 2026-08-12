@@ -751,7 +751,7 @@ name, badge or phone number prepended.
 ### Outbound — `POST /wam/` to a verified bubble
 
 ```
-POST /wam/ {"id":"2933"} -> external_id resolution -> durable queue
+POST /wam/ {"id":"918106972933"} -> phone_number resolution -> durable queue
                          -> sender -> new bubble -> census verification
 ```
 
@@ -786,7 +786,7 @@ operation, for the reasons below.
 | ~~A saved contact's phone number cannot be discovered~~ — **withdrawn, the finding was wrong** | The number IS readable from the contact-info panel; the original probes scanned an unrendered tree. See the correction | [LIMITATIONS.md](LIMITATIONS.md) |
 | **Stale message keys from before the occurrence-aware format** | At most one extra row per repeated message still in the visible tail, once | [MIGRATION.md](MIGRATION.md) |
 | **Sending requires an interactive desktop** | Over a disconnected RDP session or a locked workstation, messages queue and wait; reading continues | [LIMITATIONS.md](LIMITATIONS.md) |
-| **`external_id` is four digits and can collide** | An ambiguous id is refused with `409`, never guessed; use the full number or exact name | [SEND_API.md](SEND_API.md) |
+| **Two chats can share an exact name** | An ambiguous id is refused with `409`, never guessed; use the full number, or the `chat_id` for a group | [SEND_API.md](SEND_API.md) |
 | **Chat identity is hashed from the display name** | Renaming a contact creates a new chat here | [DATA.md](DATA.md) |
 | **A conversation read costs 1.6–5.8 s**, scaling with rendered bubbles | Bounds throughput; the queue absorbs bursts | §2 |
 | **RDP disconnect and reconnect: never tested for real** | Simulated only | below |

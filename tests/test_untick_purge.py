@@ -174,7 +174,6 @@ def test_the_configured_number_and_webhook_survive(engine):
     instance, repo = engine
     chat = populate(repo, "Alice")
     chat.phone_number = "917981149423"
-    chat.external_id = "9423"
     chat.webhook_override = "https://custom.test/hook"
     repo.save_chat(chat)
 
@@ -182,7 +181,6 @@ def test_the_configured_number_and_webhook_survive(engine):
 
     after = repo.get_chat(chat.chat_id)
     assert after.phone_number == "917981149423"
-    assert after.external_id == "9423"
     assert after.webhook_override == "https://custom.test/hook"
 
 
@@ -303,3 +301,81 @@ def test_an_unknown_chat_is_a_no_op(engine):
 
     assert repo.chat_record_counts(chat_id_for("Alice")) == {
         "messages": 3, "webhooks": 2, "outgoing": 1}
+
+
+# ---------------------------------------------------------------------------
+# Retiring the four-digit contact id
+# ---------------------------------------------------------------------------
+
+
+def test_the_legacy_contact_id_is_unset_on_startup(tmp_path: Path):
+    """A stored field nothing reads is a trap for whoever queries wa_events
+    next. `from_document` already ignores it; this removes it."""
+    from wadam.config import Settings
+
+    settings = Settings(mongodb_uri="mongodb://localhost:27017",
+                        json_backup_folder=tmp_path, json_autosave_interval=0,
+                        webhook_template="https://x.test/?{phone_number}")
+    backup = JsonBackupStore(tmp_path, autosave_interval=0)
+    backup.ensure_folder()
+    mongo = FakeMongo()
+    mongo.chat_configs.insert_one({
+        "chat_id": chat_id_for("Novus Tech Group"), "chat_name": "Novus Tech Group",
+        "external_id": "1725", "phone_number": "918522061725",
+        "is_group": False, "phone_probed_at": "2026-08-12T09:00:00+00:00"})
+    repository = Repository(settings, mongo, backup)
+    repository.start()
+    try:
+        stored = mongo.chat_configs.find_one({"chat_name": "Novus Tech Group"})
+        assert "external_id" not in stored
+    finally:
+        repository.stop()
+
+
+def test_a_chat_probed_by_an_older_build_is_probed_again(tmp_path: Path):
+    """`is_group` used to be a sidebar guess and is now a panel reading, but a
+    chat is only probed once. Without re-arming, a chat an older build probed
+    would keep its guess forever — and one really was stored as
+    `is_group=False` with a number, with nothing to say a panel ever agreed."""
+    from wadam.config import Settings
+
+    settings = Settings(mongodb_uri="mongodb://localhost:27017",
+                        json_backup_folder=tmp_path, json_autosave_interval=0,
+                        webhook_template="https://x.test/?{phone_number}")
+    backup = JsonBackupStore(tmp_path, autosave_interval=0)
+    backup.ensure_folder()
+    mongo = FakeMongo()
+    mongo.chat_configs.insert_one({
+        "chat_id": chat_id_for("Novus Tech Group"), "chat_name": "Novus Tech Group",
+        "external_id": "1725", "is_group": False,
+        "phone_probed_at": "2026-08-12T09:00:00+00:00"})
+    repository = Repository(settings, mongo, backup)
+    repository.start()
+    try:
+        assert repository.get_chat(chat_id_for("Novus Tech Group")).phone_probed_at is None
+    finally:
+        repository.stop()
+
+
+def test_a_chat_written_by_this_build_is_left_alone(tmp_path: Path):
+    """The legacy key is what marks an old row, so a chat without one must not
+    have its probe marker cleared — that would re-probe every chat on every
+    restart."""
+    from wadam.config import Settings
+    from wadam.domain.models import utcnow
+
+    settings = Settings(mongodb_uri="mongodb://localhost:27017",
+                        json_backup_folder=tmp_path, json_autosave_interval=0,
+                        webhook_template="https://x.test/?{phone_number}")
+    backup = JsonBackupStore(tmp_path, autosave_interval=0)
+    backup.ensure_folder()
+    mongo = FakeMongo()
+    mongo.chat_configs.insert_one({
+        "chat_id": chat_id_for("Alice"), "chat_name": "Alice",
+        "is_group": False, "phone_probed_at": utcnow()})
+    repository = Repository(settings, mongo, backup)
+    repository.start()
+    try:
+        assert repository.get_chat(chat_id_for("Alice")).phone_probed_at is not None
+    finally:
+        repository.stop()

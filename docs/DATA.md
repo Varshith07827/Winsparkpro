@@ -10,7 +10,7 @@ these is — and is not — matters.
 | Identifier | Source | Purpose | Unique? | Can change? | Safe to route on? |
 |---|---|---|---|---|---|
 | `chat_id` | sha1 of the chat **name** | primary key for a chat | yes | **yes** — renaming a contact creates a new chat | yes, within a run |
-| `external_id` | last 4 digits of the number, derived at discovery | what `POST /wam/` addresses | **no** — 10,000 values | only if the number does | yes, and an ambiguous one is **refused** |
+
 | `phone_number` | the chat name when it IS a number | identity; builds the relay URL | yes | rarely | yes |
 | `chat_name` | what WhatsApp displays | display, and the sender's target | no | **yes** | as a fallback only |
 | `message_key` | sha1 of chat+sender+text+time+direction | incoming dedup | yes, by construction | no | never — dedup only |
@@ -19,12 +19,14 @@ these is — and is not — matters.
 
 Three rules worth stating plainly:
 
-* **`external_id` is not `phone_number`.** It is the last four digits of it.
-  `918106972933` has `external_id` `2933`, and a second contact ending `2933`
-  collides. The resolver refuses an ambiguous id rather than picking one.
-* **A number is never invented.** A saved contact exposes none, so it has an
-  empty `phone_number`, an empty `external_id`, and cannot be addressed by
-  number at all — only by name.
+* **There is no short id.** The four-digit `external_id` was how `POST /wam/`
+  addressed a chat, and it is gone. Four digits is 10,000 values, so two
+  contacts sharing one is likely rather than exotic, and the failure it
+  produces is the worst available here — a message delivered quietly to the
+  wrong person. The full number costs the caller nothing and cannot collide.
+* **A number is never invented.** A chat whose number is unknown has an empty
+  `phone_number` and cannot be addressed by number at all — only by name.
+  **A group never has one**, because it has no single contact.
 * **`chat_id` follows the display name**, because WhatsApp exposes no durable
   chat identifier. Renaming a contact makes a new chat here.
 
@@ -51,7 +53,7 @@ through a dialog.
 | `chat_id` | string | **unique index.** SHA-1 of the case-folded, space-collapsed name, 24 hex chars |
 | `chat_name` | string | indexed. The display name as WhatsApp renders it |
 | `webhook_url` | string | `""` = no webhook. Set from `DEFAULT_WEBHOOK` for new chats |
-| `external_id` | string | the contact ID the [send API](SEND_API.md) addresses this chat by — last 4 digits of the number, auto-filled when the chat name is a number |
+| `is_group` | bool | a group, community or channel — **read from the info panel**, not guessed from the sidebar. A group never has a `phone_number`, so it is addressed by name |
 | `automation_enabled` | bool | **always `false` on discovery** |
 | `last_message_preview` | string | mirror of the sidebar row |
 | `timestamp_text` | string | as WhatsApp renders it: `"12:04"`, `"Yesterday"` |

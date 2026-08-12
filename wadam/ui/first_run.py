@@ -122,9 +122,11 @@ def validate(mongodb_uri: str, webhook_template: str) -> str:
         return "Enter the webhook URL."
     if not template.startswith(("http://", "https://")):
         return "The webhook URL should start with http:// or https://."
-    if constants.PHONE_PLACEHOLDER not in template:
+    if (constants.PHONE_PLACEHOLDER not in template
+            and constants.CHAT_NAME_PLACEHOLDER not in template):
         return (f"Keep {constants.PHONE_PLACEHOLDER} in the webhook URL — it is "
-                f"replaced with each chat's phone number.")
+                f"replaced with each chat's number. Without a placeholder every "
+                f"chat would post to the same URL.")
     return ""
 
 
@@ -165,11 +167,17 @@ class FirstRunDialog(QDialog):
 
         layout.addWidget(self._label("Webhook URL"))
         self._webhook = QLineEdit(webhook_template)
+        # A placeholder, not a value: the field starts EMPTY and Start is
+        # refused until it is filled in. Prefilling a real endpoint would ship
+        # every install pointing at somebody else's server.
+        self._webhook.setPlaceholderText(constants.WEBHOOK_TEMPLATE_EXAMPLE)
         self._webhook.textChanged.connect(self._clear_feedback)
         layout.addWidget(self._webhook)
 
         hint = QLabel(f"{constants.PHONE_PLACEHOLDER} is replaced with each "
-                      f"chat's phone number.")
+                      f"chat's number, and {constants.CHAT_NAME_PLACEHOLDER} "
+                      f"with its name. A group has no number, so it is "
+                      f"addressed by name.")
         hint.setObjectName("fieldHint")
         hint.setWordWrap(True)
         layout.addWidget(hint)

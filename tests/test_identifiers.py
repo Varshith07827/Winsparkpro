@@ -1,16 +1,24 @@
-"""Seven identifiers, none interchangeable.
+"""Six identifiers, none interchangeable.
 
-`POST /wam/ {"id": "2933"}` has to reach one chat and no other, so what each
-identifier is — and is not — has to be pinned rather than assumed. The audit
-that produced this file is in docs/DATA.md.
+`POST /wam/ {"id": "918106972933"}` has to reach one chat and no other, so what
+each identifier is — and is not — has to be pinned rather than assumed. The
+audit that produced this file is in docs/DATA.md.
 
     chat_id         sha1 of the chat NAME. Stable while the name is. Routing: yes.
-    external_id     last 4 digits. What /wam/ addresses. NOT unique by nature.
-    phone_number    full digits. Identity. Empty when unknown, never guessed.
-    chat_name       what WhatsApp displays. Changes. Not an identifier.
+    phone_number    full digits. Identity, and how a 1:1 chat is addressed.
+                    Empty when unknown, never guessed. A GROUP never has one.
+    chat_name       what WhatsApp displays. Changes — but it is how a group is
+                    addressed, because a group has no number.
     message_key     content hash of an incoming bubble. Dedup.
     outgoing_id     uuid4 per queued message. Unique forever.
     correlation_id  one message's thread through the logs.
+
+**The four-digit `external_id` is gone.** It was the primary way `/wam/`
+addressed a chat, derived from the last four digits of a number. Four digits is
+10,000 values, so with a few hundred chats a collision is likely rather than
+exotic (the birthday bound puts it above even odds at ~118 chats) — and the
+failure it produces is the worst one available here: a message delivered
+quietly to the wrong person. It bought nothing the full number does not.
 """
 
 from __future__ import annotations
@@ -19,13 +27,12 @@ from pathlib import Path
 
 import pytest
 
-from wadam.api.resolver import resolve_chat, suggest_external_id
+from wadam.api.resolver import resolve_chat
 from wadam.config import Settings
 from wadam.domain.models import (
     ChatConfig,
     OutgoingMessage,
     chat_id_for,
-    contact_id_for,
     message_key_for,
     phone_digits,
 )
@@ -34,9 +41,9 @@ from wadam.storage.repository import Repository
 from tests.test_storage import FakeMongo
 
 
-def _chat(name, phone="", external="") -> ChatConfig:
+def _chat(name, phone="", is_group=False) -> ChatConfig:
     return ChatConfig(chat_id=chat_id_for(name), chat_name=name,
-                      phone_number=phone, external_id=external)
+                      phone_number=phone, is_group=is_group)
 
 
 # ---------------------------------------------------------------------------
@@ -55,15 +62,13 @@ def test_renaming_a_contact_produces_a_different_chat():
     assert chat_id_for("Alice") != chat_id_for("Alice Smith")
 
 
-def test_external_id_is_the_last_four_digits_not_the_number():
-    assert contact_id_for("918106972933") == "2933"
-    assert contact_id_for("+91 81069 72933") == "2933"
-
-
-def test_external_id_and_phone_number_are_not_interchangeable():
-    chat = _chat("+91 81069 72933", phone="918106972933", external="2933")
-    assert chat.external_id != chat.phone_number
-    assert chat.phone_number.endswith(chat.external_id)
+def test_a_group_is_addressed_by_name_because_it_has_no_number():
+    """Not a limitation to work around. A group has no single contact, so any
+    number attached to one would be somebody else's."""
+    group = _chat("Novus Tech Group", is_group=True)
+    assert group.phone_number == ""
+    result = resolve_chat([group], "Novus Tech Group")
+    assert result.ok and result.matched_by == "chat_name"
 
 
 def test_phone_digits_normalises_every_spelling():
@@ -74,8 +79,6 @@ def test_phone_digits_normalises_every_spelling():
 
 def test_an_unknown_number_is_empty_never_invented():
     assert phone_digits("Alice") == ""
-    assert contact_id_for("Alice") == ""
-    assert suggest_external_id(_chat("Alice")) == ""
 
 
 def test_message_key_distinguishes_direction():
@@ -96,10 +99,10 @@ def test_outgoing_id_is_unique_per_queued_message():
 
 
 def test_the_api_id_resolves_to_exactly_one_chat():
-    chats = [_chat("+91 81069 72933", "918106972933", "2933"), _chat("Alice")]
-    result = resolve_chat(chats, "2933")
+    chats = [_chat("+91 81069 72933", "918106972933"), _chat("Alice")]
+    result = resolve_chat(chats, "918106972933")
     assert result.ok and result.chat.chat_name == "+91 81069 72933"
-    assert result.matched_by == "external_id"
+    assert result.matched_by == "phone_number"
 
 
 def test_an_unknown_id_resolves_to_nothing_rather_than_a_guess():
@@ -108,31 +111,33 @@ def test_an_unknown_id_resolves_to_nothing_rather_than_a_guess():
     assert not result.ambiguous
 
 
-def test_a_duplicate_external_id_is_refused_not_picked():
-    """Four digits is 10,000 values. Sending to the wrong person is the one
-    failure this must never produce quietly."""
-    chats = [_chat("+91 81069 72933", "918106972933", "2933"),
-             _chat("+44 7700 902933", "447700902933", "2933")]
+def test_the_last_four_digits_no_longer_address_anything():
+    """The removal, stated as a test so it cannot creep back.
+
+    These two contacts shared a four-digit id and used to be an `ambiguous_id`
+    409. Now "2933" is simply not an identifier, and an identifier nothing
+    recognises sends nothing."""
+    chats = [_chat("+91 81069 72933", "918106972933"),
+             _chat("+44 7700 902933", "447700902933")]
     result = resolve_chat(chats, "2933")
     assert not result.ok
-    assert result.ambiguous
-    assert len(result.candidates) == 2
+    assert not result.ambiguous
 
 
-def test_a_full_number_resolves_even_when_the_short_id_is_ambiguous():
-    chats = [_chat("+91 81069 72933", "918106972933", "2933"),
-             _chat("+44 7700 902933", "447700902933", "2933")]
-    result = resolve_chat(chats, "918106972933")
-    assert result.ok and result.matched_by == "phone_number"
+def test_two_contacts_sharing_a_suffix_are_told_apart_by_their_numbers():
+    """What replaces it: the thing that used to collide now simply resolves."""
+    chats = [_chat("+91 81069 72933", "918106972933"),
+             _chat("+44 7700 902933", "447700902933")]
+    assert resolve_chat(chats, "918106972933").chat.chat_name == "+91 81069 72933"
+    assert resolve_chat(chats, "447700902933").chat.chat_name == "+44 7700 902933"
 
 
-def test_a_saved_contact_cannot_be_addressed_by_number(_no_number=None):
-    """The documented limitation, stated as a test so it cannot regress into a
-    silent guess. A saved contact exposes no number, so it has no external_id
-    and `/wam/` cannot reach it by one."""
+def test_a_chat_with_no_number_cannot_be_addressed_by_one():
+    """No guessing. A chat whose number is unknown is not reachable by any
+    number, rather than by one inferred from its name."""
     chats = [_chat("Varshith")]
-    assert suggest_external_id(chats[0]) == ""
     assert not resolve_chat(chats, "9423").ok
+    assert not resolve_chat(chats, "917981149423").ok
 
 
 def test_a_saved_contact_is_still_addressable_by_name():
@@ -159,7 +164,7 @@ def repo(tmp_path: Path) -> Repository:
 
 
 def test_the_identifiers_survive_a_restart(repo, tmp_path: Path):
-    repo.save_chat(_chat("+91 81069 72933", "918106972933", "2933"))
+    repo.save_chat(_chat("+91 81069 72933", "918106972933"))
     repo.flush_json(force=True)
 
     settings = Settings(mongodb_uri="mongodb://localhost:27017",
@@ -169,18 +174,16 @@ def test_the_identifiers_survive_a_restart(repo, tmp_path: Path):
     try:
         chat = restarted.list_chats()[0]
         assert chat.phone_number == "918106972933"
-        assert chat.external_id == "2933"
         assert chat.chat_id == chat_id_for("+91 81069 72933")
-        assert resolve_chat(restarted.list_chats(), "2933").ok
+        assert resolve_chat(restarted.list_chats(), "918106972933").ok
     finally:
         restarted.stop()
 
 
 def test_the_ambiguity_response_tells_the_caller_what_to_use_instead(tmp_path: Path):
-    """A 409 that said "set a distinct contact ID" pointed at a configuration
-    field the simplified product no longer has. The advice has to be something
-    the caller can actually act on, so it names the identifiers that do not
-    collide."""
+    """Two chats with the same exact name is the only way to be ambiguous now.
+    The advice has to be something the caller can act on, so it names the
+    identifiers that do not collide."""
     from tests.test_send_api import FakeEngine
     from wadam.api.host import SendApiHost
 
@@ -191,17 +194,20 @@ def test_the_ambiguity_response_tells_the_caller_what_to_use_instead(tmp_path: P
     repository = Repository(settings, FakeMongo(), backup)
     repository.start()
     try:
-        repository.save_chat(_chat("+91 81069 72933", "918106972933", "2933"))
-        repository.save_chat(_chat("+44 7700 902933", "447700902933", "2933"))
+        first = _chat("Project")
+        second = _chat("Project")
+        second.chat_id = "a-second-chat-of-the-same-name"
+        repository.save_chat(first)
+        repository.save_chat(second)
         host = SendApiHost(settings, repository, FakeEngine())
 
-        response = host._send("2933", "must not be sent")
+        response = host._send("Project", "must not be sent")
 
         assert response.status == 409
         assert response.payload["code"] == "ambiguous_id"
         assert len(response.payload["candidates"]) == 2
         assert "phone_number" in response.payload["resolves_by"]
+        assert "external_id" not in response.payload["resolves_by"]
         assert "full phone number" in response.payload["error"]
-        assert "LAST FOUR DIGITS" in response.payload["error"]
     finally:
         repository.stop()

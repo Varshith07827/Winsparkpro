@@ -17,11 +17,14 @@ from wadam.whatsapp.row_parser import parse_chat_row
 
 from tests.test_storage import FakeMongo
 
+WEBHOOK = "https://x.test/?{phone_number}"
+
 
 def make_repo(tmp_path: Path, default_webhook: str = "") -> tuple[Repository, Settings]:
     settings = Settings(mongodb_uri="mongodb://localhost:27017", database_name="test",
                         json_backup_folder=tmp_path, json_autosave_interval=0,
-                        default_webhook=default_webhook)
+                        default_webhook=default_webhook,
+                        webhook_template=WEBHOOK)
     backup = JsonBackupStore(tmp_path, autosave_interval=0)
     backup.ensure_folder()
     repository = Repository(settings, FakeMongo(), backup)
@@ -186,13 +189,57 @@ def test_an_override_beats_the_template(discovery):
     assert repository.get_chat(chat.chat_id).webhook_url == "https://elsewhere.test/hook"
 
 
-def test_group_hint_is_sticky(discovery):
+def test_the_group_hint_follows_the_sidebar_until_the_panel_speaks(discovery):
+    """`is_group` starts as a guess from the preview and stays a guess.
+
+    It used to be sticky — once true, true forever — on the reasoning that a
+    group's preview only carries a speaker prefix when someone else spoke last.
+    That also made a single false positive permanent, and one was measured: a
+    real 1:1 chat whose Contact info panel produced a number was flagged as a
+    group. A guess that cannot be revised is worse than one that can."""
     engine_discovery, repository = discovery
     engine_discovery.sync([row("Team", message="Chaitu: hello")])
     assert repository.get_chat(chat_id_for("Team")).is_group is True
-    # Our own message next — the row no longer looks like a group, but it is one.
+
     engine_discovery.sync([row("Team", message="You: ok")])
-    assert repository.get_chat(chat_id_for("Team")).is_group is True
+    assert repository.get_chat(chat_id_for("Team")).is_group is False
+
+
+def test_the_panel_verdict_outranks_every_later_sidebar_reading(discovery):
+    """Once the info panel has been read — which `phone_probed_at` records —
+    what it saw is fact and the preview heuristic stops touching it."""
+    from wadam.domain.models import utcnow
+
+    engine_discovery, repository = discovery
+    engine_discovery.sync([row("Team", message="Chaitu: hello")])
+    chat = repository.get_chat(chat_id_for("Team"))
+    chat.is_group = False              # the panel said "Contact info"
+    chat.phone_probed_at = utcnow()
+    repository.save_chat(chat)
+
+    engine_discovery.sync([row("Team", message="Chaitu: hello again")])
+
+    assert repository.get_chat(chat_id_for("Team")).is_group is False
+
+
+def test_a_confirmed_group_never_takes_a_number_from_its_name(discovery):
+    """A group has no single contact, so a number on one would be somebody
+    else's. Only the panel can confirm a group — the sidebar guess is not
+    allowed to withhold a real contact's number on its own."""
+    from wadam.domain.models import utcnow
+
+    engine_discovery, repository = discovery
+    engine_discovery.sync([row("+91 81069 72933")])
+    chat = repository.get_chat(chat_id_for("+91 81069 72933"))
+    assert chat.phone_number == "918106972933"
+
+    chat.phone_number = ""
+    chat.is_group = True
+    chat.phone_probed_at = utcnow()    # confirmed by the panel
+    repository.save_chat(chat)
+    engine_discovery.sync([row("+91 81069 72933", message="something new")])
+
+    assert repository.get_chat(chat_id_for("+91 81069 72933")).phone_number == ""
 
 
 def test_row_signature_covers_everything_the_sidebar_shows():

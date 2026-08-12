@@ -28,7 +28,7 @@ from wadam.api.host import SendApiHost
 from wadam.api.resolver import resolve_chat
 from wadam.api.server import SendApiServer, SendResponse
 from wadam.config import ConfigError, Settings, load_settings
-from wadam.domain.models import ChatConfig, MessageStatus, chat_id_for, contact_id_for
+from wadam.domain.models import ChatConfig, MessageStatus, chat_id_for
 from wadam.engine.engine import SendOutcome
 from wadam.storage.json_backup import JsonBackupStore
 from wadam.storage.repository import Repository
@@ -36,37 +36,9 @@ from wadam.storage.repository import Repository
 from tests.test_storage import FakeMongo
 
 
-def chat(name: str, external_id: str = "") -> ChatConfig:
-    return ChatConfig(chat_id=chat_id_for(name), chat_name=name, external_id=external_id)
-
-
-# ---------------------------------------------------------------------------
-# Deriving a contact ID
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("name,expected", [
-    ("+1 (555) 010-9423", "9423"),
-    ("15550109423", "9423"),
-    ("+1 555 010 9423", "9423"),
-    ("919876543210", "3210"),
-])
-def test_a_number_yields_its_last_four_digits(name, expected):
-    assert contact_id_for(name) == expected
-
-
-@pytest.mark.parametrize("name", [
-    "Aarav Sharma",
-    "CSE - C 2023-27",       # digits, but a name
-    "Papa",
-    "Hostel Block B",
-    "",
-    "123",                    # too few digits to be a number
-])
-def test_a_name_yields_nothing_to_derive(name):
-    # A saved contact shows a name and never its number, so there is nothing to
-    # derive — those chats get their contact ID typed in.
-    assert contact_id_for(name) == ""
+def chat(name: str, phone_number: str = "") -> ChatConfig:
+    return ChatConfig(chat_id=chat_id_for(name), chat_name=name,
+                      phone_number=phone_number)
 
 
 # ---------------------------------------------------------------------------
@@ -74,29 +46,28 @@ def test_a_name_yields_nothing_to_derive(name):
 # ---------------------------------------------------------------------------
 
 
-def test_an_explicit_contact_id_resolves():
-    chats = [chat("Aarav Sharma", "9423"), chat("Priya Nair", "1122")]
-    resolution = resolve_chat(chats, "9423")
+def test_a_full_number_resolves():
+    chats = [chat("Aarav Sharma", "15550109423"), chat("Priya Nair", "15550101122")]
+    resolution = resolve_chat(chats, "15550109423")
     assert resolution.ok
     assert resolution.chat.chat_name == "Aarav Sharma"
-    assert resolution.matched_by == "external_id"
+    assert resolution.matched_by == "phone_number"
 
 
-def test_a_numeric_chat_name_resolves_by_its_last_four():
-    chats = [chat("+1 (555) 010-9423"), chat("Priya Nair")]
-    resolution = resolve_chat(chats, "9423")
-    assert resolution.ok
-    assert resolution.matched_by == "contact_last4"
+def test_any_spelling_of_the_same_number_resolves():
+    """A caller should not have to know which spelling this application
+    happens to store."""
+    chats = [chat("Aarav Sharma", "15550109423")]
+    for spelling in ("15550109423", "+1 555 010 9423", "+1 (555) 010-9423"):
+        assert resolve_chat(chats, spelling).ok, spelling
 
 
-def test_an_explicit_id_outranks_a_derived_one():
-    """Someone typed "9423" against Priya. That is a deliberate assignment and
-    beats a number that merely happens to end the same way."""
-    chats = [chat("+1 (555) 010-9423"), chat("Priya Nair", "9423")]
-    resolution = resolve_chat(chats, "9423")
-    assert resolution.ok
-    assert resolution.chat.chat_name == "Priya Nair"
-    assert resolution.matched_by == "external_id"
+def test_the_last_four_digits_resolve_nothing():
+    """Removed. Four digits is 10,000 values, so two contacts sharing one is
+    likely rather than exotic, and the failure it produces is a message
+    delivered quietly to the wrong person."""
+    chats = [chat("+1 (555) 010-9423", "15550109423"), chat("Priya Nair")]
+    assert not resolve_chat(chats, "9423").ok
 
 
 def test_chat_id_and_name_also_resolve():
@@ -107,27 +78,29 @@ def test_chat_id_and_name_also_resolve():
 
 def test_two_chats_sharing_an_id_are_refused_not_guessed():
     """The failure this whole module exists to prevent."""
-    chats = [chat("Aarav", "9423"), chat("Priya", "9423")]
-    resolution = resolve_chat(chats, "9423")
+    chats = [chat("Aarav", "15550109423"), chat("Priya", "15550109423")]
+    resolution = resolve_chat(chats, "15550109423")
 
     assert not resolution.ok
     assert resolution.ambiguous
     assert resolution.candidates == ("Aarav", "Priya")
 
 
-def test_two_numbers_ending_the_same_way_are_refused():
-    chats = [chat("+1 (555) 010-9423"), chat("+1 (555) 018-9423")]
-    resolution = resolve_chat(chats, "9423")
-    assert not resolution.ok
-    assert resolution.ambiguous
+def test_two_numbers_ending_the_same_way_now_resolve_separately():
+    """These used to collide on their last four digits and be refused. The full
+    number tells them apart, which is the point of the removal."""
+    chats = [chat("+1 (555) 010-9423", "15550109423"),
+             chat("+1 (555) 018-9423", "15550189423")]
+    assert resolve_chat(chats, "15550109423").chat.chat_name == "+1 (555) 010-9423"
+    assert resolve_chat(chats, "15550189423").chat.chat_name == "+1 (555) 018-9423"
 
 
 def test_an_ambiguous_tier_does_not_fall_through_to_a_cleaner_one():
-    """Two chats answer to this by contact ID. Continuing to the name tier
-    would find a single tidy match and send there — which is precisely the
-    wrong answer."""
-    chats = [chat("Aarav", "9423"), chat("Priya", "9423"), chat("9423")]
-    resolution = resolve_chat(chats, "9423")
+    """Two chats answer to this number. Continuing to the name tier would find
+    a single tidy match and send there — precisely the wrong answer."""
+    chats = [chat("Aarav", "15550109423"), chat("Priya", "15550109423"),
+             chat("15550109423")]
+    resolution = resolve_chat(chats, "15550109423")
     assert not resolution.ok
     assert resolution.ambiguous
 
@@ -139,7 +112,7 @@ def test_an_unknown_id_resolves_to_nothing():
 
 
 def test_an_empty_id_resolves_to_nothing():
-    assert not resolve_chat([chat("Alice", "9423")], "   ").ok
+    assert not resolve_chat([chat("Alice", "15550109423")], "   ").ok
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +124,7 @@ def write_env(tmp_path: Path, extra: str) -> Path:
     path = tmp_path / ".env"
     path.write_text(
         "MONGODB_URI=mongodb://localhost:27017\nDATABASE_NAME=wadam\n"
+        "WEBHOOK_URL=https://x.test/?{phone_number}\n"
         f"JSON_BACKUP_FOLDER={tmp_path / 'backup'}\n{extra}\n",
         encoding="utf-8",
     )
@@ -243,18 +217,18 @@ def post(url: str, body, token: str | None = TOKEN, path: str = "/"):
 
 def test_a_valid_request_reaches_the_sender(api):
     url, recorder = api
-    status, payload = post(url, {"id": "9423", "message": "Hello Varshith"})
+    status, payload = post(url, {"id": "15550109423", "message": "Hello Varshith"})
     assert status == 200
     assert payload["ok"] is True
-    assert recorder.calls == [("9423", "Hello Varshith")]
+    assert recorder.calls == [("15550109423", "Hello Varshith")]
 
 
 def test_the_documented_curl_shape_works(api):
     """Exactly the request format this was built for."""
     url, recorder = api
-    status, _ = post(url, b'{"id":"9423","message":"Hello Varshith"}', path="/wam/")
+    status, _ = post(url, b'{"id":"15550109423","message":"Hello Varshith"}', path="/wam/")
     assert status == 200
-    assert recorder.calls == [("9423", "Hello Varshith")]
+    assert recorder.calls == [("15550109423", "Hello Varshith")]
 
 
 def test_every_send_path_is_accepted(api):
@@ -280,11 +254,11 @@ def test_an_open_listener_accepts_a_request_with_no_token():
     server.start()
     try:
         url = f"http://127.0.0.1:{server._httpd.server_address[1]}"
-        status, payload = post(url, {"id": "9423", "message": "Hello Varshith"}, token=None)
+        status, payload = post(url, {"id": "15550109423", "message": "Hello Varshith"}, token=None)
     finally:
         server.stop()
     assert status == 200 and payload["ok"] is True
-    assert recorder.calls == [("9423", "Hello Varshith")]
+    assert recorder.calls == [("15550109423", "Hello Varshith")]
     assert server.authentication_required is False
 
 
@@ -297,7 +271,7 @@ def test_a_configured_token_is_still_enforced(api):
 
 def test_a_request_without_a_token_is_refused(api):
     url, recorder = api
-    status, payload = post(url, {"id": "9423", "message": "Hello"}, token=None)
+    status, payload = post(url, {"id": "15550109423", "message": "Hello"}, token=None)
     assert status == 401
     assert payload["code"] == "unauthorized"
     assert recorder.calls == [], "nothing may be sent without authentication"
@@ -305,7 +279,7 @@ def test_a_request_without_a_token_is_refused(api):
 
 def test_a_wrong_token_is_refused(api):
     url, recorder = api
-    status, _ = post(url, {"id": "9423", "message": "Hello"}, token="w" * 32)
+    status, _ = post(url, {"id": "15550109423", "message": "Hello"}, token="w" * 32)
     assert status == 401
     assert recorder.calls == []
 
@@ -323,8 +297,8 @@ def test_an_x_api_token_header_also_works(api):
     (b"not json", "bad_json"),
     (b"[1,2,3]", "bad_json"),
     ({"message": "no id"}, "missing_id"),
-    ({"id": "9423"}, "missing_message"),
-    ({"id": "9423", "message": "   "}, "missing_message"),
+    ({"id": "15550109423"}, "missing_message"),
+    ({"id": "15550109423", "message": "   "}, "missing_message"),
 ])
 def test_malformed_requests_are_rejected_with_a_reason(api, body, code):
     url, recorder = api
@@ -335,11 +309,11 @@ def test_malformed_requests_are_rejected_with_a_reason(api, body, code):
 
 
 def test_an_unquoted_numeric_id_is_accepted(api):
-    # {"id": 9423} rather than {"id": "9423"} is the commonest integration slip,
+    # {"id": 9423} rather than {"id": "15550109423"} is the commonest integration slip,
     # and refusing it would teach nobody anything.
     url, recorder = api
-    assert post(url, {"id": 9423, "message": "x"})[0] == 200
-    assert recorder.calls == [("9423", "x")]
+    assert post(url, {"id": 15550109423, "message": "x"})[0] == 200
+    assert recorder.calls == [("15550109423", "x")]
 
 
 def test_message_aliases_are_understood(api):
@@ -466,14 +440,14 @@ def host(tmp_path: Path):
 
 def test_a_resolved_send_reports_which_chat_it_reached(host):
     api_host, repo, engine = host
-    repo.save_chat(chat("Aarav Sharma", "9423"))
+    repo.save_chat(chat("Aarav Sharma", "15550109423"))
 
-    response = api_host._send("9423", "Hello Varshith")
+    response = api_host._send("15550109423", "Hello Varshith")
 
     # 202, not 200: the message is queued, not yet delivered.
     assert response.status == 202
     assert response.payload["chat"] == "Aarav Sharma"
-    assert response.payload["matched_by"] == "external_id"
+    assert response.payload["matched_by"] == "phone_number"
     assert response.payload["status"] == "queued"
     assert response.payload["outgoing_id"] == "q1"
 
@@ -485,9 +459,9 @@ def test_a_send_is_queued_rather_than_performed_inline(host):
     twenty connections open for minutes. Blocking here is what produced
     `timeout` responses for messages that had actually been delivered."""
     api_host, repo, engine = host
-    repo.save_chat(chat("Aarav Sharma", "9423"))
+    repo.save_chat(chat("Aarav Sharma", "15550109423"))
 
-    api_host._send("9423", "Hello")
+    api_host._send("15550109423", "Hello")
 
     assert engine.calls == ["queue_message"], (
         "the API must enqueue, not call the blocking send path"
@@ -521,10 +495,10 @@ def test_an_unknown_status_id_is_404(host):
 
 def test_an_ambiguous_id_returns_409_and_names_the_conflict(host):
     api_host, repo, _engine = host
-    repo.save_chat(chat("Aarav", "9423"))
-    repo.save_chat(chat("Priya", "9423"))
+    repo.save_chat(chat("Aarav", "15550109423"))
+    repo.save_chat(chat("Priya", "15550109423"))
 
-    response = api_host._send("9423", "Hello")
+    response = api_host._send("15550109423", "Hello")
 
     assert response.status == 409
     assert response.payload["code"] == "ambiguous_id"
@@ -536,20 +510,23 @@ def test_an_ambiguous_id_returns_409_and_names_the_conflict(host):
 
 def test_an_unknown_id_returns_404_with_the_fix(host):
     api_host, repo, _engine = host
-    repo.save_chat(chat("Aarav", "9423"))
+    repo.save_chat(chat("Aarav", "15550109423"))
 
     response = api_host._send("0000", "Hello")
 
     assert response.status == 404
-    assert "last four digits" in response.payload["error"]
+    assert "full phone number" in response.payload["error"]
+    assert "last four" not in response.payload["error"], (
+        "the short id is gone; advice pointing at it would send nobody anywhere"
+    )
 
 
 def test_a_failed_send_is_502_not_200(host):
     api_host, repo, engine = host
-    repo.save_chat(chat("Aarav", "9423"))
+    repo.save_chat(chat("Aarav", "15550109423"))
     engine.outcome = SendOutcome(False, error="the compose box still had text")
 
-    response = api_host._send("9423", "Hello")
+    response = api_host._send("15550109423", "Hello")
 
     assert response.status == 502
     assert response.payload["ok"] is False
@@ -558,10 +535,10 @@ def test_a_failed_send_is_502_not_200(host):
 
 def test_an_unavailable_engine_is_503(host):
     api_host, repo, engine = host
-    repo.save_chat(chat("Aarav", "9423"))
+    repo.save_chat(chat("Aarav", "15550109423"))
     engine.raise_on_submit = RuntimeError("The engine is not running.")
 
-    response = api_host._send("9423", "Hello")
+    response = api_host._send("15550109423", "Hello")
     assert response.status == 503
 
 
@@ -593,7 +570,7 @@ def test_an_api_send_is_stored_like_any_other_message(tmp_path: Path):
             return SendResult.succeeded("uia-value-pattern + send-button-invoke")
 
     engine._sender = Sender()
-    target = chat("Aarav Sharma", "9423")
+    target = chat("Aarav Sharma", "15550109423")
     repository.save_chat(target)
 
     outcome = asyncio.run(engine.send_message(target.chat_id, "Hello Varshith"))
@@ -630,7 +607,7 @@ def test_a_failed_api_send_records_nothing_as_sent(tmp_path: Path):
             return SendResult.failed("the compose box still had text")
 
     engine._sender = Sender()
-    target = chat("Aarav Sharma", "9423")
+    target = chat("Aarav Sharma", "15550109423")
     repository.save_chat(target)
 
     outcome = asyncio.run(engine.send_message(target.chat_id, "Hello"))
@@ -669,14 +646,14 @@ def test_a_numeric_chat_gets_a_contact_id_on_discovery(tmp_path: Path):
     result = discovery.sync(rows)
     by_name = {c.chat_name: c for c in result.seen}
 
-    assert by_name["+1 (555) 010-9423"].external_id == "9423"
-    # A saved contact has no number to derive from — left empty for someone to
-    # fill in, not guessed at.
-    assert by_name["Aarav Sharma"].external_id == ""
+    assert by_name["+1 (555) 010-9423"].phone_number == "15550109423"
+    # A saved contact shows a name, never a number — left empty for the
+    # contact-info panel to fill in, not guessed at.
+    assert by_name["Aarav Sharma"].phone_number == ""
     repository.stop()
 
 
-def test_a_hand_set_contact_id_is_never_overwritten(tmp_path: Path):
+def test_a_hand_set_number_is_never_overwritten(tmp_path: Path):
     from wadam.engine.discovery import ChatDiscovery
     from wadam.whatsapp.reader import ChatRow
     from wadam.whatsapp.row_parser import parse_chat_row
@@ -691,12 +668,12 @@ def test_a_hand_set_contact_id_is_never_overwritten(tmp_path: Path):
 
     discovery.sync([ChatRow(**parse_chat_row("Aarav Sharma 12:00 pm hi"))])
     stored = repository.get_chat(chat_id_for("Aarav Sharma"))
-    stored.external_id = "7777"
+    stored.phone_number = "919876543210"
     repository.save_chat(stored)
 
     discovery.sync([ChatRow(**parse_chat_row("Aarav Sharma 12:05 pm something new"))])
 
-    assert repository.get_chat(chat_id_for("Aarav Sharma")).external_id == "7777"
+    assert repository.get_chat(chat_id_for("Aarav Sharma")).phone_number == "919876543210"
     repository.stop()
 
 

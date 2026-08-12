@@ -80,7 +80,7 @@ def test_the_probe_never_presses_escape_blindly():
     an Escape that runs before the open-state check."""
     import inspect
 
-    source = inspect.getsource(S.read_contact_number_sync)
+    source = inspect.getsource(S.read_contact_panel_sync)
     before_check = source.split("_contact_panel_open")[0]
     assert "{Esc}" not in before_check, (
         "Escape before knowing the panel state closes the user's conversation"
@@ -90,7 +90,7 @@ def test_the_probe_never_presses_escape_blindly():
 def test_escape_is_only_sent_when_the_probe_opened_the_panel():
     import inspect
 
-    source = inspect.getsource(S.read_contact_number_sync)
+    source = inspect.getsource(S.read_contact_panel_sync)
     assert "if opened_here:" in source
     assert source.index("if opened_here:") < source.index('"{Esc}"')
 
@@ -117,7 +117,9 @@ def test_a_missing_button_is_not_an_error(monkeypatch):
     """A chat with no header button must return "" rather than raise — a
     lookup failure can never be allowed to break a scan."""
     monkeypatch.setattr(S, "_find_profile_button", lambda _h: None)
-    assert S.read_contact_number_sync(0) == ""
+    panel = S.read_contact_panel_sync(0)
+    assert panel.number == ""
+    assert panel.seen is False, "the panel never opened, so it said nothing"
 
 
 def test_a_group_panel_is_recognised_as_open(monkeypatch):
@@ -172,13 +174,14 @@ def test_a_contact_panel_is_not_treated_as_groupish(monkeypatch):
 class _Recorder:
     """A sender that counts how many times the panel was opened."""
 
-    def __init__(self, answer=""):
+    def __init__(self, answer="", title="Contact info"):
         self.answer = answer
+        self.title = title
         self.probes = 0
 
-    async def resolve_phone_number_async(self, _chat_name):
+    async def resolve_contact_panel_async(self, _chat_name):
         self.probes += 1
-        return self.answer
+        return S.ContactPanel(number=self.answer, title=self.title)
 
 
 def _engine_with(monkeypatch, tmp_path, sender):
@@ -287,3 +290,128 @@ def test_the_marker_survives_a_restart(tmp_path):
     finally:
         restarted.stop()
         repo.stop()
+
+
+# ---------------------------------------------------------------------------
+# A group takes no number, and the panel is what decides it is a group
+# ---------------------------------------------------------------------------
+
+
+def test_the_panel_reports_which_kind_of_chat_it_is():
+    """The number alone was not enough. "No number found" and "there is no
+    number to find" are different answers, and only the second one settles
+    whether a chat is a group."""
+    assert S.ContactPanel(title="Contact info").is_group is False
+    for title in ("Group info", "Community info", "Channel info"):
+        assert S.ContactPanel(title=title).is_group is True, title
+    assert S.ContactPanel().seen is False
+
+
+def test_a_group_is_recorded_as_one_and_takes_no_number(monkeypatch, tmp_path):
+    """A group has no single contact, so any number would be somebody else's."""
+    import asyncio
+
+    sender = _Recorder(answer="", title="Group info")
+    engine, repo = _engine_with(monkeypatch, tmp_path, sender)
+    chat = _chat(repo)
+
+    got = asyncio.run(engine.discover_phone_number(chat.chat_id))
+
+    after = repo.get_chat(chat.chat_id)
+    assert got == ""
+    assert after.phone_number == ""
+    assert after.is_group is True, "the panel said so, so it is recorded as fact"
+    assert after.phone_probed_at is not None
+
+
+def test_a_contact_panel_clears_a_wrong_group_guess(monkeypatch, tmp_path):
+    """The sidebar guesses `is_group` from whether a preview carries a speaker
+    prefix, and it was wrong for a real 1:1 chat. Once the panel has spoken,
+    what it said replaces the guess."""
+    import asyncio
+
+    sender = _Recorder(answer="+91 79811 49423", title="Contact info")
+    engine, repo = _engine_with(monkeypatch, tmp_path, sender)
+    chat = _chat(repo)
+    chat.is_group = True                      # the bad guess
+    repo.save_chat(chat)
+
+    got = asyncio.run(engine.discover_phone_number(chat.chat_id))
+
+    after = repo.get_chat(chat.chat_id)
+    assert got == "917981149423"
+    assert after.is_group is False
+    assert after.phone_number == "917981149423"
+
+
+def test_an_unread_panel_never_overwrites_what_is_known(monkeypatch, tmp_path):
+    """A panel that failed to open said nothing, and nothing is not evidence
+    that a chat is a one-to-one."""
+    import asyncio
+
+    sender = _Recorder(answer="", title="")   # never opened
+    engine, repo = _engine_with(monkeypatch, tmp_path, sender)
+    chat = _chat(repo)
+    chat.is_group = True
+    repo.save_chat(chat)
+
+    asyncio.run(engine.discover_phone_number(chat.chat_id))
+
+    assert repo.get_chat(chat.chat_id).is_group is True
+
+
+def test_a_member_number_on_a_group_panel_is_not_taken(monkeypatch, tmp_path):
+    """A "Group info" panel PRINTS numbers — its members'. The scan finds one
+    happily.
+
+    Measured on a real chat: "Novus Tech Group" produced a Group info panel and
+    the number +91 85220 61725, which an earlier build stored as the group's
+    own and built its webhook from. One member's personal number standing in
+    for a whole group is the kind of wrong that looks right on screen."""
+    import asyncio
+
+    sender = _Recorder(answer="+91 85220 61725", title="Group info")
+    engine, repo = _engine_with(monkeypatch, tmp_path, sender)
+    chat = _chat(repo, "Novus Tech Group")
+
+    got = asyncio.run(engine.discover_phone_number(chat.chat_id))
+
+    after = repo.get_chat(chat.chat_id)
+    assert got == ""
+    assert after.phone_number == "", "a member's number is not the group's"
+    assert after.is_group is True
+
+
+def test_a_number_an_older_build_stored_for_a_group_is_cleared(monkeypatch, tmp_path):
+    """Not just refused going forward — removed. Left alone it would keep
+    addressing the group by somebody's personal number forever."""
+    import asyncio
+
+    sender = _Recorder(answer="+91 85220 61725", title="Group info")
+    engine, repo = _engine_with(monkeypatch, tmp_path, sender)
+    chat = _chat(repo, "Novus Tech Group")
+    chat.phone_number = "918522061725"
+    chat.webhook_url = "https://x.test/?918522061725"
+    repo.save_chat(chat)
+
+    asyncio.run(engine.discover_phone_number(chat.chat_id))
+
+    after = repo.get_chat(chat.chat_id)
+    assert after.phone_number == ""
+    assert "918522061725" not in after.webhook_url, (
+        "the webhook must stop pointing at a member's number"
+    )
+
+
+def test_a_contact_panel_number_is_still_taken(monkeypatch, tmp_path):
+    """The other half: refusing group numbers must not refuse real ones."""
+    import asyncio
+
+    sender = _Recorder(answer="+91 79811 49423", title="Contact info")
+    engine, repo = _engine_with(monkeypatch, tmp_path, sender)
+    chat = _chat(repo, "Varshith")
+
+    got = asyncio.run(engine.discover_phone_number(chat.chat_id))
+
+    assert got == "917981149423"
+    assert repo.get_chat(chat.chat_id).is_group is False

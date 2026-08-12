@@ -297,7 +297,7 @@ def test_clearing_a_number_clears_it_from_history_too(repo):
 
 def _chat(name: str, phone: str = "", external: str = "") -> ChatConfig:
     return ChatConfig(chat_id=chat_id_for(name), chat_name=name,
-                      phone_number=phone, external_id=external)
+                      phone_number=phone)
 
 
 def test_a_chat_can_be_addressed_by_its_stored_number():
@@ -325,34 +325,7 @@ def test_a_number_matches_however_it_is_punctuated():
         assert result.chat.chat_name == "Varshith"
 
 
-def test_the_last_four_digits_come_from_the_stored_number_too():
-    from wadam.api.resolver import resolve_chat
 
-    chats = [_chat("Varshith", phone="919423155555"), _chat("Alice")]
-    result = resolve_chat(chats, "5555")
-    assert result.ok and result.chat.chat_name == "Varshith"
-    assert result.matched_by == "contact_last4"
-
-
-def test_two_chats_sharing_the_last_four_digits_are_refused_not_guessed():
-    from wadam.api.resolver import resolve_chat
-
-    chats = [_chat("Varshith", phone="919423155555"),
-             _chat("Nagen", phone="447700155555")]
-    result = resolve_chat(chats, "5555")
-    assert not result.ok
-    assert result.ambiguous
-    assert result.candidates == ("Nagen", "Varshith")
-
-
-def test_a_full_number_still_resolves_when_the_last_four_are_ambiguous():
-    """Ambiguity is about the abbreviation, not the number itself."""
-    from wadam.api.resolver import resolve_chat
-
-    chats = [_chat("Varshith", phone="919423155555"),
-             _chat("Nagen", phone="447700155555")]
-    result = resolve_chat(chats, "919423155555")
-    assert result.ok and result.chat.chat_name == "Varshith"
 
 
 def test_a_chat_name_still_works_when_there_is_no_number():

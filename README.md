@@ -167,7 +167,7 @@ other direction — you telling the app to send one:
 curl -X POST http://127.0.0.1:8765/wam/ -H "Content-Type: application/json" -d "{\"id\":\"9423\",\"message\":\"Hello Varshith\"}"
 ```
 
-`id` is the chat's **contact ID** — by default the last four digits of the
+`id` is the chat's **full phone number** — or its exact name, which is the
 contact's number, filled in automatically when the chat name is the number
 itself, and typed into the configuration panel for a saved contact (WhatsApp
 shows those by name and never reveals the number).

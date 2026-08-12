@@ -48,7 +48,6 @@ from wadam.domain.models import (
     OutgoingStatus,
     PollState,
     StoredMessage,
-    contact_id_for,
     message_key_for,
     outgoing_key_for,
     phone_digits,
@@ -527,11 +526,17 @@ class AutomationEngine:
         """Open a chat, read it, persist what's new, and run anything that
         needs running. This is the only path that switches the user's open
         conversation."""
-        # A chat with no number, the one time it is opened anyway. The panel
-        # costs a couple of seconds, so it is read here — on the path that was
-        # already going to switch conversations — and never again once a number
-        # is stored. Deliberately not in the 3-second poll, which stays passive.
-        if not chat.phone_number:
+        # The info panel, the one time this chat is opened anyway. It costs a
+        # couple of seconds, so it is read here — on the path that was already
+        # going to switch conversations — and exactly once per chat.
+        # Deliberately not in the 3-second poll, which stays passive.
+        #
+        # Gated on the PROBE MARKER, not on whether a number is stored. The
+        # panel answers two questions — the number, and whether this is a group
+        # — and a stored number only settles the first. Gating on the number
+        # left a chat named "Novus Tech Group" holding a number with its group
+        # status still a sidebar guess, permanently.
+        if chat.phone_probed_at is None:
             await self.discover_phone_number(chat.chat_id)
             chat = self._repo.get_chat(chat.chat_id) or chat
 
@@ -899,20 +904,22 @@ class AutomationEngine:
         Never reached from the passive poll: it is called from the worker, on
         the same path that already opens chats, under the action lock."""
         chat = self._repo.get_chat(chat_id)
-        if chat is None or chat.phone_number:
-            return chat.phone_number if chat else ""
-        if chat.phone_probed_at is not None:
-            # Already looked, and there was nothing. Opening the panel again on
-            # every scan costs seconds and flashes the UI to re-learn it.
+        if chat is None:
             return ""
-        # Deliberately NOT skipped on `chat.is_group`. That flag is inferred
-        # from whether a sidebar preview carries a speaker prefix, and it is
+        if chat.phone_probed_at is not None:
+            # Already looked. Opening the panel again on every scan costs
+            # seconds and flashes the UI to re-learn what it already knows —
+            # and that is true whether the answer was a number, a group, or
+            # nothing at all.
+            return chat.phone_number
+        # Deliberately NOT skipped on the SIDEBAR guess. `is_group` starts life
+        # inferred from whether a preview carries a speaker prefix, and that is
         # wrong often enough to matter — measured: a 1:1 chat whose number was
         # successfully read from a "Contact info" panel was flagged as a group.
         # Skipping on it would have refused to discover that number. What the
         # panel says about itself is reliable; a guess about the chat is not.
         try:
-            raw = await self._sender.resolve_phone_number_async(chat.chat_name)
+            panel = await self._sender.resolve_contact_panel_async(chat.chat_name)
         except Exception as ex:  # noqa: BLE001 - discovery must never break a scan
             logger.warning("contact-number lookup failed for %s: %s",
                            chat.chat_name, ex)
@@ -920,9 +927,40 @@ class AutomationEngine:
         # Recorded before anything else, so a chat is never probed twice even
         # if the number turns out to be unreadable.
         chat.phone_probed_at = utcnow()
+        if panel.seen:
+            # The panel opened and named itself, so this replaces the sidebar
+            # guess for good — and `_apply_row` stops overwriting it once
+            # `phone_probed_at` is set.
+            chat.is_group = panel.is_group
         await asyncio.to_thread(self._repo.save_chat, chat)
 
-        digits = phone_digits(raw)
+        if panel.is_group:
+            # A group, community or channel has no single contact, so there is
+            # no number to take. The panel DOES print numbers — its members' —
+            # and the scan happily finds one: measured on "Novus Tech Group",
+            # a "Group info" panel yielding +91 85220 61725, which an earlier
+            # build stored as the group's own number and built its webhook from.
+            # One member's number standing in for a whole group is the kind of
+            # wrong that looks right on screen.
+            discarded = panel.number
+            cleared = chat.phone_number
+            if cleared:
+                # Stored by that earlier build. Left alone it would keep
+                # addressing the group by somebody's personal number.
+                chat.phone_number = ""
+                chat.webhook_url = webhook_url_for(
+                    self._settings.webhook_template, "", chat.webhook_override,
+                    chat.chat_name)
+                await asyncio.to_thread(self._repo.save_chat, chat)
+            self._repo.log("INFO", "chat.group_confirmed", chat_id=chat_id,
+                           chat_name=chat.chat_name,
+                           message=f"{panel.title} — a group has no number of its own, "
+                                   f"so it is addressed by name."
+                                   + (f" Ignored {discarded} from the panel." if discarded else "")
+                                   + (f" Cleared the stored {cleared}." if cleared else ""))
+            return ""
+
+        digits = phone_digits(panel.number)
         if not digits:
             self._repo.log("INFO", "chat.number_unavailable", chat_id=chat_id,
                            chat_name=chat.chat_name,
@@ -949,12 +987,6 @@ class AutomationEngine:
         # Clearing the number re-arms discovery; setting one makes the question
         # settled either way.
         chat.phone_probed_at = utcnow() if digits else None
-        # Derive the short id the send API addresses chats by, unless somebody
-        # set one deliberately — an explicit assignment outranks a derived one.
-        if digits and not chat.external_id:
-            chat.external_id = contact_id_for(digits)
-        elif not digits and chat.external_id == contact_id_for(chat.phone_number or ""):
-            chat.external_id = ""
         chat.webhook_url = webhook_url_for(self._settings.webhook_template,
                                            digits, chat.webhook_override,
                                            chat.chat_name)
@@ -1204,17 +1236,6 @@ class AutomationEngine:
                        direction="out", message=f"Sent via {result.strategy}: {text[:120]}")
         self.publish()
         return SendOutcome(True, strategy=result.strategy, message_key=stored.message_key)
-
-    async def set_external_id(self, chat_id: str, external_id: str) -> None:
-        chat = self._repo.get_chat(chat_id)
-        if chat is None:
-            return
-        chat.external_id = (external_id or "").strip()
-        await asyncio.to_thread(self._repo.save_chat, chat)
-        self._repo.log("INFO", "chat.contact_id", chat_id=chat_id, chat_name=chat.chat_name,
-                       message=f"Contact ID set to {chat.external_id or '(empty)'}")
-        await asyncio.to_thread(self._repo.flush_json, True)
-        self.publish()
 
     async def scan_chat_now(self, chat_id: str) -> None:
         chat = self._repo.get_chat(chat_id)

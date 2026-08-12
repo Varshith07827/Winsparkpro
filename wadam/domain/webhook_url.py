@@ -8,19 +8,20 @@ out of step with the template.
     https://noteify.org/ntext/whook/?{phone_number}
                                      └── replaced with the chat's number
 
-Three placeholders, because not every endpoint addresses a chat by its full
-number:
+Two placeholders:
 
     {phone_number}   918106972933   the digits
-    {external_id}    2933           the last four
     {chat_name}      Novus%20Tech   the display name, URL-encoded
 
-`{external_id}` exists for endpoints that address a chat by a short id
-appended to an account key — `?agkfghxq9423` is a web key plus the last four
-digits, a shape the full number cannot express at all. A template may mix them:
-`?agkfghxq{external_id}` is a literal key with a per-chat suffix.
+A short `{external_id}` placeholder briefly existed for endpoints keyed by the
+last four digits. It went with the four-digit id itself: four digits is 10,000
+values, so two contacts sharing one is likely rather than exotic, and an
+identifier that can quietly address the wrong person is not worth having. The
+full number is what a caller already holds and what the endpoint was tested
+with.
 
-A chat whose number is not known yet falls back to its **name**, URL-encoded:
+A chat whose number is not known — **every group**, since a group has no single
+number — falls back to its **name**, URL-encoded:
 
     https://noteify.org/ntext/whook/?Novus%20Tech%20Group
 
@@ -37,12 +38,7 @@ from __future__ import annotations
 
 from urllib.parse import quote, urlparse
 
-from wadam.constants import (
-    CHAT_NAME_PLACEHOLDER,
-    EXTERNAL_ID_PLACEHOLDER,
-    PHONE_PLACEHOLDER,
-)
-from wadam.domain.models import contact_id_for
+from wadam.constants import CHAT_NAME_PLACEHOLDER, PHONE_PLACEHOLDER
 
 
 def webhook_url_for(template: str, phone_number: str, override: str = "",
@@ -63,24 +59,14 @@ def webhook_url_for(template: str, phone_number: str, override: str = "",
     # Quoted, because a chat name can hold spaces, "&", "#" or an emoji, any of
     # which would otherwise truncate or corrupt the query string.
     name = quote((chat_name or "").strip(), safe="")
-    short = contact_id_for(number)
-
-    if EXTERNAL_ID_PLACEHOLDER in template:
-        # Asked for explicitly, so there is no falling back to the name: a
-        # template like `?agkfghxq{external_id}` addresses a chat by a short id
-        # its endpoint has to recognise, and a name spliced in there would build
-        # a URL that looks valid and reaches nobody.
-        if not short:
-            return ""
-        template = template.replace(EXTERNAL_ID_PLACEHOLDER, short)
     if CHAT_NAME_PLACEHOLDER in template:
         if not name:
             return ""
         template = template.replace(CHAT_NAME_PLACEHOLDER, name)
     if PHONE_PLACEHOLDER not in template:
         # Either it never had one — the same URL for every chat, odd but
-        # explicit and warned about at startup — or the substitutions above
-        # already filled it in.
+        # explicit and warned about at startup — or {chat_name} already filled
+        # the template in.
         return template
 
     identifier = number or name

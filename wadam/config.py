@@ -22,8 +22,10 @@ from typing import Optional
 
 from wadam.constants import (
     DATABASE_NAME,
+    CHAT_NAME_PLACEHOLDER,
     DEFAULT_WEBHOOK_TEMPLATE,
     PHONE_PLACEHOLDER,
+    WEBHOOK_TEMPLATE_EXAMPLE,
     POLL_INTERVAL_SECONDS,
 )
 
@@ -281,13 +283,22 @@ def load_settings(env_path: Optional[Path] = None) -> Settings:
 
     webhook_template = (values.get("WEBHOOK_URL")
                         or values.get("DEFAULT_WEBHOOK")
-                        or DEFAULT_WEBHOOK_TEMPLATE).strip() or DEFAULT_WEBHOOK_TEMPLATE
-    if not webhook_template.startswith(("http://", "https://")):
+                        or DEFAULT_WEBHOOK_TEMPLATE).strip()
+    if not webhook_template:
+        # Deliberately a problem rather than a default. There is no sensible
+        # guess for where someone else's messages should be sent, and a build
+        # that silently pointed at a vendor's URL is what this replaces.
+        problems.append(
+            "WEBHOOK_URL is not set. It is where messages are sent, and where "
+            "outbound messages are fetched from, so there is nothing to fall "
+            f"back to. Example: {WEBHOOK_TEMPLATE_EXAMPLE}")
+    elif not webhook_template.startswith(("http://", "https://")):
         problems.append("WEBHOOK_URL must be an http:// or https:// URL.")
-    elif PHONE_PLACEHOLDER not in webhook_template:
+    elif (PHONE_PLACEHOLDER not in webhook_template
+          and CHAT_NAME_PLACEHOLDER not in webhook_template):
         warnings.append(
-            f"WEBHOOK_URL has no {PHONE_PLACEHOLDER} placeholder, so every chat "
-            f"will use the same URL."
+            f"WEBHOOK_URL has no {PHONE_PLACEHOLDER} or {CHAT_NAME_PLACEHOLDER} "
+            f"placeholder, so every chat will use the same URL."
         )
 
     folder_raw = (values.get("JSON_BACKUP_FOLDER") or "backup").strip() or "backup"

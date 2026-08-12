@@ -100,7 +100,8 @@ class NoopPipeline:
 @pytest.fixture()
 def engine(tmp_path: Path):
     settings = Settings(mongodb_uri="mongodb://localhost:27017", database_name="test",
-                        json_backup_folder=tmp_path, json_autosave_interval=0)
+                        json_backup_folder=tmp_path, json_autosave_interval=0,
+                        webhook_template="https://x.test/?{phone_number}")
     backup = JsonBackupStore(tmp_path, autosave_interval=0)
     backup.ensure_folder()
     repository = Repository(settings, FakeMongo(), backup)

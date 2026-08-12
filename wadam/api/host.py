@@ -91,25 +91,23 @@ class SendApiHost:
             return SendResponse(409, {
                 "ok": False, "code": "ambiguous_id",
                 # The advice has to be something the caller can actually do.
-                # It used to say "set a distinct contact ID", which pointed at a
-                # configuration field the simplified UI no longer has. The two
-                # unambiguous identifiers the resolver accepts are the full
-                # number and the exact chat name.
+                # Two chats sharing an exact name is the only way to get here
+                # now that abbreviated ids are gone, so the answer is the number
+                # for a one-to-one chat and the chat_id for a group.
                 "error": f"'{identifier}' matches {len(resolution.candidates)} chats "
-                         f"and nothing was sent. A four-digit id is the LAST FOUR "
-                         f"DIGITS of a number, so contacts can share one. Address "
-                         f"this chat by its full phone number or its exact name "
-                         f"instead.",
+                         f"and nothing was sent. Address this chat by its full "
+                         f"phone number, or by its chat_id if it is a group.",
                 "candidates": list(resolution.candidates),
-                "resolves_by": ["external_id", "phone_number", "chat_id", "chat_name"],
+                "resolves_by": ["phone_number", "chat_id", "chat_name"],
             })
 
         if not resolution.ok:
             return SendResponse(404, {
                 "ok": False, "code": "chat_not_found",
-                "error": f"No chat matches '{identifier}'. Use the chat's name as "
-                         f"shown in WhatsApp, its phone number, or the last four "
-                         f"digits of that number.",
+                "error": f"No chat matches '{identifier}'. Use the chat's full "
+                         f"phone number, or its exact name as shown in WhatsApp "
+                         f"(which is how a group is addressed, since a group has "
+                         f"no number).",
             })
 
         chat = resolution.chat

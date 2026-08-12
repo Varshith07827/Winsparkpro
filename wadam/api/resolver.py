@@ -5,20 +5,25 @@ refused, never guessed.** Sending a message to the wrong person is the single
 worst thing this application could do, and it is a quiet failure — the caller
 gets a 200 and nobody finds out until the wrong contact replies.
 
-Four digits is 10,000 values. With a few hundred chats a collision is not a
-remote possibility but a likelihood (the birthday bound puts it above even odds
-at ~118 chats), so this is a real operational concern, not defensive paranoia.
+Matching runs in tiers, most specific first:
 
-Matching runs in tiers, most deliberate first:
-
-    1. external_id       — someone typed this in for this chat. Explicit wins.
-    2. last 4 digits     — derived from a chat whose name is a phone number.
-    3. chat_id           — the application's own 24-char identifier.
-    4. chat name         — exact, case-insensitive.
+    1. phone_number   — the full number. A one-to-one chat.
+    2. chat_id        — the application's own 24-char identifier.
+    3. chat name      — exact, case-insensitive. How a GROUP is addressed,
+                        because a group has no number to be addressed by.
 
 A tier that matches exactly one chat resolves. A tier that matches several
 stops everything and reports the conflict by name. A tier that matches nothing
 falls through to the next.
+
+**The four-digit short id is gone.** It was derived from the last four digits
+of a number and used as the primary way to address a chat, and four digits is
+10,000 values — with a few hundred chats a collision is not a remote
+possibility but a likelihood (the birthday bound puts it above even odds at
+~118 chats). It bought nothing a full number does not: the number is what a
+caller already has, it is unambiguous, and it is what the endpoint was tested
+with. An abbreviation whose only property is that it might silently address
+the wrong person is not worth keeping.
 """
 
 from __future__ import annotations
@@ -26,7 +31,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
-from wadam.domain.models import ChatConfig, contact_id_for, phone_digits
+from wadam.domain.models import ChatConfig, phone_digits
 
 
 @dataclass(frozen=True)
@@ -44,15 +49,6 @@ class Resolution:
         return self.chat is None and len(self.candidates) > 1
 
 
-def _last4(chat: ChatConfig) -> str:
-    """A chat's last four digits, from its stored number if it has one and from
-    its name otherwise.
-
-    The stored number comes first because it is the one somebody typed in
-    deliberately; the name is only a number at all for an unsaved contact."""
-    return contact_id_for(chat.phone_number) or contact_id_for(chat.chat_name)
-
-
 def resolve_chat(chats: Iterable[ChatConfig], identifier: str) -> Resolution:
     wanted = (identifier or "").strip()
     if not wanted:
@@ -63,13 +59,10 @@ def resolve_chat(chats: Iterable[ChatConfig], identifier: str) -> Resolution:
     digits = phone_digits(wanted)
 
     tiers = (
-        ("external_id", lambda c: (c.external_id or "").strip().casefold() == lowered),
-        # A full number is the most specific thing anyone can send, so it ranks
-        # above every abbreviation. Compared as digits on both sides:
-        # "+91 94231 55555" and "919423155555" are the same contact, and a
-        # caller should not have to know which spelling this application stores.
+        # Compared as digits on both sides: "+91 94231 55555" and
+        # "919423155555" are the same contact, and a caller should not have to
+        # know which spelling this application happens to store.
         ("phone_number", lambda c: bool(digits) and phone_digits(c.phone_number) == digits),
-        ("contact_last4", lambda c: bool(_last4(c)) and _last4(c) == wanted),
         ("chat_id", lambda c: c.chat_id == wanted),
         ("chat_name", lambda c: c.chat_name.strip().casefold() == lowered),
     )
@@ -84,10 +77,3 @@ def resolve_chat(chats: Iterable[ChatConfig], identifier: str) -> Resolution:
             # the mistake this function exists to prevent.
             return Resolution(candidates=tuple(sorted(c.chat_name for c in matches)))
     return Resolution()
-
-
-def suggest_external_id(chat: ChatConfig) -> str:
-    """What this chat's contact ID should default to — the last four digits of
-    its number, or "" when neither the stored number nor the name gives us
-    anything to work with."""
-    return _last4(chat)

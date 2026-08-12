@@ -34,7 +34,6 @@ from wadam.config import Settings
 from wadam.domain.models import (
     ChatConfig,
     chat_id_for,
-    contact_id_for,
     phone_digits,
     utcnow,
 )
@@ -44,6 +43,15 @@ from wadam.whatsapp.name_rules import is_system_or_list_view_title
 from wadam.whatsapp.reader import ChatRow
 
 logger = logging.getLogger(__name__)
+
+
+def _confirmed_group(chat: ChatConfig) -> bool:
+    """A group according to the INFO PANEL, not according to the sidebar.
+
+    `is_group` is a guess until the panel has been read; `phone_probed_at` is
+    what marks it as having been read. Acting on the guess would let a preview
+    reading "Re: the invoice" withhold a real contact's number."""
+    return chat.is_group and chat.phone_probed_at is not None
 
 
 def row_signature(row: ChatRow) -> str:
@@ -106,11 +114,6 @@ class ChatDiscovery:
                     # nothing to automate, so switching this on cannot fire a
                     # webhook for a conversation that happened before install.
                     automation_enabled=True,
-                    # The send API's default addressing: the last four digits of
-                    # the contact's number. Derivable only when the chat name IS
-                    # the number, which is the case for an unsaved contact; a
-                    # saved one shows its name and gets this typed in.
-                    external_id=contact_id_for(name),
                     seeded=False,
                 )
                 self._apply_row(chat, row, signature)
@@ -155,22 +158,32 @@ class ChatDiscovery:
     @staticmethod
     def _apply_row(chat: ChatConfig, row: ChatRow, signature: str) -> None:
         chat.chat_name = row.chat_name or chat.chat_name
-        if not chat.phone_number:
+        if not chat.phone_number and not _confirmed_group(chat):
             # Backfill, and pick up a chat whose name has since become a number
             # (an address-book entry removed). Never overwrites a resolved one.
+            #
+            # Skipped for a confirmed group: a group has no single contact, so
+            # any number is somebody else's. Only the panel can confirm one —
+            # the sidebar guess is not allowed to withhold a number on its own.
             chat.phone_number = phone_digits(chat.chat_name)
-        if not chat.external_id:
-            # Backfill: chats stored before contact IDs existed, and chats whose
-            # name has since become a number. Never overwrites one someone set
-            # by hand — an explicit assignment outranks anything derived.
-            chat.external_id = contact_id_for(chat.chat_name)
         chat.last_message_preview = row.last_message
         chat.timestamp_text = row.timestamp_text
         chat.unread_count = row.unread_count
         chat.is_pinned = row.is_pinned
         chat.is_muted = row.is_muted
-        # Sticky: a group's preview only carries a speaker prefix when someone
-        # else spoke last, so a single "You: …" preview must not un-group it.
-        chat.is_group = chat.is_group or row.looks_like_group
+        # A HINT, and only until the info panel has said what this chat is.
+        #
+        # It used to be sticky (`is_group or looks_like_group`) on the reasoning
+        # that a group's preview only carries a speaker prefix when someone else
+        # spoke last. True, but it also made a single false positive permanent —
+        # a one-to-one chat whose contact wrote "Re: the invoice" was a group
+        # forever. Measured: Varshith, a 1:1 chat with a readable Contact info
+        # panel, was flagged as a group.
+        #
+        # `phone_probed_at` marks the panel as having been read, and the panel
+        # is authoritative, so from that point the guess is not allowed to
+        # overwrite what was actually seen.
+        if chat.phone_probed_at is None:
+            chat.is_group = row.looks_like_group
         chat.row_signature = signature
         chat.updated_at = utcnow()

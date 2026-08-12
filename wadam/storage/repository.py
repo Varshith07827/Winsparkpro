@@ -78,6 +78,7 @@ class Repository:
         self._load_from_mongo()
         if not self._chats:
             self._recover_from_json()
+        self._migrate_legacy_chats()
         self._app_state.run_count += 1
         self._app_state.started_at = utcnow()
         self._app_state.version = constants.APP_VERSION
@@ -139,6 +140,50 @@ class Repository:
         except Exception as ex:  # noqa: BLE001
             self._mongo.note_failure(ex)
             logger.error("Could not load state from MongoDB: %s", ex)
+
+    def _migrate_legacy_chats(self) -> None:
+        """Retire the four-digit `external_id`, and re-arm the panel probe for
+        every chat an older build had already probed.
+
+        Two things need doing, and one legacy key marks both.
+
+        `external_id` no longer exists on `ChatConfig`, so `from_document`
+        already ignores it — nothing breaks. But the key stays in MongoDB
+        forever otherwise, and a stored field nothing reads is a trap for the
+        next person querying `wa_events`.
+
+        The second is not cosmetic. `is_group` used to be guessed from the
+        sidebar preview and is now read from the info panel — but only when a
+        chat is probed, and `phone_probed_at` stops a chat being probed twice.
+        So a chat an older build probed carries a probe marker and NO panel
+        verdict, and would keep the guess forever. Measured here: a chat named
+        "Novus Tech Group" was stored with `is_group=False` and a phone number,
+        with no way to tell whether a panel ever said so.
+
+        Clearing the marker costs one panel open per chat, once, and settles it
+        from the only reliable source."""
+        try:
+            legacy = list(self._mongo.chat_configs.find(
+                {"external_id": {"$exists": True}}, {"chat_id": 1}))
+            if not legacy:
+                return
+            self._mongo.chat_configs.update_many(
+                {"external_id": {"$exists": True}},
+                {"$unset": {"external_id": ""}, "$set": {"phone_probed_at": None}})
+            self._mongo.note_success()
+        except Exception as ex:  # noqa: BLE001 - never block startup
+            self._mongo.note_failure(ex)
+            logger.error("Retiring the legacy contact id failed: %s", ex)
+            return
+
+        for document in legacy:
+            chat = self._chats.get(document.get("chat_id") or "")
+            if chat is not None:
+                chat.phone_probed_at = None
+        self.log("INFO", "chats.migrated",
+                 message=f"Retired the four-digit contact id on {len(legacy)} chat(s), "
+                         f"and re-armed the info-panel probe so each one's group "
+                         f"status comes from the panel rather than a sidebar guess.")
 
     def _recover_from_json(self) -> None:
         """MongoDB had no chats. If the mirror does, this is a fresh/emptied
@@ -266,7 +311,7 @@ class Repository:
     #: the counters — and copying those back over a live object would undo
     #: whatever happened since the last save.
     CONFIG_FIELDS = ("automation_enabled", "webhook_url", "webhook_override",
-                     "phone_number", "external_id")
+                     "phone_number")
 
     def reload_chat_config(self) -> list[str]:
         """Re-read the configuration fields of every chat from MongoDB.

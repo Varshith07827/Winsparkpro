@@ -80,24 +80,6 @@ def phone_digits(value: str) -> str:
     return digits
 
 
-def contact_id_for(value: str) -> str:
-    """The last four digits of a chat's phone number — the identifier the send
-    API addresses chats by.
-
-    Returns "" when the chat name is not a phone number, which is the common
-    case for a **saved** contact: WhatsApp's sidebar shows such a chat by the
-    contact's name and never exposes the number, so there is nothing to derive
-    from. Those chats get their contact ID typed in once, in the configuration
-    panel. See `ChatConfig.external_id`.
-
-    Four digits is only 10,000 values, so collisions across a large chat list
-    are not hypothetical. The resolver refuses an ambiguous ID rather than
-    guessing — sending a message to the wrong person is the one failure this
-    application must never produce quietly."""
-    digits = phone_digits(value)
-    return digits[-4:] if digits else ""
-
-
 def message_key_for(chat_id: str, sender: str, text: str, time_text: str,
                     direction: str, occurrence: int = 0) -> str:
     """The deduplication key for a message bubble.
@@ -187,12 +169,6 @@ class ChatConfig:
     webhook_override: str = ""
     automation_enabled: bool = False
     # The identifier the inbound send API addresses this chat by — by default
-    # the last four digits of the contact's number, auto-filled at discovery
-    # when the chat name is itself a number. For a saved contact the sidebar
-    # only ever shows the name, so there is nothing to derive and this is typed
-    # in once from the chat details panel.
-    external_id: str = ""
-
     # --- sidebar mirror (what the chat list renders) -----------------------
     last_message_preview: str = ""
     timestamp_text: str = ""

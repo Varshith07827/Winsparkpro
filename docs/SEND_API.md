@@ -84,7 +84,7 @@ belong in any of them.
   "id": "9423",
   "chat": "Varshith",
   "chat_id": "d25187dc137f35c88bc80ec8",
-  "matched_by": "external_id",
+  "matched_by": "phone_number",
   "strategy": "clipboard-paste + send-button-invoke",
   "message_key": "…"
 }
@@ -106,7 +106,8 @@ verification everything else in this application does.
 
 ### Four digits collide, and that is by design
 
-`id` defaults to the **last four digits** of a contact's number. Four digits is
+`id` is a contact's **full phone number**, or a chat's exact name. A short
+four-digit form used to be the default and was removed: four digits is
 10,000 values, so with enough chats two will eventually share one — the
 identifier is convenient, not unique.
 
@@ -122,7 +123,7 @@ unambiguous:
   "ok": false,
   "code": "ambiguous_id",
   "candidates": ["+91 81069 72933", "+44 7700 902933"],
-  "resolves_by": ["external_id", "phone_number", "chat_id", "chat_name"]
+  "resolves_by": ["phone_number", "chat_id", "chat_name"]
 }
 ```
 
@@ -144,7 +145,7 @@ identifier", not as a transient error to retry.
 
 ## How `id` finds a chat
 
-The default is **the last four digits of the contact's number**, and it is
+The identifier is **the contact's full phone number**, and it is
 filled in automatically at discovery when the chat name is the number itself —
 which is how an unsaved contact appears in WhatsApp.
 
@@ -155,8 +156,7 @@ once and save.
 
 Matching runs in tiers, most deliberate first:
 
-1. **`external_id`** — what you typed into the Contact ID field
-2. **last four digits** — derived from a chat whose name is a phone number
+1. **`phone_number`** — the full number, in any spelling
 3. **`chat_id`** — the app's own 24-character identifier
 4. **chat name** — exact, case-insensitive
 

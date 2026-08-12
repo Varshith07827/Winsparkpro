@@ -440,6 +440,7 @@ def write_env(tmp_path: Path, extra: str) -> Path:
     path = tmp_path / ".env"
     path.write_text(
         "MONGODB_URI=mongodb://localhost:27017\nDATABASE_NAME=wadam\n"
+        "WEBHOOK_URL=https://x.test/?{phone_number}\n"
         f"JSON_BACKUP_FOLDER={tmp_path / 'backup'}\n{extra}\n", encoding="utf-8")
     return path
 

@@ -60,7 +60,7 @@ re-reading the same visible bubble every three seconds cannot store it twice.
 curl --location 'http://127.0.0.1:8765/wam/'   --header 'Content-Type: application/json'   --data '{"id":"2933","message":"Hello"}'
 ```
 
-`id` resolves to a chat — by `external_id` (the last four digits of the
+`id` resolves to a chat — by `phone_number` (the full number, for a 1:1
 number), the full number, the chat id, or the chat name. An ambiguous `id` is
 **refused**, never guessed: sending to the wrong person is the one failure this
 must not produce quietly.
@@ -136,9 +136,12 @@ uses.
 
 ## Limitations that shape the design
 
-* **A saved contact's phone number cannot be discovered.** WhatsApp exposes it
-  nowhere reachable, so such a chat has no `external_id` and cannot be
-  addressed by number. See [LIMITATIONS.md](LIMITATIONS.md).
+* **A group has no phone number**, because it has no single contact. It is
+  addressed by its name, and its webhook URL is built from the name. Whether a
+  chat is a group is read from its info panel, never guessed from the sidebar.
+* **A saved contact's number is read from the contact-info panel**, once, and
+  the result is remembered either way. That costs one panel open per chat. See
+  [LIMITATIONS.md](LIMITATIONS.md).
 * **Sending needs an interactive desktop.** Reading works over a disconnected
   RDP session or a locked workstation; sending does not, and messages wait in
   the queue rather than being lost.

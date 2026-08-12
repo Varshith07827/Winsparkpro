@@ -1068,8 +1068,34 @@ def _contact_panel_open(window_handle: int) -> bool:
     return walk(root)
 
 
-def read_contact_number_sync(window_handle: int) -> str:
-    """The open chat's phone number, from the contact-info panel, or "".
+@dataclass(frozen=True)
+class ContactPanel:
+    """What the info panel said about the open chat.
+
+    The number alone was not enough. The panel is the only reliable place this
+    application can learn whether a chat is a group — the sidebar heuristic
+    guesses from whether a preview carries a speaker prefix, and it is wrong
+    often enough to matter — and returning only a number threw that away, so
+    "no number found" could not be told apart from "there is no number to
+    find"."""
+
+    number: str = ""
+    title: str = ""            # "Contact info", "Group info", … or "" if unread
+
+    @property
+    def is_group(self) -> bool:
+        """A group, community or channel: no one person, so no one number."""
+        return self.title in GROUPISH_PANEL_TITLES
+
+    @property
+    def seen(self) -> bool:
+        """Did the panel actually open? Distinguishes what it said from the
+        panel never having been read, which must not be recorded as fact."""
+        return bool(self.title)
+
+
+def read_contact_panel_sync(window_handle: int) -> ContactPanel:
+    """The open chat's info panel: its phone number and which kind it is.
 
     An INTERACTION: it opens a panel. It must never run from the passive poll,
     and it runs once per chat — a stored number is never probed for again.
@@ -1087,7 +1113,7 @@ def read_contact_number_sync(window_handle: int) -> str:
     if button is None:
         logger.debug("no %r button — cannot read the contact number",
                      PROFILE_DETAILS_BUTTON)
-        return ""
+        return ContactPanel()
 
     # The button TOGGLES, so open it only if it is not already open — and put
     # back exactly what was found. Closing a panel the user was reading, or
@@ -1097,25 +1123,27 @@ def read_contact_number_sync(window_handle: int) -> str:
         try:
             pattern = button.GetPattern(auto.PatternId.InvokePattern)
             if pattern is None:
-                return ""
+                return ContactPanel()
             pattern.Invoke()
             opened_here = True
         except Exception:  # noqa: BLE001
             logger.debug("could not open the contact-info panel", exc_info=True)
-            return ""
+            return ContactPanel()
 
     # Polled, not slept: the tree materialises in stages and the number is
     # among the last things to appear.
     found = ""
+    title = ""
     deadline = time.monotonic() + PROFILE_PANEL_TIMEOUT
     while time.monotonic() < deadline:
         found = _scan_for_phone(window_handle)
+        title = _panel_title(window_handle) or title
         if found:
             break
         # A group or community has no single number, so stop as soon as the
         # panel says which kind it is rather than waiting out the timeout.
         # Read from the panel, not from a guess about the chat.
-        if _panel_title(window_handle) in GROUPISH_PANEL_TITLES:
+        if title in GROUPISH_PANEL_TITLES:
             break
         time.sleep(PROFILE_PANEL_POLL)
 
@@ -1124,7 +1152,7 @@ def read_contact_number_sync(window_handle: int) -> str:
             auto.SendKeys("{Esc}", waitTime=0.1)
         except Exception:  # noqa: BLE001
             logger.debug("could not close the contact-info panel", exc_info=True)
-    return found
+    return ContactPanel(number=found, title=title)
 
 
 def chat_already_open(window_handle: int, target: str) -> bool:
@@ -1322,8 +1350,8 @@ class WhatsAppSender:
         await self._sta.invoke_async(lambda: clear_search_sync(window_handle))
         return window_handle, None
 
-    async def resolve_phone_number_async(self, chat_name: str) -> str:
-        """Open a chat's contact-info panel and read its number. "" if none.
+    async def resolve_contact_panel_async(self, chat_name: str) -> ContactPanel:
+        """Open a chat's info panel and read its number AND which kind it is.
 
         Holds the action lock for the whole sequence, exactly like a send: it
         opens a chat and a panel, and doing that while a message is being typed
@@ -1331,20 +1359,20 @@ class WhatsAppSender:
         afterwards so the desktop is handed back."""
         window_handle, row = await self.resolve_chat_row_async(chat_name)
         if window_handle is None or row is None:
-            return ""
+            return ContactPanel()
         async with self._sta.action_lock:
             previous = await self._sta.invoke_async(previous_foreground)
             try:
                 if not await self._sta.invoke_async(
                         lambda: ensure_foreground(window_handle)):
-                    return ""
+                    return ContactPanel()
                 opened = await self._sta.invoke_async(
                     lambda: open_chat_sync(window_handle, row.raw_text, chat_name))
                 if not opened:
-                    return ""
+                    return ContactPanel()
                 await asyncio.sleep(0.4)
                 return await self._sta.invoke_async(
-                    lambda: read_contact_number_sync(window_handle))
+                    lambda: read_contact_panel_sync(window_handle))
             finally:
                 restored = await self._sta.invoke_async(
                     lambda: restore_foreground(previous))

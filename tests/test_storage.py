@@ -31,11 +31,16 @@ def _matches(document: dict, query: dict) -> bool:
     quietly saying "already sent" about the wrong message. A stand-in that
     answers differently from the real thing is worse than no stand-in.
 
-    Supports equality and `$in`, which is everything this application queries
-    with."""
+    Supports equality, `$in`, `$lt` and `$exists`, which is everything this
+    application queries with. `$exists` was added when the legacy-field
+    migration matched EVERY document here and none in real MongoDB — a
+    stand-in that answers differently from the real thing is worse than no
+    stand-in."""
     for key, expected in query.items():
         actual = document.get(key)
         if isinstance(expected, dict):
+            if "$exists" in expected and (key in document) != bool(expected["$exists"]):
+                return False
             if "$in" in expected and actual not in expected["$in"]:
                 return False
             if "$lt" in expected and not (actual is not None and actual < expected["$lt"]):
@@ -73,7 +78,9 @@ class FakeCollection:
         mongod as well for exactly this reason."""
         for existing in self.documents:
             if _matches(existing, query):
-                existing.update(update["$set"])
+                existing.update(update.get("$set") or {})
+                for field in (update.get("$unset") or {}):
+                    existing.pop(field, None)
 
     def bulk_write(self, operations, ordered=False):
         for operation in operations:

@@ -64,12 +64,17 @@ DATABASE_NAME = "wa_events"
 
 #: The token replaced with a chat's number when building its webhook URL.
 PHONE_PLACEHOLDER = "{phone_number}"
-#: The last four digits. Some endpoints address a chat by a short id appended to
-#: an account key — `?agkfghxq9423` is a web key plus this — which the full
-#: number cannot express.
-EXTERNAL_ID_PLACEHOLDER = "{external_id}"
 #: The chat's display name, URL-encoded.
 CHAT_NAME_PLACEHOLDER = "{chat_name}"
 
 #: The default webhook template. One setting instead of a URL per chat.
-DEFAULT_WEBHOOK_TEMPLATE = "https://noteify.org/ntext/whook/?{phone_number}"
+#: No default endpoint. A specific vendor's URL used to sit here, which meant
+#: every install shipped pointing at somebody else's server whether or not the
+#: person installing it had an account there — and a first run that "worked"
+#: without anyone choosing a destination. There is no sensible default for
+#: where someone else's messages should be sent.
+DEFAULT_WEBHOOK_TEMPLATE = ""
+
+#: Shown as greyed-out placeholder text in the setup window. An EXAMPLE of the
+#: shape, never a value: nothing reads this as configuration.
+WEBHOOK_TEMPLATE_EXAMPLE = "https://example.com/hook/?{phone_number}"
