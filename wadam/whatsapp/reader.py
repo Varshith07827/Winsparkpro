@@ -31,7 +31,7 @@ import functools
 import logging
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 from wadam.whatsapp.row_parser import parse_chat_row
@@ -234,6 +234,10 @@ class WhatsAppReader:
     async def read_chat_rows_async(self, window_handle: int) -> list[ChatRow]:
         return await self._sta.invoke_async(lambda: read_chat_rows_sync(window_handle))
 
+    async def read_sidebar_async(self, window_handle: int) -> SidebarReading:
+        """The chat list AND whether a search is filtering it."""
+        return await self._sta.invoke_async(lambda: read_sidebar_sync(window_handle))
+
     async def read_chat_rows_deep_async(self, window_handle: int, max_scrolls: int = 8) -> list[ChatRow]:
         return await self._sta.invoke_async(
             lambda: read_chat_rows_deep_sync(window_handle, max_scrolls)
@@ -359,6 +363,51 @@ def _row_from_control(item) -> Optional[ChatRow]:
     if not parsed["chat_name"]:
         return None
     return ChatRow(**parsed)
+
+
+@dataclass(frozen=True)
+class SidebarReading:
+    """What one look at the sidebar found, and whether it was the real list.
+
+    `filtered` is the important half. An active search hides the recents grid,
+    so the rows come from the search results instead — a partial, arbitrary
+    subset that must not be reconciled against the stored chat list as though
+    it were everything. Returning the rows without saying which they were is
+    what let a leftover query quietly stop the application."""
+
+    rows: list = field(default_factory=list)
+    filtered: bool = False
+
+
+@_absorb_com_errors(lambda: SidebarReading())
+def read_sidebar_sync(window_handle: int) -> SidebarReading:
+    """The chat list, and whether a search is filtering it. Input-free.
+
+    `filtered` is decided by the SEARCH BOX, not by which grid exists.
+
+    Measured on this build, with a query sitting in the box:
+
+        search='zzz'  recents_grid=False  results_grid=False  rows=0
+        search=''     recents_grid=True   results_grid=False  rows=5
+
+    So an active search removes BOTH grids and the sidebar reads as empty —
+    not, as this code first assumed, as a results grid standing in for the
+    recents one. Keying off the results grid therefore detected nothing, and an
+    empty read is indistinguishable from WhatsApp still starting up. The box's
+    own contents are the only signal that says which it is."""
+    _require_win32()
+    from wadam.whatsapp.sender import search_query_sync
+
+    rows = read_chat_rows_sync(window_handle)
+    if rows:
+        return SidebarReading(rows=rows, filtered=False)
+    # Empty. A query in the box explains it; anything else is a window that is
+    # not ready yet, which is not something to press keys about.
+    try:
+        searching = bool(search_query_sync(window_handle))
+    except Exception:  # noqa: BLE001 - a failed probe is not evidence of a search
+        searching = False
+    return SidebarReading(rows=rows, filtered=searching)
 
 
 @_absorb_com_errors(list)

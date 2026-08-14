@@ -123,6 +123,7 @@ class _Job:
     # after every job, so queueing one is how an API send wakes the drainer
     # without waiting for the next poll tick.
     kind: str          # "scan" | "process" | "resume" | "relay" | "drain"
+                       # | "clear_search"
     chat_id: str
     message: Optional[StoredMessage] = None
     relay: Optional[RelayMessage] = None
@@ -398,7 +399,26 @@ class AutomationEngine:
         if hwnd is None:
             return
 
-        rows = await self._reader.read_chat_rows_async(hwnd)
+        reading = await self._reader.read_sidebar_async(hwnd)
+        if reading.filtered:
+            # An active search empties the sidebar entirely on this build, so
+            # "no rows" and "a query is stuck in the box" are the same symptom
+            # and only the box tells them apart.
+            # A search is filtering the sidebar, so these rows are an arbitrary
+            # subset and reconciling the stored chat list against them would be
+            # wrong — no real chat registers as changed, so no scan is queued,
+            # and since the outgoing queue is drained after each job, nothing
+            # gets sent for as long as the query sits there.
+            #
+            # The send path is the one allowed to press keys, so the clearing
+            # goes to the worker rather than happening in this passive poll.
+            # Queued unconditionally: it is deduplicated by chat id like every
+            # other job, and one clear per cycle is what makes this self-heal
+            # rather than wait for someone to notice.
+            self._enqueue(_Job("clear_search", ""))
+            await self._wake_drainer_if_owed()
+            return
+        rows = reading.rows
         if not rows:
             return
         result = await asyncio.to_thread(self._discovery.sync, rows)
@@ -483,6 +503,13 @@ class AutomationEngine:
             job = await self._queue.get()
             chat = self._repo.get_chat(job.chat_id)
             try:
+                if job.kind in ("clear_search", "drain"):
+                    # Belongs to no chat, so it is handled before the lookup
+                    # below — which would otherwise drop it as "deleted while
+                    # queued" and leave the sidebar filtered forever.
+                    if job.kind == "clear_search":
+                        await self._clear_search()
+                    continue          # the finally below does the draining
                 if chat is None:
                     continue  # deleted while queued
                 self._busy_with = chat.chat_name
@@ -521,6 +548,39 @@ class AutomationEngine:
                 except Exception:  # noqa: BLE001
                     logger.exception("Draining the outgoing queue failed")
                 self.publish()
+
+    async def _clear_search(self) -> None:
+        """Put the sidebar back to the real chat list.
+
+        Runs on the worker because it presses keys, and holds the action lock
+        for the same reason every other interaction does.
+
+        This is a repair, not a routine: `open_chat_sync` clears the search it
+        started, so reaching here means a query survived something — a crash
+        mid-open, an older build, or the person at the keyboard. It used to be
+        unrecoverable: an active search hides the recents grid, so the poll read
+        the filtered results as the chat list, nothing registered as changed,
+        no job ran, and the outgoing queue is drained after jobs."""
+        if self._hwnd is None:
+            return
+        cleared = await self._sender.clear_search_async(self._hwnd)
+        if cleared:
+            self._repo.log("INFO", "search.cleared",
+                           message=f"A leftover search ({cleared!r}) was hiding the chat "
+                                   f"list and has been cleared.")
+
+    async def _wake_drainer_if_owed(self) -> None:
+        """Queue a drain when messages are owed and nothing is running.
+
+        The outgoing queue is drained after each job, which is efficient and
+        was the only trigger — so a cycle that produced no jobs sent nothing,
+        and a filtered sidebar produces no jobs indefinitely. Delivery should
+        not depend on unrelated work happening to occur."""
+        if not self._queue.empty() or self._stop.is_set():
+            return
+        pending = await asyncio.to_thread(self._repo.pending_outgoing)
+        if any(m.status not in OutgoingStatus.AMBIGUOUS for m in pending):
+            self._enqueue(_Job("drain", ""))
 
     async def _scan_chat(self, chat: ChatConfig) -> None:
         """Open a chat, read it, persist what's new, and run anything that

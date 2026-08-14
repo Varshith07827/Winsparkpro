@@ -743,6 +743,17 @@ def _search_box_query(window_handle: int) -> str:
     return ""
 
 
+def search_query_sync(window_handle: int) -> str:
+    """What is currently typed in the chat-search box, or "".
+
+    Read-only and input-free — it reads a `ValuePattern`, moves no focus and
+    presses nothing — so the passive three-second poll may call it. That
+    matters: an active search hides the recents grid, and the poll needs to
+    know it is looking at a filtered list rather than the chat list, without
+    becoming something that types into the user's window."""
+    return _search_box_query(window_handle)
+
+
 def clear_search_sync(window_handle: int) -> None:
     """Leave an active search so WhatsApp returns to the recents list.
 
@@ -1268,21 +1279,37 @@ def open_chat_sync(window_handle: int, row_raw_text: str, chat_name: str = "") -
 
     if not target:
         return False
-    search_and_read_rows_sync(window_handle, target)
-    grid = find_chat_grid(window_handle, SEARCH_RESULTS_GRID)
-    if grid is None:
-        return False
-    item = _find_row_item(grid, row_raw_text, target)
-    if item is None:
-        return False
-    pattern = _activate_via_pattern(item)
-    if pattern and _opened_chat_matches(window_handle, target):
-        return True
-    if not _click_point_inside(item, grid, window_handle):
-        return False
-    if not _click_item(item):
-        return False
-    return _opened_chat_matches(window_handle, target)
+
+    # Everything from here types into the search box, and the box must be empty
+    # again however this ends. An active search HIDES the recents grid outright
+    # (see `read_chat_rows_sync`), so a query left behind does not merely look
+    # untidy — the poll then reads the filtered results as if they were the chat
+    # list, no chat registers as changed, no job is queued, and because the
+    # outgoing queue is drained after each job, nothing is ever sent again.
+    #
+    # There were six ways out of this block and none of them cleared up. The
+    # success path relied on WhatsApp clearing the box itself on open, which is
+    # not something this application should be betting on.
+    try:
+        search_and_read_rows_sync(window_handle, target)
+        grid = find_chat_grid(window_handle, SEARCH_RESULTS_GRID)
+        if grid is None:
+            return False
+        item = _find_row_item(grid, row_raw_text, target)
+        if item is None:
+            return False
+        pattern = _activate_via_pattern(item)
+        if pattern and _opened_chat_matches(window_handle, target):
+            return True
+        if not _click_point_inside(item, grid, window_handle):
+            return False
+        if not _click_item(item):
+            return False
+        return _opened_chat_matches(window_handle, target)
+    finally:
+        # Gated inside on the box actually holding a query, so when WhatsApp
+        # did clear it this costs one accessibility read and sends no keys.
+        clear_search_sync(window_handle)
 
 
 # ---------------------------------------------------------------------------
@@ -1349,6 +1376,20 @@ class WhatsAppSender:
 
         await self._sta.invoke_async(lambda: clear_search_sync(window_handle))
         return window_handle, None
+
+    async def clear_search_async(self, window_handle: int) -> str:
+        """Leave an active search, so the sidebar goes back to the real chat
+        list. Returns whatever query was cleared, or "" if there was none.
+
+        Interaction, so it holds the action lock like any other: pressing keys
+        while a message is being typed is how text lands in the wrong
+        conversation."""
+        query = await self._sta.invoke_async(lambda: search_query_sync(window_handle))
+        if not query:
+            return ""
+        async with self._sta.action_lock:
+            await self._sta.invoke_async(lambda: clear_search_sync(window_handle))
+        return query
 
     async def resolve_contact_panel_async(self, chat_name: str) -> ContactPanel:
         """Open a chat's info panel and read its number AND which kind it is.

@@ -45,6 +45,7 @@ class FakeReader:
         self.messages: list[WhatsAppMessage] = []
         self.find_calls = 0
         self.message_reads = 0
+        self.searching = False
 
     async def find_window_async(self) -> Optional[int]:
         self.find_calls += 1
@@ -55,6 +56,14 @@ class FakeReader:
 
     async def read_chat_rows_async(self, _handle: int) -> list[ChatRow]:
         return list(self.rows)
+
+    async def read_sidebar_async(self, _handle: int):
+        """The chat list plus whether a search is filtering it. `searching` is
+        the state a leftover query leaves WhatsApp in: the recents grid is
+        hidden and only the search results can be read."""
+        from wadam.whatsapp.reader import SidebarReading
+
+        return SidebarReading(rows=list(self.rows), filtered=self.searching)
 
     async def read_chat_rows_deep_async(self, _handle: int, _max_scrolls: int = 8) -> list[ChatRow]:
         return list(self.rows)
@@ -72,6 +81,14 @@ class FakeSender:
         self._reader = reader
         self.opened: list[str] = []
         self.sent: list[tuple[str, str]] = []
+        self.searches_cleared = 0
+
+    async def clear_search_async(self, _handle):
+        if not self._reader.searching:
+            return ""
+        self._reader.searching = False
+        self.searches_cleared += 1
+        return "leftover query"
 
     async def open_and_read_async(self, chat_name: str, limit: int = 25):
         self.opened.append(chat_name)
