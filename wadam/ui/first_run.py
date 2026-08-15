@@ -38,23 +38,34 @@ CANCEL = 0
 _MONGO_PLACEHOLDER = "mongodb://localhost:27017"
 
 
-def env_text(mongodb_uri: str, webhook_template: str) -> str:
+def env_text(mongodb_uri: str, webhook_template: str,
+             database_name: str = constants.DATABASE_NAME) -> str:
     """The `.env` this writes.
 
-    Two live keys, and one documented-but-commented third. A setting nobody can
-    discover may as well not exist: `API_PORT` is the difference between "curl
-    reaches this app" and "curl reaches nothing", and a user who has never read
-    the source has no way to learn the name. Written commented so it changes
-    nothing until someone means it to — the comment parser drops the line
-    entirely, so `api_port` stays 0 and no socket is opened.
+    Three live keys and some documented-but-commented ones. A setting nobody
+    can discover may as well not exist — `API_PORT` is the difference between
+    "curl reaches this app" and "curl reaches nothing", and a reader who has
+    never seen the source has no way to learn the name. Those are written
+    commented, so they change nothing until someone means them to; the comment
+    parser drops the line entirely.
+
+    `DATABASE_NAME` is written LIVE rather than commented, because unlike the
+    others it is always in effect. A commented default tells you what would
+    happen; a live line tells you what IS happening, and that is the one worth
+    seeing on a cluster that holds more than one deployment.
     """
     return (
         "# WhatsApp Automation — configuration\n"
         "# Written by the first-run setup. Everything not listed here is fixed\n"
-        "# (database name, 3s polling) or derived (per-chat webhook URLs).\n"
+        "# (3s polling) or derived (per-chat webhook URLs).\n"
         "\n"
         "# Where chats and messages are stored.\n"
         f"MONGODB_URI={mongodb_uri}\n"
+        "\n"
+        "# Which database on that server. One cluster often holds more than one\n"
+        "# deployment — a staging run and real messages should not share a\n"
+        "# database. MongoDB's own (admin, local, config) are refused.\n"
+        f"DATABASE_NAME={database_name}\n"
         "\n"
         "# The webhook, and it carries BOTH directions over one address:\n"
         "#\n"

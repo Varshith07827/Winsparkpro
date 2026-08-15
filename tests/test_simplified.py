@@ -172,12 +172,19 @@ def test_a_template_with_no_placeholder_warns_rather_than_failing(tmp_path: Path
 # ---------------------------------------------------------------------------
 
 
-def test_the_written_env_holds_exactly_the_two_keys(tmp_path: Path):
+def test_the_written_env_holds_only_the_keys_that_are_always_in_effect(tmp_path: Path):
+    """Three live keys, and everything else commented.
+
+    This asserted exactly two for a while, which was the right instinct — the
+    file should stay small enough to read — but it also meant a setting could
+    become configurable without ever appearing in the file anyone edits.
+    DATABASE_NAME joins it because it is ALWAYS in effect: there is no state
+    where it does nothing, so a commented default would hide the live value."""
     text = env_text("mongodb://localhost:27017",
                     "https://noteify.org/ntext/whook/?{phone_number}")
     keys = [line.split("=", 1)[0] for line in text.splitlines()
             if line and not line.startswith("#")]
-    assert keys == ["MONGODB_URI", "WEBHOOK_URL"]
+    assert keys == ["MONGODB_URI", "DATABASE_NAME", "WEBHOOK_URL"]
 
 
 def test_the_written_env_can_be_loaded_back(tmp_path: Path):
@@ -442,3 +449,34 @@ def test_a_relative_backup_folder_is_resolved_against_the_app_not_the_cwd(
         os.chdir(previous)
     assert settings.json_backup_folder.is_absolute()
     assert elsewhere not in settings.json_backup_folder.parents
+
+
+def test_the_setup_file_carries_the_database_name(tmp_path: Path):
+    """Configurable and INVISIBLE is the same as not configurable.
+
+    DATABASE_NAME became a real setting, and for a while nothing wrote it into
+    the file — so the only way to learn the name was to read the source, which
+    is exactly the failure API_PORT had. Written live rather than commented,
+    because unlike the optional keys it is always in effect: a commented
+    default says what would happen, a live line says what IS happening."""
+    from wadam.ui.first_run import env_text
+
+    text = env_text("mongodb://localhost:27017", "https://x.test/?{phone_number}")
+
+    assert "\nDATABASE_NAME=wa_events\n" in text, "present, and not commented out"
+
+    path = tmp_path / ".env"
+    path.write_text(text, encoding="utf-8")
+    assert load_settings(path).database_name == "wa_events"
+
+
+def test_the_setup_file_round_trips_a_chosen_database_name(tmp_path: Path):
+    """The edit the line invites, proved to work end to end."""
+    from wadam.ui.first_run import env_text
+
+    path = tmp_path / ".env"
+    path.write_text(env_text("mongodb://localhost:27017",
+                             "https://x.test/?{phone_number}", "client_acme"),
+                    encoding="utf-8")
+
+    assert load_settings(path).database_name == "client_acme"
