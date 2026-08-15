@@ -131,9 +131,12 @@ def test_all_six_collections_and_their_indexes_exist(repo: Repository, store: Mo
     names = set(store._db.list_collection_names())
     assert {
         constants.COLLECTION_CHAT_CONFIGS, constants.COLLECTION_MESSAGES,
-        constants.COLLECTION_WEBHOOKS, constants.COLLECTION_AUTOMATION_LOGS,
-        constants.COLLECTION_APPLICATION_STATE, constants.COLLECTION_POLL_STATE,
+        constants.COLLECTION_WEBHOOKS, constants.COLLECTION_APPLICATION_STATE,
     } <= names
+    assert not set(constants.RETIRED_COLLECTIONS) & names, (
+        "logs and poll counters are kept locally — writing them here is what "
+        "1.7 million operations a month was made of"
+    )
 
     message_indexes = {i["name"] for i in store.messages.list_indexes()}
     assert any("message_key" in name for name in message_indexes)
@@ -245,10 +248,18 @@ def test_bulk_chat_save_upserts_every_row(repo: Repository, store: MongoStore):
     assert store.chat_configs.count_documents({"automation_enabled": True}) == 25
 
 
-def test_log_pruning_keeps_the_newest_rows(repo: Repository, store: MongoStore):
+def test_logs_and_poll_counters_stay_out_of_the_database(repo: Repository, store: MongoStore):
+    """Against a real mongod.
+
+    Sixty log lines and a poll state used to be sixty-one billable writes, plus
+    a periodic scan-and-delete to stop the collection growing without limit.
+    Now they are no writes at all and the collections never come into
+    existence — the ring buffer and its JSON mirror were always the copies
+    anyone actually read."""
     for index in range(60):
         repo.log("INFO", "test.bulk", message=f"line {index}")
-    repo.prune_logs(keep=10)
-    # The guard only prunes once the collection has meaningfully outgrown the
-    # limit (keep * 1.2), which 60 rows against a keep of 10 does.
-    assert store.automation_logs.count_documents({}) <= 12
+    repo.save_poll_state(repo.poll_state)
+
+    names = set(store._db.list_collection_names())
+    assert not set(constants.RETIRED_COLLECTIONS) & names
+    assert len(repo.recent_logs(limit=100)) >= 60, "kept locally, in full"

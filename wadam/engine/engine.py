@@ -466,14 +466,16 @@ class AutomationEngine:
         # Cheap enough to refresh every cycle, and it is how a disconnected RDP
         # session or a locked desktop becomes visible instead of mysterious.
         self._session_state = win_session.probe(self._settings.whatsapp_window_title)
-        # Written to MongoDB on the first cycle (so the collection exists and a
-        # short run still leaves a trace) and every ten cycles after that, not
-        # every three seconds: it is telemetry, and the in-memory copy the UI
-        # reads is always current regardless.
-        if state.cycle_count == 1 or state.cycle_count % 10 == 0:
-            await asyncio.to_thread(self._repo.save_poll_state, state)
-        if state.cycle_count % 200 == 0:
-            await asyncio.to_thread(self._repo.prune_logs)
+        # Local only now, so this costs a dict assignment rather than a billable
+        # write, and the JSON mirror picks it up on its next coalesced flush.
+        # It used to be written every ten cycles — deliberately not every three
+        # seconds — which is a good instinct applied to something that should
+        # not have been in the database at all.
+        #
+        # Nothing left to prune either: the log ring buffer and the mirror are
+        # both bounded by their own maxlen, and only the MongoDB copy grew
+        # without limit.
+        self._repo.save_poll_state(state)
 
     def _find_chat_by_name(self, name: str) -> Optional[ChatConfig]:
         from wadam.domain.models import chat_id_for

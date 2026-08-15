@@ -79,9 +79,11 @@ class Repository:
         """Warm the cache from MongoDB, restore from the JSON mirror if the
         primary came up empty, then start the autosave timer."""
         self._load_from_mongo()
+        self._load_local_only()
         if not self._chats:
             self._recover_from_json()
         self._migrate_legacy_chats()
+        self._drop_retired_collections()
         self._app_state.run_count += 1
         self._app_state.started_at = utcnow()
         self._app_state.version = constants.APP_VERSION
@@ -126,9 +128,6 @@ class Repository:
             for document in (self._mongo.webhooks.find({})
                              .sort("created_at", -1).limit(constants.JSON_WEBHOOK_LIMIT)):
                 self._webhooks.appendleft(WebhookRecord.from_document(strip_object_id(document)))
-            for document in (self._mongo.automation_logs.find({})
-                             .sort("created_at", -1).limit(constants.JSON_LOG_LIMIT)):
-                self._logs.appendleft(AutomationLog.from_document(strip_object_id(document)))
             for document in self._mongo.outgoing.find({}):
                 queued = OutgoingMessage.from_document(strip_object_id(document))
                 if queued.outgoing_id:
@@ -136,13 +135,47 @@ class Repository:
             state = self._mongo.application_state.find_one({"_id": constants.SINGLETON_ID})
             if state:
                 self._app_state = ApplicationState.from_document(strip_object_id(state))
-            poll = self._mongo.poll_state.find_one({"_id": constants.SINGLETON_ID})
-            if poll:
-                self._poll_state = PollState.from_document(strip_object_id(poll))
             self._mongo.note_success()
         except Exception as ex:  # noqa: BLE001
             self._mongo.note_failure(ex)
             logger.error("Could not load state from MongoDB: %s", ex)
+
+    def _load_local_only(self) -> None:
+        """Warm the things MongoDB no longer stores, from the JSON mirror.
+
+        Logs and poll counters are diagnostics. They were in MongoDB because
+        everything was, and that cost a billable write per log line and one per
+        ten cycles forever. The mirror already held both, so this is where they
+        come back from — and the window shows the same history it always did."""
+        payload = self._backup.read_section(constants.JSON_LOGS)
+        if isinstance(payload, list):
+            for document in payload[-constants.JSON_LOG_LIMIT:]:
+                try:
+                    self._logs.append(AutomationLog.from_document(document))
+                except Exception:  # noqa: BLE001 - a bad line is not worth failing over
+                    continue
+        state = self._backup.read_section(constants.JSON_APP_STATE)
+        if isinstance(state, dict) and isinstance(state.get("poll_state"), dict):
+            try:
+                self._poll_state = PollState.from_document(state["poll_state"])
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _drop_retired_collections(self) -> None:
+        """Remove `automation_logs` and `poll_state` from an existing database.
+
+        They are written locally now, so what is in MongoDB is a frozen partial
+        copy — worse than nothing, because the next person to query the database
+        would find a log that silently stopped."""
+        for name in constants.RETIRED_COLLECTIONS:
+            try:
+                if name not in self._mongo.database.list_collection_names():
+                    continue
+                self._mongo.database.drop_collection(name)
+                self.log("INFO", "collection.retired",
+                         message=f"Dropped {name!r} from MongoDB — it is kept locally now.")
+            except Exception as ex:  # noqa: BLE001 - never block startup
+                logger.warning("Could not drop the retired collection %s: %s", name, ex)
 
     def _migrate_legacy_chats(self) -> None:
         """Retire the four-digit `external_id`, and re-arm the panel probe for
@@ -793,11 +826,12 @@ class Repository:
         with self._lock:
             self._logs.append(entry)
         logger.log(getattr(logging, entry.level, logging.INFO), "%s %s", event, message)
-        try:
-            self._mongo.automation_logs.insert_one(entry.to_document())
-            self._mongo.note_success()
-        except Exception as ex:  # noqa: BLE001
-            self._mongo.note_failure(ex)
+        # LOCAL ONLY. This used to also insert into MongoDB, which made every
+        # log line a billable write and stored it three times over: the ring
+        # buffer above feeds logs.json, and the line before this one writes
+        # wadam.log. A diagnostic trail is worth keeping and is not worth
+        # paying a cloud provider to keep for you.
+        self._mark_logs_dirty()
         self._mark_logs_dirty()
         return entry
 
@@ -816,12 +850,6 @@ class Repository:
         with self._lock:
             rows = [entry for entry in self._logs if not chat_id or entry.chat_id == chat_id]
         return rows[-limit:]
-
-    def prune_logs(self, keep: int = constants.LOG_RETENTION_ROWS) -> None:
-        """Trim the log collection to its newest `keep` rows. The in-memory ring
-        buffer and the JSON mirror are already bounded by their own maxlen; this
-        is only about the primary, which keeps everything until told not to."""
-        self._mongo.prune_logs(keep)
 
     # -- singletons --------------------------------------------------------
 
@@ -846,15 +874,13 @@ class Repository:
         self._mark_state_dirty()
 
     def save_poll_state(self, state: PollState) -> None:
+        """Cycle counters and timings. LOCAL ONLY.
+
+        Written on a timer, read by nothing but the status bar, and meaningless
+        after a restart — a MongoDB write for it was ~86,000 billable
+        operations a month to remember how many times a loop had run."""
         state.updated_at = utcnow()
         self._poll_state = state
-        try:
-            self._mongo.poll_state.update_one(
-                {"_id": constants.SINGLETON_ID}, {"$set": state.to_document()}, upsert=True
-            )
-            self._mongo.note_success()
-        except Exception as ex:  # noqa: BLE001
-            self._mongo.note_failure(ex)
         self._mark_state_dirty()
 
     # -- JSON mirror -------------------------------------------------------

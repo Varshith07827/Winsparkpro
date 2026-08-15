@@ -82,20 +82,36 @@ def test_bookkeeping_survives_every_periodic_branch(repo: Repository):
     assert state.last_cycle_utc is not None
 
 
-def test_the_first_cycle_persists_poll_state(repo: Repository):
+def test_the_first_cycle_records_poll_state_locally(repo: Repository):
+    """Cycle counters are diagnostics. They used to go to MongoDB every ten
+    cycles — a billable write to remember how many times a loop had run, and
+    meaningless after a restart. Kept in memory and in the JSON mirror now."""
     harness = make_harness(repo)
     asyncio.run(harness._record_cycle(5))
-    # A short run must still leave a trace — otherwise the collection only
-    # materializes after thirty seconds of uptime.
-    assert repo._mongo.poll_state.documents, "poll_state was not written on cycle 1"
+
+    assert repo.poll_state.cycle_count == 1
+    assert repo.poll_state.last_cycle_ms == 5
 
 
-def test_repository_exposes_prune_logs(repo: Repository):
-    # The exact call the poll loop makes. It is delegated to the primary store,
-    # which is the only place unbounded log growth can happen — the in-memory
-    # buffer and the JSON mirror are bounded by their own maxlen.
-    repo.prune_logs()
-    repo.prune_logs(keep=10)
+def test_the_retired_collections_are_never_reached_for(repo: Repository):
+    """A guard rather than an assertion about a fake: the store is wrapped so
+    that touching either retired collection raises, then the two paths that
+    used to write to them are exercised."""
+    class Tripwire:
+        def __init__(self, inner): self._inner = inner
+        def __getattr__(self, name):
+            if name in ("automation_logs", "poll_state"):
+                raise AssertionError(f"{name} is retired — writing it costs money")
+            return getattr(self._inner, name)
+
+    repo._mongo = Tripwire(repo._mongo)
+
+    repo.log("INFO", "test.event", message="hello")
+    repo.save_poll_state(repo.poll_state)
+
+    assert any(e.event == "test.event" for e in repo.recent_logs()), (
+        "still recorded — locally, in the ring buffer that feeds logs.json"
+    )
 
 
 def test_a_raising_repository_does_not_stop_the_loop(repo: Repository, monkeypatch):

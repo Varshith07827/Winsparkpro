@@ -51,9 +51,16 @@ COLLECTION_CHAT_CONFIGS = "chat_configs"
 COLLECTION_MESSAGES = "messages"
 COLLECTION_WEBHOOKS = "webhooks"
 COLLECTION_OUTGOING = "outgoing_queue"
-COLLECTION_AUTOMATION_LOGS = "automation_logs"
 COLLECTION_APPLICATION_STATE = "application_state"
-COLLECTION_POLL_STATE = "poll_state"
+
+#: Retired from MongoDB and kept locally instead — named here only so an
+#: existing database can be told to drop them.
+#:
+#: `automation_logs` was a billable write per log line, and stored three times
+#: over: the ring buffer feeds logs.json, and wadam.log gets the same line.
+#: `poll_state` was a write every ten cycles to remember how many times a loop
+#: had run — meaningless after a restart.
+RETIRED_COLLECTIONS = ("automation_logs", "poll_state")
 
 # Both singleton collections hold exactly one document under this _id.
 SINGLETON_ID = "singleton"
@@ -74,9 +81,6 @@ JSON_SETTINGS = "settings.json"
 JSON_MESSAGE_LIMIT = 5000
 JSON_WEBHOOK_LIMIT = 2000
 JSON_LOG_LIMIT = 2000
-
-# Rows kept in the automation_logs collection before the oldest are pruned.
-LOG_RETENTION_ROWS = 20000
 
 
 #: The MongoDB database. Fixed by the product specification and deliberately

@@ -154,6 +154,14 @@ class MongoStore:
 
     # -- collections -------------------------------------------------------
 
+    @property
+    def database(self):
+        """The database handle, for the few operations that are about the
+        database itself rather than a collection in it."""
+        if self._db is None:
+            raise MongoUnavailableError("MongoDB is not connected.")
+        return self._db
+
     def _collection(self, name: str):
         if self._db is None:
             raise MongoUnavailableError("MongoDB is not connected.")
@@ -176,16 +184,8 @@ class MongoStore:
         return self._collection(constants.COLLECTION_OUTGOING)
 
     @property
-    def automation_logs(self):
-        return self._collection(constants.COLLECTION_AUTOMATION_LOGS)
-
-    @property
     def application_state(self):
         return self._collection(constants.COLLECTION_APPLICATION_STATE)
-
-    @property
-    def poll_state(self):
-        return self._collection(constants.COLLECTION_POLL_STATE)
 
     def _ensure_indexes(self) -> None:
         """Indexes are created once at startup. The unique key on
@@ -206,8 +206,6 @@ class MongoStore:
             # The queue is read as "what is pending, oldest first, per chat".
             self.outgoing.create_index([("status", 1), ("chat_id", 1), ("sequence", 1)])
             self.webhooks.create_index([("chat_id", 1), ("created_at", -1)])
-            self.automation_logs.create_index([("created_at", -1)])
-            self.automation_logs.create_index("chat_id")
         except Exception as ex:  # noqa: BLE001
             # A read-only user or an existing conflicting index shouldn't stop
             # the app — everything still works, just slower and with the
@@ -222,27 +220,9 @@ class MongoStore:
                 "chats": self.chat_configs.estimated_document_count(),
                 "messages": self.messages.estimated_document_count(),
                 "webhooks": self.webhooks.estimated_document_count(),
-                "logs": self.automation_logs.estimated_document_count(),
             }
         except Exception:  # noqa: BLE001
             return {}
-
-    def prune_logs(self, keep: int = constants.LOG_RETENTION_ROWS) -> None:
-        """Trim the log collection to its newest `keep` rows."""
-        try:
-            total = self.automation_logs.estimated_document_count()
-            if total <= keep * 1.2:  # only pay for the scan once it's actually grown
-                return
-            cutoff_docs = list(
-                self.automation_logs.find({}, {"created_at": 1})
-                .sort("created_at", -1).skip(keep).limit(1)
-            )
-            if not cutoff_docs:
-                return
-            self.automation_logs.delete_many({"created_at": {"$lt": cutoff_docs[0]["created_at"]}})
-        except Exception as ex:  # noqa: BLE001
-            logger.warning("Log pruning failed: %s", ex)
-
 
 def strip_object_id(document: Optional[dict]) -> Optional[dict]:
     """Drop Mongo's `_id` so a document can be handed straight to a dataclass
