@@ -271,11 +271,15 @@ def test_the_reload_does_not_invent_chats(engine):
     assert [c.chat_name for c in repo.list_chats()] == ["Alice"]
 
 
-def test_the_reload_runs_every_cycle_because_a_slower_one_loses(engine):
-    """The first attempt reloaded every ten seconds and an edit never once took
-    effect: discovery saves each chat every three seconds, so the stale
-    in-memory value was written back over the edit and the reload then read its
-    own overwrite. A reload slower than the writes it races is no reload."""
+def test_the_reload_is_not_run_every_cycle(engine):
+    """It used to be, and had to be: every save wrote the whole chat, so a
+    routine write stamped stale config over an external edit and only a reload
+    faster than the writes could win.
+
+    `Repository._writable` fixed that at the source, so there is no race left to
+    win — and a read every three seconds against a paid cluster is a standing
+    charge for a value that changes when a person changes it. Measured on an
+    idle five-chat install: this was half of 1.7 million operations a month."""
     instance, repo = engine
     chat_on(repo)
     calls = []
@@ -284,7 +288,8 @@ def test_the_reload_runs_every_cycle_because_a_slower_one_loses(engine):
     for _ in range(3):
         asyncio.run(instance._reload_chat_config())
 
-    assert len(calls) == 3
+    assert len(calls) == 1
+    assert constants.CHAT_CONFIG_RELOAD_INTERVAL > constants.POLL_INTERVAL_SECONDS
 
 
 def test_an_external_edit_survives_the_save_that_follows_it(engine):
@@ -357,3 +362,27 @@ def test_the_two_together_survive_a_reload_cycle(engine):
     assert repo.get_chat(chat.chat_id).webhook_url == "https://edited.test/hook"
     stored = repo._mongo.chat_configs.find_one({"chat_id": chat.chat_id})
     assert stored["webhook_url"] == "https://edited.test/hook"
+
+
+def test_the_last_poll_stamp_is_not_written_every_cycle(engine):
+    """"When did we last look at this chat" is telemetry nobody decides
+    anything from, and it was an UPDATE on a three-second timer — measured as
+    half of the entire idle cost. Kept live in memory and in the JSON mirror;
+    written to MongoDB rarely."""
+    instance, repo = engine
+    chat = chat_on(repo)
+    from wadam.domain.models import utcnow
+
+    before = repo._mongo.chat_configs.updates if hasattr(
+        repo._mongo.chat_configs, "updates") else None
+    calls = []
+    original = repo._mongo.chat_configs.update_many
+    repo._mongo.chat_configs.update_many = lambda *a, **k: calls.append(1) or original(*a, **k)
+
+    for _ in range(5):
+        repo.touch_last_poll([chat.chat_id], utcnow())
+
+    assert len(calls) == 1, "the first write lands; the rest are held in memory"
+    assert repo.get_chat(chat.chat_id).last_poll_utc is not None, (
+        "and the value on screen is as live as it ever was"
+    )

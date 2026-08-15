@@ -27,11 +27,12 @@ from __future__ import annotations
 import logging
 import threading
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from wadam import constants
+from wadam.constants import POLL_TOUCH_INTERVAL
 from wadam.config import Settings
 from wadam.domain.models import (
     ApplicationState,
@@ -69,6 +70,8 @@ class Repository:
         self._poll_state = PollState()
         self._autosave = AutosaveTimer(self.flush_json, settings.json_autosave_interval or 15.0)
         self._recovered_from_json = False
+        # Epoch, so the first poll of a run always writes.
+        self._last_poll_written = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -266,6 +269,22 @@ class Repository:
                 chat = self._chats.get(chat_id)
                 if chat is not None:
                     chat.last_poll_utc = when
+
+        # In memory always; to MongoDB rarely.
+        #
+        # This is "when did we last look at this chat" — telemetry, worth
+        # roughly nothing after a restart, and it was a write on a 3-second
+        # timer whether or not anything happened. Measured: half of the entire
+        # idle cost of the application, 864,000 writes a month on a cluster
+        # where nobody had sent a message.
+        #
+        # A stale minute in a field nobody makes decisions from is not worth
+        # paying for. The JSON mirror still gets it on every flush, so the
+        # number on screen is as live as it ever was.
+        if (when - self._last_poll_written).total_seconds() < POLL_TOUCH_INTERVAL:
+            self._mark_chats_dirty()
+            return
+        self._last_poll_written = when
         try:
             self._mongo.chat_configs.update_many(
                 {"chat_id": {"$in": chat_ids}}, {"$set": {"last_poll_utc": when}}

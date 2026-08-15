@@ -18,6 +18,28 @@ POLL_INTERVAL_SECONDS = 3
 # that returns something new on every request cannot hold the tick open.
 MAX_RELAY_DRAIN = 10
 
+# --- what MongoDB is asked to do, and how often ----------------------------
+# Atlas bills per operation, so anything on a timer is a standing charge that
+# accrues whether or not the application did any work. Measured on an idle
+# five-chat install: 2 operations per 3-second cycle, 1.7 MILLION a month, for
+# nothing happening. These two intervals are where that went.
+
+#: Seconds between writing "last seen this chat" to MongoDB. Kept in memory and
+#: in the JSON mirror continuously; it is telemetry nobody decides anything
+#: from, so paying per-cycle for it is the wrong trade.
+POLL_TOUCH_INTERVAL = 300.0
+
+#: Seconds between re-reading chat CONFIGURATION from MongoDB, so an edit made
+#: outside this process takes effect without a restart.
+#:
+#: This ran every cycle for a while, and had to: every save wrote the whole
+#: chat, so a routine write stamped stale config back over an external edit and
+#: only a reload faster than the writes could win.  fixed
+#: that properly — a save no longer writes back a config field it did not
+#: change — so the reload no longer has a race to win and can cost what it
+#: should.
+CHAT_CONFIG_RELOAD_INTERVAL = 30.0
+
 
 # How many message bubbles are read out of a conversation per pass. WhatsApp
 # only realizes the visible tail into the accessibility tree anyway, so a

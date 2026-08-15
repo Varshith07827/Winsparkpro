@@ -15,6 +15,7 @@ MongoDB's own system database.
 from __future__ import annotations
 
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -49,6 +50,12 @@ def app_dir() -> Path:
     return PROJECT_ROOT
 
 _TRUE_VALUES = {"1", "true", "yes", "on"}
+
+#: MongoDB's own databases. Collections landing in one of these are hard to
+#: find and worse to clean up, which is why DATABASE_NAME was fixed for a while.
+_RESERVED_DATABASES = {"admin", "local", "config"}
+#: Characters MongoDB forbids in a database name, plus the space.
+_INVALID_DB_CHARS = re.compile(r'[/\. "$*<>:|?]')
 
 
 def parse_env_text(text: str) -> dict[str, str]:
@@ -99,8 +106,9 @@ class Settings:
     """The effective configuration. Immutable for the life of the process."""
 
     mongodb_uri: str = ""
-    #: Fixed, deliberately not configurable. Kept as a field so tests can use a
-    #: throwaway database, but nothing reads it from the environment.
+    #: Which database on the cluster. Configurable because one paid cluster
+    #: often serves more than one deployment, and mixing a staging run in with
+    #: real messages is not a mistake worth leaving available.
     database_name: str = DATABASE_NAME
     json_backup_folder: Path = field(default_factory=lambda: app_dir() / "backup")
     json_autosave_interval: float = 15.0
@@ -272,14 +280,26 @@ def load_settings(env_path: Optional[Path] = None) -> Settings:
     elif not mongodb_uri.startswith(("mongodb://", "mongodb+srv://")):
         problems.append("MONGODB_URI must start with mongodb:// or mongodb+srv://.")
 
-    # Fixed. It used to be configurable, which only ever created ways to get it
-    # wrong (DATABASE_NAME=admin put application collections in a system
-    # database). One less thing in .env, one less thing to validate.
-    database_name = DATABASE_NAME
-    if values.get("DATABASE_NAME"):
-        warnings.append(
-            f"DATABASE_NAME is ignored — the database is always {DATABASE_NAME!r}."
+    # Configurable, with a default. It was fixed for a while because a
+    # configurable name is a way to get it wrong — but one cluster serving more
+    # than one deployment needs separate databases, and on a paid cluster that
+    # is the difference between a staging run and somebody's real messages.
+    #
+    # The validation that made it worth fixing stays: MongoDB's own databases
+    # are refused outright rather than warned about, because collections landing
+    # in `admin` or `local` are a mess to find and a worse one to clean up.
+    database_name = (values.get("DATABASE_NAME") or "").strip() or DATABASE_NAME
+    if database_name.lower() in _RESERVED_DATABASES:
+        problems.append(
+            f"DATABASE_NAME cannot be {database_name!r} — that is one of MongoDB's "
+            f"own databases. Use something like {DATABASE_NAME!r}."
         )
+    elif _INVALID_DB_CHARS.search(database_name):
+        problems.append(
+            "DATABASE_NAME cannot contain any of / \\ . \" $ * < > : | ? or a space."
+        )
+    elif len(database_name.encode("utf-8")) > 63:
+        problems.append("DATABASE_NAME must be 63 bytes or fewer.")
 
     webhook_template = (values.get("WEBHOOK_URL")
                         or values.get("DEFAULT_WEBHOOK")

@@ -86,17 +86,64 @@ def test_the_database_name_is_fixed():
     assert constants.DATABASE_NAME == "wa_events"
 
 
-def test_the_database_name_cannot_be_set_from_the_environment(tmp_path: Path):
+def test_the_database_name_comes_from_the_environment(tmp_path: Path):
+    """Configurable again. It was fixed for a while because a configurable name
+    is a way to get it wrong, but one paid cluster commonly serves more than one
+    deployment, and mixing a staging run in with real messages is not a mistake
+    worth leaving available."""
     env = tmp_path / ".env"
     env.write_text(
         "MONGODB_URI=mongodb://localhost:27017\n"
-        "WEBHOOK_URL=https://noteify.org/ntext/whook/?{phone_number}\n"
-        "DATABASE_NAME=something_else\n",
+        "WEBHOOK_URL=https://x.test/?{phone_number}\n"
+        "DATABASE_NAME=client_acme\n",
         encoding="utf-8",
     )
-    settings = load_settings(env)
-    assert settings.database_name == "wa_events"
-    assert any("DATABASE_NAME is ignored" in w for w in settings.warnings)
+    assert load_settings(env).database_name == "client_acme"
+
+
+def test_the_database_name_defaults_when_unset(tmp_path: Path):
+    env = tmp_path / ".env"
+    env.write_text(
+        "MONGODB_URI=mongodb://localhost:27017\n"
+        "WEBHOOK_URL=https://x.test/?{phone_number}\n",
+        encoding="utf-8",
+    )
+    assert load_settings(env).database_name == "wa_events"
+
+
+@pytest.mark.parametrize("name", ["admin", "local", "config", "ADMIN"])
+def test_mongodbs_own_databases_are_refused(tmp_path: Path, name):
+    """The reason the setting was removed in the first place: collections
+    landing in `admin` are hard to find and worse to clean up. Refused now
+    rather than warned about, because a warning at startup is not read."""
+    from wadam.config import ConfigError
+
+    env = tmp_path / ".env"
+    env.write_text(
+        "MONGODB_URI=mongodb://localhost:27017\n"
+        "WEBHOOK_URL=https://x.test/?{phone_number}\n"
+        f"DATABASE_NAME={name}\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError):
+        load_settings(env)
+
+
+@pytest.mark.parametrize("name", ["my db", "a/b", "x.y", 'q"z', "a$b"])
+def test_a_name_mongodb_would_reject_is_caught_here(tmp_path: Path, name):
+    """Caught at startup with a sentence, rather than as a driver exception on
+    the first write."""
+    from wadam.config import ConfigError
+
+    env = tmp_path / ".env"
+    env.write_text(
+        "MONGODB_URI=mongodb://localhost:27017\n"
+        "WEBHOOK_URL=https://x.test/?{phone_number}\n"
+        f"DATABASE_NAME={name}\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError):
+        load_settings(env)
 
 
 def test_the_env_file_needs_only_two_settings(tmp_path: Path):

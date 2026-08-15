@@ -172,6 +172,7 @@ class AutomationEngine:
         self._active_chat_name = ""
         # When each chat's webhook was last GETted, by chat id (monotonic).
         self._relay_polled_at: dict[str, float] = {}
+        self._config_reloaded_at = 0.0
         self._session_state = win_session.probe(settings.whatsapp_window_title)
         self._capability_summary = "not probed yet"
         self._capabilities = None
@@ -732,11 +733,21 @@ class AutomationEngine:
         Only the configuration fields are taken (see `Repository.CONFIG_FIELDS`);
         runtime state stays with the process that is mutating it.
 
-        **Every cycle, and before discovery.** A slower reload does not work at
-        all: discovery saves each chat every cycle, so a reload on a longer
-        interval loses the race — the stale in-memory value is written back over
-        the edit and the reload then reads its own overwrite. Measured: at ten
-        seconds against a three-second save, an edit never once took effect."""
+        This ran every cycle for a while, and had to: every save wrote the whole
+        chat, so a routine write stamped stale configuration back over an
+        external edit and only a reload faster than the writes could win.
+        Measured at the time: at ten seconds against a three-second save, an
+        edit never once took effect.
+
+        `Repository._writable` fixed that at the source — a save no longer
+        writes back a config field this process did not change — so there is no
+        longer a race to win, and a read every three seconds against a paid
+        cluster is a standing charge for a value that changes when a person
+        changes it."""
+        now = time.monotonic()
+        if now - self._config_reloaded_at < constants.CHAT_CONFIG_RELOAD_INTERVAL:
+            return
+        self._config_reloaded_at = now
         changed = await asyncio.to_thread(self._repo.reload_chat_config)
         for chat_id in changed:
             chat = self._repo.get_chat(chat_id)
