@@ -52,6 +52,26 @@ def is_local_uri(uri: str) -> bool:
     return host.strip().lower() in _LOCAL_HOSTS
 
 
+def uri_uses_tls(uri: str) -> bool:
+    """Does this URI actually ask for TLS?
+
+    `mongodb+srv://` turns it on by default — that is how Atlas connects — and
+    otherwise it takes an explicit `tls=true` or the older `ssl=true`. A plain
+    `mongodb://host:27017` does not, however remote the host is, so nothing
+    here should assume otherwise. Either option can also be spelled `=false`,
+    which wins over the SRV default."""
+    text = (uri or "").strip()
+    query = text.split("?", 1)[1].lower() if "?" in text else ""
+    options = dict(
+        pair.split("=", 1) for pair in query.split("&")
+        if "=" in pair
+    )
+    for key in ("tls", "ssl"):
+        if key in options:
+            return options[key].strip() in ("true", "1", "yes")
+    return is_srv_uri(text)
+
+
 def timeout_for(uri: str) -> int:
     return LOCAL_TIMEOUT_MS if is_local_uri(uri) else REMOTE_TIMEOUT_MS
 
@@ -87,7 +107,18 @@ class MongoStore:
             "connectTimeoutMS": timeout_for(self._uri),
             "appname": constants.APP_SHORT_NAME,
         }
-        if not is_local_uri(self._uri):
+        # TLS is the URI's business, not this function's.
+        #
+        # A CA bundle used to be attached to every non-local URI, on the
+        # reasoning that a remote server means TLS. It does not: a plain
+        # `mongodb://host:27017` on a private network speaks no TLS at all, and
+        # supplying TLS options for a connection that has none is at best noise
+        # and at worst a handshake nobody asked for.
+        #
+        # So the bundle is supplied only when the URI itself asks for TLS —
+        # `mongodb+srv://`, which defaults it on, or an explicit `tls=true` /
+        # `ssl=true`. Everything else connects exactly as written.
+        if uri_uses_tls(self._uri):
             try:
                 import certifi
 

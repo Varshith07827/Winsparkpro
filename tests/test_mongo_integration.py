@@ -263,3 +263,68 @@ def test_logs_and_poll_counters_stay_out_of_the_database(repo: Repository, store
     names = set(store._db.list_collection_names())
     assert not set(constants.RETIRED_COLLECTIONS) & names
     assert len(repo.recent_logs(limit=100)) >= 60, "kept locally, in full"
+
+
+# ---------------------------------------------------------------------------
+# TLS is the URI's business
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("uri,expected", [
+    ("mongodb://localhost:27017", False),
+    ("mongodb://10.0.0.5:27017", False),
+    ("mongodb://user:pw@db.internal:27017/?authSource=admin", False),
+    ("mongodb+srv://user:pw@cluster.abc.mongodb.net/", True),
+    ("mongodb://host:27017/?tls=true", True),
+    ("mongodb://host:27017/?ssl=true", True),
+])
+def test_tls_is_read_from_the_uri_not_assumed(uri, expected):
+    """A CA bundle used to be attached to every non-local URI, on the reasoning
+    that remote means TLS. It does not: a plain `mongodb://host:27017` on a
+    private network speaks none, and supplying TLS options for a connection
+    that has no TLS is noise at best."""
+    from wadam.storage.mongo import uri_uses_tls
+
+    assert uri_uses_tls(uri) is expected
+
+
+@pytest.mark.parametrize("uri", [
+    "mongodb+srv://user:pw@cluster.abc.mongodb.net/?tls=false",
+    "mongodb+srv://user:pw@cluster.abc.mongodb.net/?ssl=false",
+])
+def test_an_explicit_false_beats_the_srv_default(uri):
+    """SRV turns TLS on by default, and `tls=false` turns it back off. Reading
+    the scheme alone would ignore what the URI actually says."""
+    from wadam.storage.mongo import uri_uses_tls
+
+    assert uri_uses_tls(uri) is False
+
+
+def test_a_plain_remote_uri_gets_no_tls_options(monkeypatch):
+    """The behaviour that matters: what is handed to MongoClient."""
+    from wadam.storage import mongo as M
+
+    captured = {}
+
+    class FakeClient:
+        def __init__(self, uri, **kwargs):
+            captured.update(kwargs)
+            self.admin = self
+
+        def command(self, _name):
+            return {"ok": 1}
+
+        def __getitem__(self, _name):
+            raise RuntimeError("stop here — the options are what is being checked")
+
+    import pymongo
+
+    monkeypatch.setattr(pymongo, "MongoClient", FakeClient)
+    store = M.MongoStore("mongodb://db.internal:27017", "wa_events")
+    try:
+        store.connect()
+    except Exception:  # noqa: BLE001 - the fake stops after the options are read
+        pass
+
+    assert "tlsCAFile" not in captured
+    assert not any(k.lower().startswith(("tls", "ssl")) for k in captured)
