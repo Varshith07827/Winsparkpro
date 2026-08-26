@@ -41,13 +41,16 @@ MAX_WIDTH = 560
 
 
 def _sort_key(chat: ChatConfig):
-    """Pinned first, then unread, then most recently updated — WhatsApp's own
-    ordering, approximated. The sidebar's real order isn't available to us (rows
-    come back in whatever order the grid realizes them), so it is reconstructed
-    from what each row carries."""
+    """Most recently active first, then by name.
+
+    This used to approximate WhatsApp's own sidebar order — pinned first, then
+    unread, then recency — reconstructed from what each scraped row carried.
+    Pin state and unread counts came from the sidebar and OpenWA's
+    `message.received` does not carry either, so the two leading terms would
+    now be constants. Recency is what is left, and it is what actually matters
+    in a list of chats being answered.
+    """
     return (
-        not chat.is_pinned,
-        not bool(chat.unread_count),
         -(chat.updated_at.timestamp() if chat.updated_at else 0),
         chat.chat_name.lower(),
     )
@@ -171,9 +174,8 @@ class ChatListPanel(QWidget):
         # Rebuilding an unchanged list would reset the scroll position and
         # flicker the selection every poll, which is worse than useless.
         signature = tuple(
-            (c.chat_id, c.chat_name, c.last_message_preview, c.timestamp_text,
-             c.unread_count, c.automation_enabled, bool(c.webhook_url),
-             c.is_pinned, self._webhook_failing(c))
+            (c.chat_id, c.chat_name, c.last_message_preview,
+             c.automation_enabled, bool(c.last_error))
             for c in visible
         )
         if not force and signature == self._render_signature:
@@ -192,12 +194,15 @@ class ChatListPanel(QWidget):
         self._list.blockSignals(False)
 
     @staticmethod
-    def _webhook_failing(chat: ChatConfig) -> bool:
-        """Per-chat connection status: did this chat's webhook last fail?
-        Surfaced as the HOOK badge's colour so a broken endpoint is visible in
-        the list rather than only after clicking through to the panel."""
-        status = (chat.last_webhook_status or "").lower()
-        return bool(status) and ("fail" in status or "timeout" in status or "error" in status)
+    def _has_error(chat: ChatConfig) -> bool:
+        """Did the last thing this chat attempted fail?
+
+        Was `_webhook_failing`, reading a per-chat webhook's last status. There
+        is one webhook now and it belongs to the session, not the chat, so what
+        is worth surfacing in the list is the chat's own last error — a send
+        that did not go.
+        """
+        return bool(chat.last_error)
 
     def _visible_chats(self) -> list[ChatConfig]:
         query = self._search.text().strip().lower()
@@ -213,14 +218,13 @@ class ChatListPanel(QWidget):
     def _tooltip_for(chat: ChatConfig) -> str:
         lines = [chat.chat_name]
         lines.append("Automation: " + ("ON" if chat.automation_enabled else "OFF"))
-        lines.append("Webhook: " + (chat.webhook_url or "not configured"))
-        if chat.last_webhook_status:
-            lines.append("Last webhook: " + chat.last_webhook_status)
+        lines.append(chat.chat_id)
+        if chat.last_error:
+            lines.append("Last error: " + chat.last_error)
         lines.append("Messages stored: " + str(chat.messages_stored))
-        if chat.automation_enabled:
-            # Said before the click, not only in the dialog after it. A user who
-            # hovers a ticked box should already know what unticking costs.
-            lines.append("Unticking deletes this chat's stored records.")
+        # A warning that unticking deletes the chat's records used to sit here,
+        # said before the click rather than only in the dialog after it.
+        # Unticking no longer deletes anything, so it would now be a lie.
         return "\n".join(lines)
 
     # -- selection ---------------------------------------------------------

@@ -107,7 +107,13 @@ class ChatItemDelegate(QStyledItemDelegate):
         painter.drawText(circle, Qt.AlignCenter, theme.initials(chat.chat_name))
 
     def _paint_timestamp(self, painter: QPainter, rect: QRect, chat, right_edge: int) -> int:
-        text = chat.timestamp_text or ""
+        """The chat's last activity, as a clock label.
+
+        This used to render `timestamp_text` — the sidebar's own label, scraped
+        verbatim. OpenWA sends no such string, so it is formatted from the
+        chat's `updated_at` instead.
+        """
+        text = chat.updated_at.strftime("%H:%M") if chat.updated_at else ""
         if not text:
             return right_edge
         font = QFont(painter.font())
@@ -116,7 +122,7 @@ class ChatItemDelegate(QStyledItemDelegate):
         painter.setFont(font)
         metrics = QFontMetrics(font)
         width = metrics.horizontalAdvance(text)
-        painter.setPen(QPen(QColor(theme.ACCENT if chat.unread_count else theme.TEXT_MUTED)))
+        painter.setPen(QPen(QColor(theme.ACCENT if chat.automation_enabled else theme.TEXT_MUTED)))
         box = QRect(right_edge - width, rect.top() + 14, width, metrics.height())
         painter.drawText(box, Qt.AlignRight | Qt.AlignVCenter, text)
         return right_edge - width - 8

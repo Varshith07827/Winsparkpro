@@ -12,3 +12,6 @@ __pycache__/
 build/
 dist/
 *.spec
+
+# Runtime JSON mirror — never source
+backup/
