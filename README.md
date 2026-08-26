@@ -148,9 +148,17 @@ curl -X POST http://127.0.0.1:8766/wam/ -H "Content-Type: application/json" -d "
 ```
 
 Off unless `API_PORT` is set, loopback-bound by default (where a token is
-optional; bind it anywhere else and `API_TOKEN` is mandatory). `id` is a chat
-id, a name, or a phone number. **An identifier matching more than one chat is
-refused with 409**, never delivered to a guess.
+optional; bind it anywhere else and `API_TOKEN` is mandatory — configuration
+refuses to start otherwise). `id` is a chat id, a name, or a phone number.
+**An identifier matching more than one chat is refused with 409**, never
+delivered to a guess.
+
+Addressing by name is the point: WhatsApp's LID means a chat is
+`216298915164281@lid`, which nobody can remember and which cannot be derived
+from a phone number. wadam keeps the mapping.
+
+To run this on a remote machine and send to it from your own, see
+[DEPLOYMENT.md](docs/DEPLOYMENT.md).
 
 ---
 
@@ -162,6 +170,7 @@ refused with 409**, never delivered to a guess.
 | [DATA.md](docs/DATA.md) | MongoDB collections, the message lifecycle, the JSON mirror |
 | [UI.md](docs/UI.md) | The window, and what the status bar is telling you |
 | [SEND_API.md](docs/SEND_API.md) | The inbound HTTP API and how `id` resolves |
+| [DEPLOYMENT.md](docs/DEPLOYMENT.md) | Running it on a remote desktop and sending to it from your own machine |
 | [OPERATIONS.md](docs/OPERATIONS.md) | Wiring it to OpenWA, health, and what to check when a ticked chat is silent |
 | [LIMITATIONS.md](docs/LIMITATIONS.md) | Honest boundaries |
 

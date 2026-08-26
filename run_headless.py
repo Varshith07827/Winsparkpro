@@ -13,6 +13,7 @@ import signal
 import sys
 from pathlib import Path
 
+from wadam.api.host import SendApiHost
 from wadam.config import ConfigError, load_settings
 from wadam.engine.service import AutomationService
 from wadam.logging_setup import configure_logging
@@ -48,6 +49,14 @@ def main() -> int:
     log.info("session %s · mongo %s · %d chat(s)",
              snapshot.session_status, snapshot.mongo_status, len(snapshot.chats))
 
+    # After the listener: a send arriving before the service exists would fail
+    # for a reason the caller could do nothing about.
+    api = SendApiHost(settings, repository, service)
+    if api.enabled:
+        api.start()
+    else:
+        log.info("send API off (set API_PORT to enable)")
+
     stopping = False
 
     def shutdown(_signum, _frame):
@@ -61,6 +70,7 @@ def main() -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        api.stop()
         service.stop()
         repository.stop()
         mongo.close()
