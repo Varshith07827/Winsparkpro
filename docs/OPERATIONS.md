@@ -1,258 +1,156 @@
-# Operations and architecture
+# Operations
 
-Developer documentation for running and maintaining the automation engine.
-For *why* sending cannot be invisible, see [HEADLESS.md](HEADLESS.md); this
-document assumes that finding and describes the system built around it.
+## What has to be running
 
----
-
-## Architecture
-
-```
-                          WhatsApp Desktop
-                                 │  UI Automation (read: free, write: no-op)
-                    ┌────────────┴────────────┐
-                    │   STA automation thread │   one thread, COM-safe
-                    └────────────┬────────────┘
-                                 │
-   ┌─────────────────────────────┴──────────────────────────────────────┐
-   │  Engine — own asyncio loop, own OS thread                          │
-   │                                                                    │
-   │   poll loop (3 s)          worker              relay loop          │
-   │   ───────────────          ──────              ──────────          │
-   │   discovery                scan chat           GET each webhook    │
-   │   read open chat           read messages       parse + dedupe      │
-   │   detect change            webhook dispatch    enqueue             │
-   │   enqueue jobs             enqueue replies                         │
-   │                                 │                                  │
-   │                                 ▼                                  │
-   │                       ┌──────────────────┐                         │
-   │                       │  OUTGOING QUEUE  │  durable, per-chat order │
-   │                       └────────┬─────────┘                         │
-   │                                ▼                                   │
-   │                      send ─▶ verify ─▶ delivered                   │
-   └──────┬───────────────────────────────┬─────────────────────────────┘
-          │ every write                   │ snapshots
-   ┌──────▼─────────────┐          ┌──────▼──────────────┐
-   │ Repository         │          │ UI (Qt thread)      │
-   │ ├─▶ MongoDB        │          │ chat rail           │
-   │ └─▶ JSON mirror    │          │ config · health · ops│
-   └────────────────────┘          └─────────────────────┘
-          ▲
-          │ submit(send)
-   ┌──────┴───────────┐
-   │ Send API (opt.)  │◀── POST {"id","message"}
-   └──────────────────┘
-```
-
-Dependency direction is one-way:
-`{ui, api} → engine → {storage, whatsapp} → domain`.
-
----
-
-## Lifecycles
-
-### Message (incoming)
-
-```
-detected ─▶ PENDING ─▶ DISPATCHING ─▶ [webhook] ─▶ AWAITING_SEND ─▶ REPLIED
-                │                          │
-                └─▶ SEEDED / IGNORED       └─▶ WEBHOOK_OK / WEBHOOK_FAILED
-```
-
-`DISPATCHING` is written *before* the webhook call, so a crash there is known
-to be ambiguous and is never retried. See [DATA.md](DATA.md#message-lifecycle).
-
-### Outgoing message (queue)
-
-```
-                       enqueue (persisted)
-                              │
-                              ▼
-                          QUEUED ◀──────────┐ transport failed, attempts left
-                              │             │
-                              ▼             │
-                          SENDING ──────────┘
-                              │ compose box cleared
-                              ▼
-                        VERIFYING
-                    ┌─────────┴──────────┐
-        new bubble  │                    │  no bubble within 8 s
-                    ▼                    ▼
-                DELIVERED           UNVERIFIED   ← never auto-retried
-                                                   (a retry risks a duplicate)
-
-    attempts exhausted ─▶ FAILED      chat deleted ─▶ CANCELLED
-```
-
-On restart:
-
-| Found in | Meaning | Action |
-|---|---|---|
-| `QUEUED` | nothing was attempted | send |
-| `SENDING` / `VERIFYING` | may already be on their screen | **read the chat first**, send only if absent |
-| `DELIVERED` / `UNVERIFIED` / `FAILED` / `CANCELLED` | finished | leave |
-
-Ordering is per chat, assigned at enqueue time (`sequence`), so two replies to
-one conversation arrive in the order they were produced. One drainer means
-sends never overlap.
-
-### Sender
-
-```
-preflight (session)  ─▶ blocked?  ─▶ refuse with a reason, message stays queued
-        │
-        ▼
-wait for 1.5 s of user idle  (cap 20 s)
-        │
-        ▼
-capture foreground ─▶ open chat (if not already open)
-        │                └─ pattern attempts → viewport-checked click (cursor restored)
-        ▼
-fill compose  ValuePattern ─▶ clipboard paste ─▶ per-character Unicode
-        │      (no-op today)   (SetFocus, no cursor)
-        ▼
-send  InvokePattern on Send ─▶ Enter
-        ▼
-compose box empties  = transport success
-        ▼
-restore foreground ─▶ hand back to whatever was in front
-```
-
-### Session
-
-```
-                    WTSRegisterSessionNotification
-                              │
-     lock / unlock / RDP connect / disconnect / console attach / logoff
-                              │
-                              ▼
-                    re-probe immediately ──▶ publish
-```
-
-`OpenInputDesktop` remains the authority — the events only stop the answer
-being up to one cycle out of date. If registration fails, polling alone is
-still correct, just later.
-
-### Capability probe
-
-```
-startup ─▶ read WhatsApp package version
-              │
-      cached version matches? ──yes──▶ use the cached result
-              │ no
-              ▼
-   write a probe string via ValuePattern, read it back, restore
-   write a probe string via LegacyIAccessible, read it back, restore
-   record which patterns are present on chat rows / the Send button
-              │
-              ▼
-   cache against the version ─▶ adapt automatically
-```
-
-Skipped entirely if the compose box is not empty — probing must never destroy
-something being typed. A WhatsApp update invalidates the cache, so the day the
-provider implements `SetValue`, sending goes silent with no code change.
-
----
-
-## Runtime health
-
-Shown in the configuration panel and the status bar:
-
-```
-WhatsApp            Connected
-Desktop session     Active (Default)
-Session type        RDP (session 4)
-UI Automation       Available
-Sender              Ready
-```
-
-Operations counters, all cumulative since start, with windowed averages:
-
-```
-Messages read / queued / sent / verified      Delivery rate
-Verification failures · Send failures         Queue depth
-Webhook calls (failures) · Relay polls        Reconnects
-Sends held (session) · Focus restores         Cursor restores
-Average read / send / verification / webhook
-```
-
-Averages use a 50-sample window on purpose. A lifetime mean stops moving and
-will report a healthy 900 ms while every send in the last ten minutes has taken
-twelve seconds.
-
----
-
-## Why UIA write patterns fail
-
-Established through raw `IUIAutomation` COM, with the Python wrapper removed:
-
-```
-IUIAutomationValuePattern::SetValue("…")   →  S_OK, no COMError
-CurrentIsReadOnly                          →  0  (writable)
-CurrentValue after                         →  '\n'   unchanged
-```
-
-WhatsApp Desktop is an MSIX app (`5319275A.WhatsAppDesktop`) with a WinUI 3
-shell over Chromium content. Its UIA provider maps the accessibility tree for
-**reading** and leaves the write side unimplemented while still advertising it.
-Full evidence, including the same result for `SelectionItemPattern.Select`,
-`LegacyIAccessible`, `WM_SETTEXT` and `WM_CHAR`, in [HEADLESS.md](HEADLESS.md).
-
-Consequence for maintainers: **never trust pattern availability as proof of
-capability.** Probe it. That is what `wadam/whatsapp/capabilities.py` is for.
-
----
-
-## Supported environments
-
-| | Status |
+| | |
 |---|---|
-| Windows 10/11, console session, unlocked | **Supported** — full read and send |
-| Windows 11 over RDP, client connected | **Supported** — sends while attached |
-| RDP session disconnected | **Read only.** Sends are held with a stated reason, not failed |
-| Workstation locked | **Read only.** Same hold |
-| Windows service / Session 0 | **Not supported.** No interactive desktop, ever |
-| Headless VM with no display | **Not supported for sending.** Needs a virtual display + auto-logon |
-| Multiple instances on one machine | **Not supported.** Two processes fight over the foreground |
-| WhatsApp minimised | Supported — restored automatically for a send |
-| WhatsApp closed | Detected; reconnects within one cycle when it returns |
+| **OpenWA** | With a linked session in `ready` state |
+| **MongoDB** | Local `mongod` or Atlas |
+| **This application** | GUI (`run.py`) or headless (`run_headless.py`) |
+
+WhatsApp Desktop is **not** required, and neither is Windows. The last reason
+this was Windows-only was the UI-Automation transport; it has been replaced by
+HTTP calls made with the standard library.
 
 ---
 
-## Deployment recommendations
+## Wiring it to OpenWA
 
-1. **Dedicated machine or VM.** The one unavoidable interruption only matters if
-   somebody is using that desktop.
-2. **Console session, not RDP.** Or `tscon <id> /dest:console` to move an RDP
-   session to the console, where it survives the client disconnecting.
-3. **Disable the lock timeout and screensaver.** A locked workstation switches
-   input to the `Winlogon` desktop and sending stops until it is unlocked.
-4. **Do not run as a Windows service.** Session 0 isolation makes sending
-   permanently impossible; run it as a logged-on user, via Task Scheduler with
-   "run only when user is logged on" if it needs to start automatically.
-5. **Keep MongoDB local** unless you need otherwise — the queue and mirror are
-   both on the critical path for every message.
-6. **Watch three numbers**: queue depth (should return to zero), verification
-   failures (should be zero), and sends held (non-zero means the session keeps
-   going away).
+Register a webhook against the session:
+
+```bash
+curl -X POST http://localhost:2785/api/sessions/<session-id>/webhooks \
+  -H "x-api-key: <openwa-api-key>" \
+  -H "Content-Type: application/json" \
+  -d '{"url":"http://host.docker.internal:8765/hook",
+       "events":["message.received"],
+       "secret":"<WEBHOOK_SECRET from .env>",
+       "retryCount":3}'
+```
+
+Two things go wrong here more than anything else.
+
+**`localhost` inside the container is the container.** OpenWA resolves the
+webhook URL from inside Docker, so a URL pointing at `http://localhost:8765`
+reaches nothing and every delivery fails. Docker Desktop publishes the host as
+`host.docker.internal`. That is also why `WEBHOOK_HOST` defaults to `0.0.0.0`
+rather than `127.0.0.1` — a loopback listener is unreachable from the
+container.
+
+**OpenWA blocks internal addresses by default.** Its SSRF guard refuses to
+deliver to a URL resolving into a private range, which `host.docker.internal`
+does:
+
+```
+400  Host host.docker.internal resolves to a blocked internal address: 192.168.127.254
+```
+
+Add `SSRF_ALLOWED_HOSTS=host.docker.internal` to **OpenWA's** `.env` and
+recreate its container. That is the narrow allowlist, which OpenWA's own source
+recommends over `WEBHOOK_SSRF_PROTECT=false`.
+
+Verify the wiring without sending a WhatsApp message:
+
+```bash
+curl -X POST http://localhost:2785/api/sessions/<session-id>/webhooks/<webhook-id>/test \
+  -H "x-api-key: <openwa-api-key>"
+```
+
+`{"success":true,"statusCode":200}` proves the container reached the host
+**and** that the signature matched — a mismatch would be a 401 and OpenWA would
+report failure.
 
 ---
 
-## Failure taxonomy
+## Health
 
-Every failure is classified, and the classes want different responses:
+```bash
+curl http://localhost:8765/health
+```
 
-| Class | Log event | Meaning | Retried? |
-|---|---|---|---|
-| Session hold | `session.changed` | no interactive desktop | held, resumes automatically |
-| Transport | `outgoing.retry` / `outgoing.failed` | never left the compose box | **yes**, to `max_attempts` |
-| Verification | `outgoing.unverified` | left the box, no bubble found | **no** — a retry risks a duplicate |
-| Webhook | `webhook.failed` | endpoint error | yes, per the retry policy |
-| Interrupted | `recovery.interrupted` | crashed mid-webhook | **no** — may already have been delivered |
-| Ambiguous send | `outgoing.recovered` / `outgoing.resuming` | crashed mid-send | verified first, then sent only if absent |
+```json
+{"ok": true, "listening": true, "session": "ready",
+ "mongo": "connected · wa_events",
+ "deliveries": 12, "replies": 4, "send_failures": 0}
+```
 
-Nothing fails silently. The two "no" rows are the ones to understand: both
-choose a *missed* message over a *duplicate* one, because a duplicate reaches
-someone else's phone and cannot be taken back.
+`deliveries` is the number to look at first. Zero means OpenWA is not reaching
+this process, which is a webhook problem, not an automation one.
+
+---
+
+## When a ticked chat is not being answered
+
+Work down this list; each step rules out the one above it.
+
+1. **`deliveries` is 0** → OpenWA is not reaching the listener. Check the
+   webhook URL uses `host.docker.internal`, that `SSRF_ALLOWED_HOSTS` is set,
+   and that nothing else holds the port.
+2. **Deliveries climb, `replies` stays 0, log says `invalid signature`** →
+   `WEBHOOK_SECRET` and the webhook's `secret` in OpenWA differ.
+3. **Log says `automation off for this chat`** → tick the box.
+4. **Log says `no reply wanted`** → `reply_for` returned `None`. Working as
+   configured.
+5. **Log says `cooldown`** → within `COOLDOWN_SECONDS` of the last reply to
+   that chat.
+6. **Log says `duplicate delivery`** → OpenWA retried something already
+   handled. Correct behaviour.
+7. **`send_failures` climbing** → the send reached OpenWA and was refused. The
+   message's `error` field says why; a session that is not `ready` is the usual
+   cause.
+
+---
+
+## Known failure modes
+
+**A send reported as failed that actually arrived.** OpenWA 0.7.2's
+whatsapp-web.js adapter dereferenced `msg.id._serialized` on a `sendMessage`
+that returned `undefined`, so a delivered message came back as HTTP 500 and was
+stored as `failed`. Fixed in newer OpenWA, which routes through `sendResolved`
+and `toMessageResult`. If you see `failed` messages that recipients confirm
+receiving, check OpenWA's version first.
+
+This is also why a failed send is **not retried**: a retry would have sent four
+copies of that message.
+
+**A session that needs re-pairing after an OpenWA image change.** Stored auth
+is tied to the browser profile. A different Chromium version in a rebuilt image
+can invalidate it, and OpenWA clears the auth and asks for a QR. Pinning
+`WWEBJS_WEB_VERSION` to the build a session was paired under makes this less
+likely.
+
+---
+
+## Backup and recovery
+
+MongoDB is the primary. The JSON mirror in `JSON_BACKUP_FOLDER` is a readable
+second copy, and if MongoDB starts empty while the mirror has chats,
+configuration is restored from it and written back — the startup screen says so.
+
+The mirror is capped (5,000 messages, 2,000 log lines). It is a safety net and
+a debugging aid, not an archive.
+
+---
+
+## Logs
+
+`wadam.log` in the backup folder, plus stdout. `LOG_LEVEL=DEBUG` adds
+per-request HTTP lines.
+
+The in-app activity log is mirrored to `logs.json` and shown in the window. It
+is deliberately not written to MongoDB — a billable write per log line, stored
+three times over.
+
+---
+
+## Upgrading
+
+Retired collections are dropped on boot, so moving from an older version needs
+no manual migration. The four dropped so far: `automation_logs`, `poll_state`,
+`webhooks`, `outgoing_queue`.
+
+Chat documents from an older version still load — unknown keys are ignored and
+missing ones take their defaults. A chat that predates the OpenWA transport
+will have a name-derived `chat_id` that no longer matches anything OpenWA
+sends, so it will sit inert while the real chat is registered fresh. Delete the
+stale rows once you have confirmed the new ones work.

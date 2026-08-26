@@ -158,12 +158,12 @@ refused with 409**, never delivered to a guess.
 
 | | |
 |---|---|
-| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | The two flows, module boundaries, message lifecycle |
-| [DATA.md](docs/DATA.md) | MongoDB collections and the JSON mirror |
-| [UI.md](docs/UI.md) | Screen-by-screen walkthrough |
-| [SEND_API.md](docs/SEND_API.md) | The inbound HTTP API |
-| [OPERATIONS.md](docs/OPERATIONS.md) | Health, deployment, supported environments |
-| [LIMITATIONS.md](docs/LIMITATIONS.md) | Known limitations |
+| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Threads, modules, one message end to end, and why almost everything answers 200 |
+| [DATA.md](docs/DATA.md) | MongoDB collections, the message lifecycle, the JSON mirror |
+| [UI.md](docs/UI.md) | The window, and what the status bar is telling you |
+| [SEND_API.md](docs/SEND_API.md) | The inbound HTTP API and how `id` resolves |
+| [OPERATIONS.md](docs/OPERATIONS.md) | Wiring it to OpenWA, health, and what to check when a ticked chat is silent |
+| [LIMITATIONS.md](docs/LIMITATIONS.md) | Honest boundaries |
 
 ---
 
@@ -173,7 +173,7 @@ refused with 409**, never delivered to a guess.
 python -m pytest -q
 ```
 
-94 tests, ~4 seconds. Storage tests run twice — against a dict-backed fake and,
+100 tests, ~4 seconds. Storage tests run twice — against a dict-backed fake and,
 when one is reachable, a real `mongod`. Doubles here have been caught lying
 before.
 

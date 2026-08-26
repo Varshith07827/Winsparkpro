@@ -1,173 +1,115 @@
-# Interface walkthrough
+# The window
 
-WhatsApp Desktop's layout, with per-chat automation configuration where the
-conversation would be. Someone who uses WhatsApp should not need to learn
-anything to find their way around.
+```
+┌───────────────────────────────┬──────────────────────────────────────┐
+│ search                        │ V                                    │
+│───────────────────────────────├──────────────────────────────────────┤
+│ ☑ V            pong        2  │ 216298915164281@lid                  │
+│ ☐ Team chat    Are you…       │ automation on                        │
+│ ☑ Bob          Send the file  │──────────────────────────────────────│
+│                               │  ← ping                       9:21   │
+│                               │  → pong                       9:21   │
+├───────────────────────────────┴──────────────────────────────────────┤
+│ session ready · 918985370703 · 12 delivered · 4 replied · MongoDB ·  │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+**The tick box is the only control.** Everything else is a read of what
+happened.
 
 ---
 
-## Main window
+## The chat list
 
-![Main window, dark theme](screens/main-dark.png)
+Chats appear on their own, the first time a message arrives from them. There is
+no "add chat" step and no manual refresh — the list repaints the moment a
+delivery lands.
 
-### Top bar
+A new chat arrives with its box **unticked**. Tick it and the chat starts being
+answered; untick it and it stops. That is immediate and silent in both
+directions.
 
-Application name, live engine state (`watching 9 chats`, `reading Alice…`,
-`waiting for WhatsApp Desktop`), **Rescan chats**, and the global **Automation
-ON/OFF** at top right.
+Untiicking does **not** delete anything. The earlier version deleted the chat's
+entire stored history when you unticked it, which is why it asked for
+confirmation first — a stray click on a 14-pixel target would destroy a history
+nothing could restore. Turning automation off should stop replies, not destroy
+the history you turned it off in order to read, so both the deletion and the
+dialog guarding it are gone.
 
-The global switch is a **bulk action, not a master gate**: pressing it writes
-`automation_enabled` to every chat, and afterwards individual chats can be
-toggled and that choice stands. A gate would silently veto a chat switched on
-after a global OFF. It asks for confirmation, naming the number of chats.
+Search filters by name.
 
-### Left rail
+---
 
-Does not collapse — it has a minimum and maximum width, so the splitter resizes
-it within WhatsApp-like proportions and can never hide it.
+## The detail panel
 
-* **Profile strip** — avatar, name, and a status line with a coloured dot:
-  green when WhatsApp is connected, red when it is not. `9 chats · 5 automated ·
-  WhatsApp connected`.
-* **Search** — filters as you type, on both chat name and last message. No
-  refresh button anywhere in the application. `Ctrl+F` or `Ctrl+K` focuses it;
-  `Escape` clears it, then moves focus into the list, where the arrow keys
-  navigate.
-* **Chat rows**, 72px with a 49px avatar circle, ordered pinned → unread →
-  most recent. Each shows avatar (initials, coloured by a hash of the name so it
-  stays the same between runs), name, last message preview, timestamp, and
-  badges:
+Click a chat to see:
 
-| Badge | Meaning |
+- **Its name**, from the sender's push name.
+- **Its identity** — the chat id, and a phone number when there genuinely is
+  one. A `@lid` chat has no derivable number, so only the id is shown. This is
+  deliberate: a plausible-looking number that belongs to nobody is worse than
+  no number.
+- **Its state** — automation on or off, whether it is a group, and any last
+  error.
+- **The transcript** — the last 200 messages, `←` in and `→` out. A failed send
+  is the one thing coloured.
+
+Nothing on this panel can be typed into. It used to carry two editable fields:
+
+- **A phone number**, because WhatsApp Desktop would not give one up — it shows
+  a saved contact by name and exposes the number nowhere readable (measured:
+  zero phone-shaped strings across every accessible name in the window). The
+  per-chat webhook URL was built from that number, so without it a chat could
+  never forward anything. OpenWA supplies the identity, so the field has
+  nothing left to do.
+- **A webhook URL**, derived per chat from a global template. There is one
+  webhook now, registered against the session inside OpenWA.
+
+---
+
+## The status bar
+
+| Reads | Means |
 |---|---|
-| **3** teal | unread count |
-| **AUTO** teal | automation enabled for this chat |
-| **HOOK** blue outline | a webhook URL is configured |
-| **HOOK** red outline | …and its last call failed |
+| `session ready · 918985370703` | OpenWA's session state and linked number. Red if anything but `ready`. |
+| `12 delivered · 4 replied` | What the listener has actually done. `· 2 failed` and `· 1 unsigned` appear only when non-zero. |
+| `not listening` | The webhook port could not be bound |
+| `MongoDB connected · wa_events` | |
+| `JSON ok · 09:21` | Last mirror write |
 
-Look at Support Desk in the screenshot: a red HOOK, so its endpoint is failing
-without having to click into it. Papa has AUTO but no HOOK — automation is on
-with nowhere to send, which the panel spells out.
-
-Hovering a row shows automation state, webhook URL, last webhook status and
-messages stored.
-
-### Right panel — configuration, not conversation
-
-Header with the chat's avatar, name, a one-line summary, and **Read now** (open
-this chat in WhatsApp and read it immediately rather than waiting for the poll —
-it does switch the conversation WhatsApp is showing).
-
-**Automation card** — the Enabled checkbox, the webhook URL with **Save** and
-**Test**, and a one-line reminder of the contract. The URL is validated before
-it is saved; `Save` reports success or the reason it failed, and `Test` POSTs a
-`webhook.test` payload and shows the response.
-
-The field always shows the selected chat's URL. It preserves unsaved text across
-the once-a-second refresh, but switching chats always reloads it — the text
-sitting there belongs to the chat you just left.
-
-**Contact ID card** — how the [send API](SEND_API.md) addresses this chat.
-Auto-filled from the contact-info panel when the chat name is the contact's
-number (an unsaved contact); empty and editable for a saved contact, which
-WhatsApp only ever shows by name. The card says out loud that four digits is
-10,000 values and that a collision is refused rather than delivered to a guess.
-
-**Activity card** — last poll, last incoming message (with sender and relative
-time), last outgoing message, webhook status, last webhook response, retry
-count, messages stored, last error. Values are selectable for copying and are
-only rewritten when they change, so a selection survives the refresh.
-
-**Storage card** — MongoDB status, JSON backup status, and the **Chat ID** in a
-monospaced font, because its whole purpose is being pasted into a query.
-
-**Actions** — Export JSON, Reset automation, and Delete chat (right-aligned,
-red). Reset and Delete both confirm and say exactly what they will do.
-
-### Status bar
-
-Cycle count, last cycle duration, the fixed interval, queue depth, the send API
-(only when enabled), and MongoDB / JSON health — red when any is unhealthy.
+The delivery count is the most useful number on the screen. When a chat is
+ticked and nothing happens, `0 delivered` says *OpenWA is not reaching this
+process* — a webhook pointing at `localhost` instead of `host.docker.internal`,
+or its SSRF guard blocking the address. A green session light says the
+opposite and would be misleading on its own.
 
 ---
 
-## A failing webhook
+## Startup
 
-![A chat whose webhook is failing](screens/main-webhook-failed.png)
+Load → validate → launch. A configuration problem shows a startup screen
+listing **every** problem at once, with a Retry button, so you can fix `.env` in
+another window and try again without restarting.
 
-`timeout after 3 attempts` in Webhook status, the same text under Last error in
-red, a retry count of 3, and the red HOOK badge in the rail. The chat keeps
-recording messages throughout — a failing endpoint never costs you the message.
+First run asks for four things — MongoDB URI, and OpenWA's address, API key and
+session id — tests both connections before writing `.env`, and never asks
+again. It is not a settings screen: there is no way back into it from the
+running application.
 
----
-
-## Search
-
-![Filtering the chat list](screens/main-search.png)
-
-Instant, as-you-type, across name and preview.
+Non-fatal problems appear as a warning dialog rather than blocking the launch.
 
 ---
 
-## Nothing selected
+## Theme
 
-![Empty state](screens/main-empty.png)
-
-States the model plainly: chats appear automatically, and new ones arrive
-watched. There is no "add chat" button because there is no way to add a chat —
-WhatsApp decides what exists.
-
-Unticking a chat is the one action in this window that asks first. It stops the
-automation **and deletes that chat's stored records**, so the confirmation names
-the counts — "12 message(s), 4 webhook call(s) and 0 queued send(s)" — rather
-than asking about "all records". Ticking a chat on stays instant and silent.
-If MongoDB is unreachable the untick is refused outright, because only the JSON
-backup would be cleared and the window would be reporting a deletion that had
-not happened.
+Light and dark, following the operating system, and it re-styles live if you
+change the system setting while the window is open.
 
 ---
 
-## Light theme
+## Running without it
 
-![Main window, light theme](screens/main-light.png)
-
-Follows the operating system's preference and switches live when it changes.
-Avatar colours are deliberately identical in both themes — a contact whose
-colour changed with the theme would be harder to recognise.
-
----
-
-## Startup errors
-
-![Startup error](screens/startup-error.png)
-
-`load → validate → launch`. A configuration problem stops the launch and shows
-**every** problem at once, names the `.env` it read, and offers **Retry** — the
-usual fix is to edit the file in another window, and making someone restart the
-application to find out whether they got it right is a poor way to spend an
-afternoon.
-
-The same screen reports an unwritable backup folder or an unreachable MongoDB,
-each with the specific next step (`mongod` not running, Atlas asleep, IP not
-allow-listed, `pymongo[srv]` missing for an Atlas URI).
-
----
-
-## Startup warnings
-
-![Startup warnings](screens/startup-warning.png)
-
-Non-fatal things worth saying out loud: a setting that does nothing (`POLL_INTERVAL`
-is fixed in code), or MongoDB having come up empty so the configuration was
-restored from the JSON backup. Startup continues either way.
-
----
-
-## What is deliberately absent
-
-There is no UI for the send API's port or token — like everything else, those
-live in `.env`. The status bar shows whether it is listening; that is all.
-
-No settings window. No refresh button. No "add chat" dialog. No confirmation when
-a chat is discovered. No poll-interval control. No AI panel. The only dialogs are
-the two startup screens and the confirmations on destructive actions.
+`python run_headless.py` starts the service with no window — for a server, a
+container, or a check that the pipeline works with no display attached.
+Everything works except the tick box, so chats have to be switched on from the
+window once, or in the database.

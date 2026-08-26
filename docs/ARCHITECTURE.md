@@ -1,149 +1,156 @@
-# Architecture — two independent flows
+# Architecture
 
-winSpark is a **bridge**, not a bot. It does not decide anything, interpret
-anything, or answer anything. Messages travel in two directions and the two
-paths never touch:
+A bridge, not a bot. It does not decide anything on its own — it carries a
+message to your code and carries the answer back.
 
 ```
-INBOUND — collect                       OUTBOUND — deliver
-
-  someone messages you                   your application
-          │                                      │
-          ▼                                      │ POST /wam/
-  WhatsApp Desktop                                │ {"id","message"}
-          │                                      ▼
-          │ passive accessibility read     winSpark send API
-          ▼                                      │
-      winSpark reader                     resolve id → chat
-          │                                      │
-          ▼                                      ▼
-   MongoDB  wa_events                    durable outgoing queue
-          │                                      │
-          ▼                                      ▼
-  your monitoring application            WhatsApp Desktop (UI Automation)
-                                                 │
-                                                 ▼
-                                        census verification
-                                                 │
-                                                 ▼
-                                             VERIFIED
+                        ┌──────────────┐
+   someone messages you │              │  reply goes back
+            │           │   OpenWA     │        ▲
+            ▼           │  (gateway)   │        │
+        WhatsApp ──────▶│              │────────┘
+                        └──────┬───────┘
+                    POST       │      ▲   POST /messages/send-text
+             message.received  │      │
+                               ▼      │
+                        ┌─────────────┴─┐
+                        │     wadam     │
+                        │               │
+                        │  verify sig   │
+                        │  store        │──▶ MongoDB + JSON mirror
+                        │  reply_for()  │
+                        │  send         │
+                        └───────────────┘
 ```
 
-**Receiving a message never causes winSpark to send one.** The inbound side
-writes to `wa_events` and stops. Whatever reads that database decides what to
-do; if it wants to reply, it calls the outbound bridge like any other caller.
-That is what makes a reply loop structurally impossible rather than guarded
-against — an earlier version POSTed each incoming message to a webhook and sent
-back whatever came, and that behaviour is gone.
+There is no polling loop, no worker queue, and no automation lock. OpenWA tells
+this process when a message arrives; a threaded HTTP server handles the
+delivery inline.
 
 ---
 
-## Inbound: WhatsApp → `wa_events`
+## What used to be here
 
-Every three seconds the reader walks WhatsApp's accessibility tree. **It is
-passive**: no mouse, no keyboard, no focus change, no foreground steal. Proven
-by call graph — the poll cycle reaches only reader functions, and
-`wadam/whatsapp/reader.py` contains no input call of any kind.
+This application drove **WhatsApp Desktop** through Windows UI Automation,
+because there was no API. That layer was about 4,000 lines and it is gone. It
+is worth knowing what it did, because most of the design decisions that remain
+are scar tissue from it:
 
-What is stored, per message: the **raw** text exactly as WhatsApp rendered it,
-the chat, the phone number if known, direction, state and timestamps. Nothing
-is summarised, classified, filtered or enriched.
+- **The reader** walked the accessibility tree every three seconds and pulled
+  messages out of a flattened string of name + preview + timestamp.
+- **The sender** was a ladder: `InvokePattern`, then a viewport-checked
+  coordinate click, then the search box — because `GridPattern` realizes rows
+  below the viewport at real screen coordinates thousands of pixels down, and
+  clicking one opens the wrong chat. Filling the compose box was a second
+  ladder, because `ValuePattern.SetValue` silently no-ops on a contenteditable
+  div.
+- **The verifier** counted outgoing bubbles, because an empty compose box
+  proves the text left the input, not that it reached the conversation.
+- **The outgoing queue** was durable because a send took seconds, could not run
+  concurrently, and might half-happen.
 
-Duplicate protection is a content-derived `message_key` with a unique index, so
-re-reading the same visible bubble every three seconds cannot store it twice.
-
----
-
-## Outbound: `POST /wam/` → WhatsApp
-
-```bash
-curl --location 'http://127.0.0.1:8765/wam/'   --header 'Content-Type: application/json'   --data '{"id":"2933","message":"Hello"}'
-```
-
-`id` resolves to a chat — by `phone_number` (the full number, for a 1:1
-number), the full number, the chat id, or the chat name. An ambiguous `id` is
-**refused**, never guessed: sending to the wrong person is the one failure this
-must not produce quietly.
-
-The response is `202 Accepted` with an `outgoing_id`. It means *queued*, not
-*delivered* — delivery is reported by `GET /wam/status/<outgoing_id>`. The
-request is bounded by the enqueue (about a millisecond), never by the send,
-because a physical send takes seconds and a burst of twenty would otherwise
-hold twenty connections open for minutes.
-
-### Delivery is a bubble, not an empty box
-
-```
-resolve chat → open it if it is not already → read the BASELINE
-             → send → read the chat again → count
-```
-
-Verification requires the count of matching outgoing bubbles to have **gone
-up**. An empty compose box proves the text left the input; it does not prove it
-reached the conversation. A pre-existing identical message can never satisfy a
-new send.
-
-A message that leaves the box but is never found is `UNVERIFIED` and is **not
-retried** — retrying risks a duplicate, which is the worse failure. It is
-surfaced for a person to resolve.
+All of that was transport. A send is now an HTTP POST whose response says
+whether it worked.
 
 ---
 
-## The relay is the outbound path
+## Threads
 
-`WEBHOOK_URL` carries both directions over one address:
+| Thread | What runs on it |
+|---|---|
+| Qt main thread | The window. Reads snapshots, writes one thing: a chat's automation flag. |
+| HTTP server threads | One per delivery. Verify, store, decide, send. |
+| Qt timer | Asks OpenWA for session status every 10s, so the status light is a light and not a heartbeat. |
 
-```
-inbound    message arrives in a ticked chat ──POST {…}──▶  your endpoint
-outbound   every few seconds  ──GET──▶ your endpoint ──body──▶ sent to the chat
-```
+**Why concurrent deliveries are safe.** The old engine serialized everything
+behind an automation lock, because two concurrent UI-Automation sends would
+race for the same foreground window and put a message in the wrong
+conversation. Sends are independent HTTP calls now, and OpenWA does its own
+pacing. The only shared mutable state is the per-chat cooldown, which takes a
+lock.
 
-One URL, two verbs, one thing to configure — which is what makes the two-key
-`.env` that first-run setup writes a complete configuration. There is no
-`API_PORT` in that file and nothing writes one, so **the relay is the only
-outbound path a fresh install has**, and it is on unless `RELAY_ENABLED=false`
-says otherwise.
-
-Pull rather than push is the point: no listening socket, no open port, no token
-crossing the network, and it works from behind NAT or a corporate firewall
-where nothing can reach the machine WhatsApp runs on.
-
-See [RELAY.md](RELAY.md) for response shapes and the three deduplication rules.
-Briefly: an `id` in the response is sent once ever; without one, a repeat of the
-last text is suppressed until the endpoint has answered empty at least once,
-which proves it dequeues.
-
-An earlier revision of this document claimed `https://noteify.org/ntext/whook/`
-answered `400 Invalid URL format` to everything and "must not be configured as"
-the outbound API. That was measured against a key-shaped query
-(`?<WEB_KEY><MESSAGE_ID>`). Probed with the number the template actually
-produces, it answers `200` with an empty body — a well-formed "nothing
-waiting":
-
-```
-GET https://noteify.org/ntext/whook/?917981149423  →  200, 0 bytes
-GET https://noteify.org/ntext/whook/?17328358250   →  200, 0 bytes
-```
-
-## `POST /wam/` is the second way in, not the way
-
-An external system that *can* reach this machine may POST `{"id","message"}`
-instead of waiting to be polled. It needs `API_PORT` set by hand. Useful when
-you already have a push integration; not required, and not what a built EXE
-uses.
+`EngineHost` is the boundary. The service calls `on_snapshot` with an immutable
+`EngineSnapshot`; the host re-emits it as a Qt signal, which Qt queues onto the
+GUI thread. The window never reads the repository to render and never writes to
+it directly.
 
 ---
 
-## Limitations that shape the design
+## Modules
 
-* **A group has no phone number**, because it has no single contact. It is
-  addressed by its name, and its webhook URL is built from the name. Whether a
-  chat is a group is read from its info panel, never guessed from the sidebar.
-* **A saved contact's number is read from the contact-info panel**, once, and
-  the result is remembered either way. That costs one panel open per chat. See
-  [LIMITATIONS.md](LIMITATIONS.md).
-* **Sending needs an interactive desktop.** Reading works over a disconnected
-  RDP session or a locked workstation; sending does not, and messages wait in
-  the queue rather than being lost.
-* **Identity is hashed from the display name**, so renaming a contact creates a
-  new chat here.
+```
+wadam/
+  openwa/       the transport
+    client.py     send_text, session_status
+    inbound.py    signature verification, delivery parsing
+  engine/
+    service.py    the HTTP listener, and the snapshot the window renders
+    pipeline.py   what happens to one message
+    guards.py     the per-chat cooldown
+    metrics.py    counters
+  storage/
+    repository.py MongoDB primary + JSON mirror, one API over both
+    mongo.py      collections and indexes
+    json_backup.py
+  domain/
+    models.py     one dataclass per collection
+  api/            the inbound send API (optional)
+  ui/             the window
+  reply.py        ← the file you edit
+```
+
+---
+
+## One message, end to end
+
+1. **Signature.** `X-OpenWA-Signature` is `sha256=<hex>` over the raw body,
+   checked *before* `json.loads` — re-serializing a parsed object reorders keys
+   and the signature stops matching. A bad one is the only `401` this service
+   returns.
+2. **Parse.** Each field is read from the first of several plausible keys.
+   OpenWA has moved field names between releases, and being strict about a
+   shape you do not control turns someone else's rename into your outage.
+3. **Register or find the chat.** Discovery is a side effect of a message
+   arriving. New chats get automation **off**.
+4. **Store.** Before anything is decided, so a crash leaves a record of how far
+   the message got.
+5. **Decide.** `reply_for(msg, chat)` returns text or `None`.
+6. **Cooldown**, asked last and only for a message actually about to be
+   answered.
+7. **Send**, and store the outgoing message against the chat.
+
+---
+
+## Why almost everything answers HTTP 200
+
+A 4xx or 5xx tells OpenWA the delivery failed and earns a retry. There is
+nothing to retry about a message that was correctly ignored — it would be
+ignored again, three more times. So "automation is off", "that is a group",
+"already handled", "still in cooldown" and "no reply wanted" are all `200`.
+
+The exception is a bad signature, which is the one case where repeating the
+request verbatim really is wrong.
+
+**A failed send also answers 200**, and this one is worth stating plainly: a
+retry would re-run `reply_for` and could deliver twice. It is not theoretical.
+On the first live message through this architecture, OpenWA 0.7.2 returned HTTP
+500 for a message it had *already* delivered — a retrying client would have
+sent four copies. A duplicate is worse than a miss, which is the same judgment
+the old code made when it refused to retry an unverified send.
+
+---
+
+## Chat identity
+
+WhatsApp's LID addressing means a chat is identified as
+`216298915164281@lid`, and that is **not derivable from a phone number**.
+
+The chat id that arrived is the chat id a reply goes to, verbatim. Nothing in
+this codebase composes one from digits. `phone_from_chat_id` returns a number
+only for a `@c.us` id and an empty string for a LID, because displaying a
+plausible-looking number that belongs to nobody is worse than displaying
+nothing.
+
+The send API resolves an identifier by *lookup* and refuses an ambiguous one
+with `409` rather than picking. Sending to the wrong person is the one failure
+that must not happen quietly.
