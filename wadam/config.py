@@ -21,16 +21,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from wadam.constants import (
-    DATABASE_NAME,
-    CHAT_NAME_PLACEHOLDER,
-    DEFAULT_WEBHOOK_TEMPLATE,
-    PHONE_PLACEHOLDER,
-    WEBHOOK_TEMPLATE_EXAMPLE,
-    POLL_INTERVAL_SECONDS,
-)
+from wadam.constants import DATABASE_NAME
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+#: Bind addresses that cannot be reached from another machine.
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
 def app_dir() -> Path:
@@ -113,49 +109,42 @@ class Settings:
     json_backup_folder: Path = field(default_factory=lambda: app_dir() / "backup")
     json_autosave_interval: float = 15.0
 
-    #: The one webhook setting. `{phone_number}` is substituted per chat.
-    webhook_template: str = DEFAULT_WEBHOOK_TEMPLATE
-    default_webhook: str = ""
-    webhook_api_key: str = ""
-    webhook_timeout: float = 20.0
-    webhook_max_retries: int = 3
+    # --- OpenWA, the transport -------------------------------------------
+    #: Where the OpenWA gateway is. This process talks to it over HTTP; there
+    #: is no WhatsApp Desktop and no UI Automation any more.
+    openwa_url: str = "http://localhost:2785"
+    openwa_api_key: str = ""
+    #: The session's UUID, not its name. `GET /api/sessions` lists them.
+    openwa_session_id: str = ""
 
-    whatsapp_window_title: str = "WhatsApp"
-    # Paste is faster and does not drop characters, but borrows the
-    # clipboard for a moment. Off = per-character input, clipboard untouched.
-    sender_use_clipboard: bool = True
+    # --- the webhook this process listens on ------------------------------
+    #: OpenWA POSTs here when a message arrives. Bound to 0.0.0.0 by default
+    #: because OpenWA usually runs in Docker and reaches the host as
+    #: `host.docker.internal` — a loopback bind is unreachable from there.
+    webhook_host: str = "0.0.0.0"
+    webhook_port: int = 8765
+    #: Shared with the webhook's `secret` so a delivery can be proven to have
+    #: come from OpenWA. Required whenever `webhook_host` is not loopback.
+    webhook_secret: str = ""
+
+    #: Per-chat quiet period. Bounds an automation-answering-automation loop.
+    cooldown_seconds: float = 60.0
+    #: Answer group chats. Off by default: a bot in a group is louder than a
+    #: bot in a DM, and easier to turn on than to live down.
+    answer_groups: bool = False
+
     log_level: str = "INFO"
 
-    # The relay: GET each automated chat's webhook and send what comes back.
-    #
-    # ON by default, because it is the outbound path this product ships with.
-    # First-run setup writes exactly two keys — MONGODB_URI and WEBHOOK_URL —
-    # and the send API needs an API_PORT that nothing writes, so with the relay
-    # off a freshly installed build has NO way to send at all. That is what a
-    # built EXE was doing: reading a two-line .env, listening on nothing, and
-    # polling nothing.
-    #
-    # Set RELAY_ENABLED=false to turn it off.
-    relay_enabled: bool = True
-    relay_poll_interval: float = 3.0
-
-    # Inbound send API. Off unless a port is set; a token is required whenever
-    # it is on, and the bind address defaults to loopback.
+    # Inbound send API — the second way to send, for something that wants to
+    # push a message in rather than answer one. Off unless a port is set.
     api_host: str = "127.0.0.1"
     api_port: int = 0
     api_token: str = ""
     api_send_timeout: float = 60.0
 
     env_path: Optional[Path] = None
-    # Non-fatal problems worth telling the user about at startup (e.g. someone
-    # set POLL_INTERVAL, which does nothing).
+    # Non-fatal problems worth telling the user about at startup.
     warnings: tuple[str, ...] = ()
-
-    @property
-    def poll_interval_seconds(self) -> int:
-        """Fixed. Exposed as a property so nothing downstream is tempted to
-        look for a configurable one."""
-        return POLL_INTERVAL_SECONDS
 
     def redacted(self) -> dict[str, object]:
         """The settings as they're mirrored into `settings.json` — credentials
@@ -165,17 +154,15 @@ class Settings:
             "database_name": self.database_name,
             "json_backup_folder": str(self.json_backup_folder),
             "json_autosave_interval": self.json_autosave_interval,
-            "webhook_template": self.webhook_template,
-            "default_webhook": self.default_webhook,
-            "webhook_api_key": "***" if self.webhook_api_key else "",
-            "webhook_timeout": self.webhook_timeout,
-            "webhook_max_retries": self.webhook_max_retries,
-            "whatsapp_window_title": self.whatsapp_window_title,
+            "openwa_url": self.openwa_url,
+            "openwa_api_key": "***" if self.openwa_api_key else "",
+            "openwa_session_id": self.openwa_session_id,
+            "webhook_host": self.webhook_host,
+            "webhook_port": self.webhook_port,
+            "webhook_secret": "***" if self.webhook_secret else "",
+            "cooldown_seconds": self.cooldown_seconds,
+            "answer_groups": self.answer_groups,
             "log_level": self.log_level,
-            "sender_use_clipboard": self.sender_use_clipboard,
-            "poll_interval_seconds": self.poll_interval_seconds,
-            "relay_enabled": self.relay_enabled,
-            "relay_poll_interval": self.relay_poll_interval,
             "api_host": self.api_host,
             "api_port": self.api_port,
             "api_token": "***" if self.api_token else "",
@@ -255,12 +242,12 @@ def load_settings(env_path: Optional[Path] = None) -> Settings:
     values = load_env_file(path)
     # Process environment overrides file values for the keys we know about.
     for key in (
-        "MONGODB_URI", "WEBHOOK_URL", "DATABASE_NAME",
+        "MONGODB_URI", "DATABASE_NAME",
         "JSON_BACKUP_FOLDER", "JSON_AUTOSAVE_INTERVAL",
-        "DEFAULT_WEBHOOK", "WEBHOOK_API_KEY", "WEBHOOK_TIMEOUT", "WEBHOOK_MAX_RETRIES",
-        "WHATSAPP_WINDOW_TITLE", "LOG_LEVEL", "POLL_INTERVAL",
+        "OPENWA_URL", "OPENWA_API_KEY", "OPENWA_SESSION_ID",
+        "WEBHOOK_HOST", "WEBHOOK_PORT", "WEBHOOK_SECRET",
+        "COOLDOWN_SECONDS", "ANSWER_GROUPS", "LOG_LEVEL",
         "API_HOST", "API_PORT", "API_TOKEN", "API_SEND_TIMEOUT",
-        "RELAY_ENABLED", "RELAY_POLL_INTERVAL", "SENDER_USE_CLIPBOARD",
     ):
         if os.environ.get(key):
             values[key] = os.environ[key]
@@ -301,24 +288,23 @@ def load_settings(env_path: Optional[Path] = None) -> Settings:
     elif len(database_name.encode("utf-8")) > 63:
         problems.append("DATABASE_NAME must be 63 bytes or fewer.")
 
-    webhook_template = (values.get("WEBHOOK_URL")
-                        or values.get("DEFAULT_WEBHOOK")
-                        or DEFAULT_WEBHOOK_TEMPLATE).strip()
-    if not webhook_template:
-        # Deliberately a problem rather than a default. There is no sensible
-        # guess for where someone else's messages should be sent, and a build
-        # that silently pointed at a vendor's URL is what this replaces.
+    # --- OpenWA, the transport --------------------------------------------
+    openwa_url = (values.get("OPENWA_URL") or "http://localhost:2785").strip().rstrip("/")
+    if not openwa_url.startswith(("http://", "https://")):
+        problems.append(f"OPENWA_URL must be an http:// or https:// URL (got {openwa_url!r}).")
+
+    openwa_api_key = (values.get("OPENWA_API_KEY") or "").strip()
+    if not openwa_api_key:
         problems.append(
-            "WEBHOOK_URL is not set. It is where messages are sent, and where "
-            "outbound messages are fetched from, so there is nothing to fall "
-            f"back to. Example: {WEBHOOK_TEMPLATE_EXAMPLE}")
-    elif not webhook_template.startswith(("http://", "https://")):
-        problems.append("WEBHOOK_URL must be an http:// or https:// URL.")
-    elif (PHONE_PLACEHOLDER not in webhook_template
-          and CHAT_NAME_PLACEHOLDER not in webhook_template):
-        warnings.append(
-            f"WEBHOOK_URL has no {PHONE_PLACEHOLDER} or {CHAT_NAME_PLACEHOLDER} "
-            f"placeholder, so every chat will use the same URL."
+            "OPENWA_API_KEY is required. It is in OpenWA's data/.api-key file, "
+            "or on its dashboard's API keys page."
+        )
+
+    openwa_session_id = (values.get("OPENWA_SESSION_ID") or "").strip()
+    if not openwa_session_id:
+        problems.append(
+            "OPENWA_SESSION_ID is required. It is the session's UUID, not its name — "
+            "GET /api/sessions lists them."
         )
 
     folder_raw = (values.get("JSON_BACKUP_FOLDER") or "backup").strip() or "backup"
@@ -327,25 +313,41 @@ def load_settings(env_path: Optional[Path] = None) -> Settings:
         folder = app_dir() / folder
 
     autosave = _as_float(values, "JSON_AUTOSAVE_INTERVAL", 15.0, problems, minimum=0.0)
-    webhook_timeout = _as_float(values, "WEBHOOK_TIMEOUT", 20.0, problems, minimum=1.0)
-    max_retries = _as_int(values, "WEBHOOK_MAX_RETRIES", 3, problems, minimum=0)
-
-    default_webhook = (values.get("DEFAULT_WEBHOOK") or "").strip()
-    if default_webhook and not default_webhook.startswith(("http://", "https://")):
-        problems.append("DEFAULT_WEBHOOK must be an http:// or https:// URL.")
-
     log_level = (values.get("LOG_LEVEL") or "INFO").strip().upper() or "INFO"
     if log_level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
         problems.append(f"LOG_LEVEL must be DEBUG, INFO, WARNING, ERROR or CRITICAL (got {log_level!r}).")
         log_level = "INFO"
 
-    # --- relay -------------------------------------------------------------
-    # Absent means ON. The two-key .env that first-run setup writes never
-    # mentions RELAY_ENABLED, and that file has to produce a working outbound
-    # path — so silence cannot mean "no way to send".
-    relay_raw = (values.get("RELAY_ENABLED") or "").strip().lower()
-    relay_enabled = True if not relay_raw else relay_raw in _TRUE_VALUES
-    relay_poll_interval = _as_float(values, "RELAY_POLL_INTERVAL", 3.0, problems, minimum=1.0)
+    # --- the webhook this process listens on -------------------------------
+    webhook_host = (values.get("WEBHOOK_HOST") or "0.0.0.0").strip() or "0.0.0.0"
+    webhook_port = _as_int(values, "WEBHOOK_PORT", 8765, problems, minimum=1)
+    if webhook_port > 65535:
+        problems.append(f"WEBHOOK_PORT must be between 1 and 65535 (got {webhook_port}).")
+        webhook_port = 8765
+
+    webhook_secret = (values.get("WEBHOOK_SECRET") or "").strip()
+    # The line is drawn at reachability, the same place the send API draws it.
+    # A loopback listener cannot be reached from another machine, so an
+    # unverified delivery there exposes this machine to itself. Bound anywhere
+    # else — and it must be, for a Dockerised OpenWA to reach it — the
+    # signature is the only thing stopping anyone who can reach the port from
+    # making this account send whatever they like.
+    if webhook_host not in _LOOPBACK_HOSTS and not webhook_secret:
+        problems.append(
+            f"WEBHOOK_SECRET is required when WEBHOOK_HOST is not loopback (it is "
+            f"{webhook_host}). Anything that could reach port {webhook_port} would "
+            f"otherwise be able to make your WhatsApp account send messages. "
+            f"Generate one with:  "
+            f'python -c "import secrets; print(secrets.token_urlsafe(32))"'
+        )
+    elif webhook_secret and len(webhook_secret) < 16:
+        problems.append(
+            f"WEBHOOK_SECRET is only {len(webhook_secret)} characters. Use at least 16 — "
+            f"it is the only proof a delivery really came from OpenWA."
+        )
+
+    cooldown_seconds = _as_float(values, "COOLDOWN_SECONDS", 60.0, problems, minimum=0.0)
+    answer_groups = (values.get("ANSWER_GROUPS") or "").strip().lower() in _TRUE_VALUES
 
     # --- inbound send API -------------------------------------------------
     api_port = _as_int(values, "API_PORT", 0, problems, minimum=0)
@@ -363,7 +365,7 @@ def load_settings(env_path: Optional[Path] = None) -> Settings:
         # listener there exposes is this machine to itself. Bind it anywhere
         # else and the token is the only thing between the network and someone's
         # WhatsApp account, so it stops being optional.
-        if api_host not in ("127.0.0.1", "localhost", "::1"):
+        if api_host not in _LOOPBACK_HOSTS:
             if not api_token:
                 problems.append(
                     f"API_TOKEN is required when API_HOST is not loopback (it is {api_host}). "
@@ -383,34 +385,23 @@ def load_settings(env_path: Optional[Path] = None) -> Settings:
                     f"can send WhatsApp messages as you."
                 )
 
-    raw_clipboard = (values.get("SENDER_USE_CLIPBOARD") or "").strip().lower()
-    sender_use_clipboard = raw_clipboard not in {"0", "false", "no", "off"}
-
-    poll_raw = (values.get("POLL_INTERVAL") or "").strip()
-    if poll_raw and poll_raw != str(POLL_INTERVAL_SECONDS):
-        warnings.append(
-            f"POLL_INTERVAL={poll_raw} in .env is ignored — the poll interval is fixed "
-            f"at {POLL_INTERVAL_SECONDS} seconds."
-        )
-
     if problems:
         raise ConfigError(problems)
 
     return Settings(
         mongodb_uri=mongodb_uri,
         database_name=database_name,
-        webhook_template=webhook_template,
         json_backup_folder=folder,
         json_autosave_interval=autosave,
-        default_webhook=default_webhook,
-        webhook_api_key=(values.get("WEBHOOK_API_KEY") or "").strip(),
-        webhook_timeout=webhook_timeout,
-        webhook_max_retries=max_retries,
-        whatsapp_window_title=(values.get("WHATSAPP_WINDOW_TITLE") or "WhatsApp").strip(),
+        openwa_url=openwa_url,
+        openwa_api_key=openwa_api_key,
+        openwa_session_id=openwa_session_id,
+        webhook_host=webhook_host,
+        webhook_port=webhook_port,
+        webhook_secret=webhook_secret,
+        cooldown_seconds=cooldown_seconds,
+        answer_groups=answer_groups,
         log_level=log_level,
-        sender_use_clipboard=sender_use_clipboard,
-        relay_enabled=relay_enabled,
-        relay_poll_interval=relay_poll_interval,
         api_host=api_host,
         api_port=api_port,
         api_token=api_token,

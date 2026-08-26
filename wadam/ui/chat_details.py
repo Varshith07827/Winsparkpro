@@ -1,187 +1,174 @@
-"""The right-hand panel: a chat's name and the address its messages go to.
+"""The right-hand panel: a chat, and what has actually been said in it.
 
-That is the whole panel, and the restraint is the point. It replaced a
-six-card configuration screen carrying activity history, session health,
-operations counters, storage status and a row of destructive buttons — none of
-which a user of this tool has to understand, and all of which are still
-available in the logs.
+Nothing here can be typed into, and that is a change worth stating. The panel
+used to carry one editable field — the contact's phone number — because
+WhatsApp Desktop would not give it up: it shows a saved contact by name and
+exposes the number nowhere readable (measured — zero phone-shaped strings
+across every accessible name in the window). Without a number there was no
+webhook URL, so the choice was one small field or a chat that could never
+forward anything.
 
-The webhook URL is **shown, not edited**. It is built from the global template
-and the chat's phone number, so editing it here would create a per-chat value
-that silently stops tracking the template. The number itself IS editable, and
-is the only editable thing in the product — see the class docstring for why.
+OpenWA supplies the identity, so the field has nothing left to do. The webhook
+went the same way: there is one webhook now, registered against the session in
+OpenWA, not a URL derived per chat from a template.
+
+What replaces them is the thing an operator actually wants when they click a
+chat — the messages, in order, with which ones this application answered.
 """
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import List, Optional
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QFrame,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
+    QScrollArea,
     QVBoxLayout,
     QWidget,
 )
 
-from wadam.domain.models import ChatConfig, phone_digits
-from wadam.domain.webhook_url import validate_webhook_url
+from wadam.domain.models import ChatConfig, MessageStatus, StoredMessage
+from wadam.ui import theme
+
+#: How many messages the transcript renders. The repository holds far more; a
+#: panel that painted ten thousand bubbles would stall the window on a click.
+TRANSCRIPT_LIMIT = 200
 
 
 class ChatDetailsPanel(QWidget):
-    """Name, number, webhook. Nothing else.
-
-    The number is the one thing here that can be typed, and only because
-    WhatsApp will not give it up: it shows a saved contact by name and exposes
-    the number nowhere readable (measured — zero phone-shaped strings across
-    every accessible name in the window). Without it there is no webhook URL,
-    so the choice is one small field or a chat that can never forward anything.
-
-    The reference implementation reached the same conclusion from the other
-    direction: winSpark asks for "contact name or phone number" and uses
-    WhatsApp's own search to bind a typed number to a saved contact. Same
-    trade, same reason."""
-
-    #: (chat_id, phone_number) — saved immediately, no button.
-    phone_saved = Signal(str, str)
-    #: (chat_id, url) — an empty url means "follow the global template".
-    webhook_saved = Signal(str, str)
+    """A chat's name, its identity, and its recent messages. Read-only."""
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
-        self.setObjectName("configPanel")
-        self._chat: Optional[ChatConfig] = None
+        self.setObjectName("chatDetails")
+        self._chat_id = ""
 
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(28, 24, 28, 20)
+        layout.setSpacing(14)
 
-        header = QWidget()
-        header.setObjectName("panelHeader")
-        header.setFixedHeight(60)
-        header_row = QHBoxLayout(header)
-        header_row.setContentsMargins(24, 0, 20, 0)
-        self._title = QLabel("")
-        self._title.setObjectName("panelTitle")
-        header_row.addWidget(self._title, 1)
-        outer.addWidget(header)
+        self._name = QLabel("No chat selected")
+        self._name.setObjectName("detailsTitle")
+        self._name.setStyleSheet("font-size: 20px; font-weight: 600;")
+        layout.addWidget(self._name)
 
-        self._body = QWidget()
-        body = QVBoxLayout(self._body)
-        body.setContentsMargins(24, 22, 24, 24)
-        body.setSpacing(6)
+        self._identity = QLabel("")
+        self._identity.setStyleSheet(f"color: {theme.TEXT_MUTED};")
+        self._identity.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        layout.addWidget(self._identity)
 
-        body.addWidget(self._label("Phone number"))
-        self._phone = QLineEdit()
-        self._phone.setPlaceholderText("15551234567")
-        self._phone.setMaximumWidth(320)
-        self._phone.editingFinished.connect(self._save_phone)
-        body.addWidget(self._phone)
+        self._state = QLabel("")
+        self._state.setStyleSheet(f"color: {theme.TEXT_MUTED};")
+        layout.addWidget(self._state)
 
-        self._phone_hint = QLabel("")
-        self._phone_hint.setObjectName("fieldHint")
-        self._phone_hint.setWordWrap(True)
-        body.addWidget(self._phone_hint)
-        body.addSpacing(16)
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        line.setStyleSheet(f"color: {theme.BORDER};")
+        layout.addWidget(line)
 
-        body.addWidget(self._label("Webhook"))
-        # Filled in for you, but yours to change. Editing stores an OVERRIDE;
-        # clearing the box hands the chat back to the global template.
-        self._webhook = QLineEdit()
-        self._webhook.editingFinished.connect(self._save_webhook)
-        body.addWidget(self._webhook)
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.NoFrame)
+        self._transcript = QWidget()
+        self._transcript_layout = QVBoxLayout(self._transcript)
+        self._transcript_layout.setContentsMargins(0, 0, 0, 0)
+        self._transcript_layout.setSpacing(6)
+        self._transcript_layout.addStretch(1)
+        self._scroll.setWidget(self._transcript)
+        layout.addWidget(self._scroll, 1)
 
-        self._webhook_hint = QLabel("")
-        self._webhook_hint.setObjectName("fieldHint")
-        self._webhook_hint.setWordWrap(True)
-        body.addWidget(self._webhook_hint)
+        self._empty = QLabel("Select a chat to see its messages.")
+        self._empty.setStyleSheet(f"color: {theme.TEXT_MUTED};")
+        layout.addWidget(self._empty)
 
-        body.addStretch(1)
-        outer.addWidget(self._body, 1)
+        self.set_chat(None, [])
 
-        self._empty = QLabel(
-            "Select a chat to see where its messages are sent.\n\n"
-            "Tick a chat in the list to turn its automation on."
-        )
-        self._empty.setAlignment(Qt.AlignCenter)
-        self._empty.setObjectName("fieldValueMuted")
-        outer.addWidget(self._empty, 1)
+    # ── rendering ─────────────────────────────────────────────────────
 
-        self.set_chat(None)
+    def set_chat(self, chat: Optional[ChatConfig],
+                 messages: Optional[List[StoredMessage]] = None) -> None:
+        self._clear_transcript()
 
-    @staticmethod
-    def _label(text: str) -> QLabel:
-        label = QLabel(text)
-        label.setObjectName("fieldLabel")
-        return label
-
-    def set_chat(self, chat: Optional[ChatConfig]) -> None:
-        switching = chat is None or self._chat is None or chat.chat_id != self._chat.chat_id
-        self._chat = chat
-        self._body.setVisible(chat is not None)
-        self._empty.setVisible(chat is None)
         if chat is None:
-            self._title.setText("")
+            self._chat_id = ""
+            self._name.setText("No chat selected")
+            self._identity.setText("")
+            self._state.setText("")
+            self._empty.setText("Select a chat to see its messages.")
+            self._empty.setVisible(True)
+            self._scroll.setVisible(False)
             return
 
-        self._title.setText(chat.chat_name)
-        # Reload the field ONLY when the chat actually changed. The panel is
-        # re-rendered once a second, and overwriting the box on every pass made
-        # it impossible to type a number at all — the same mistake, in the same
-        # place, as the webhook field that used to show the previous chat's URL.
-        # Focus is not a safe proxy here: clicking away mid-edit would still eat
-        # the value.
-        if switching:
-            self._phone.setText(chat.phone_number or "")
+        self._chat_id = chat.chat_id
+        self._name.setText(chat.chat_name or chat.chat_id)
 
-        url = (chat.webhook_url or "").strip()
-        if switching:
-            self._webhook.setText(url)
-        self._webhook_hint.setText(
-            "Custom address for this chat. Clear the box to go back to the default."
-            if chat.webhook_override else ""
-        )
-        self._webhook_hint.setVisible(bool(self._webhook_hint.text()))
-        # One explanation, under the field that fixes it. Saying the same thing
-        # twice on one screen reads as two different problems.
-        self._phone_hint.setText(
-            "" if chat.phone_number else
-            "WhatsApp does not show the number for a saved contact, so this "
-            "chat has no webhook yet. Type the number once — digits only, "
-            "including the country code."
-        )
-        self._phone_hint.setVisible(bool(self._phone_hint.text()))
+        # The chat id is shown rather than hidden. It is what the send API
+        # addresses, what a support question needs, and — for a LID — the only
+        # identity there is, since no phone number can be derived from it.
+        identity = chat.chat_id
+        if chat.phone_number:
+            identity = f"{chat.phone_number}  ·  {chat.chat_id}"
+        self._identity.setText(identity)
 
-    def _save_phone(self) -> None:
-        """Persist the typed number. Digits only — a number pasted as
-        "+91 94231 55555" is the same number as "919423155555" and the webhook
-        URL must not contain spaces either way."""
-        if self._chat is None:
-            return
-        digits = phone_digits(self._phone.text())
-        if digits == (self._chat.phone_number or ""):
-            return
-        self._phone.setText(digits)
-        self.phone_saved.emit(self._chat.chat_id, digits)
+        state = "automation on" if chat.automation_enabled else "automation off"
+        if chat.is_group:
+            state += "  ·  group"
+        if chat.last_error:
+            state += f"  ·  {chat.last_error}"
+        self._state.setText(state)
 
-    def _save_webhook(self) -> None:
-        """Persist an edited webhook, or reject it without losing what was typed.
+        rows = list(messages or [])
+        if not rows:
+            self._empty.setText("Nothing stored for this chat yet.")
+            self._empty.setVisible(True)
+            self._scroll.setVisible(False)
+            return
 
-        An invalid URL is left in the box with the reason underneath rather than
-        being silently reverted — retyping a long URL because the application
-        quietly threw it away is a miserable way to spend a minute."""
-        if self._chat is None:
-            return
-        text = self._webhook.text().strip()
-        if text == (self._chat.webhook_url or "").strip():
-            return
-        ok, problem = validate_webhook_url(text)
-        if not ok:
-            self._webhook_hint.setText(problem)
-            self._webhook_hint.setVisible(True)
-            return
-        self.webhook_saved.emit(self._chat.chat_id, text)
+        self._empty.setVisible(False)
+        self._scroll.setVisible(True)
+        for message in rows[-TRANSCRIPT_LIMIT:]:
+            self._transcript_layout.insertWidget(
+                self._transcript_layout.count() - 1, _message_row(message))
 
     def current_chat_id(self) -> str:
-        return self._chat.chat_id if self._chat else ""
+        return self._chat_id
+
+    def _clear_transcript(self) -> None:
+        while self._transcript_layout.count() > 1:
+            item = self._transcript_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+
+def _message_row(message: StoredMessage) -> QWidget:
+    """One line of the transcript: direction, text, and when."""
+    row = QWidget()
+    layout = QHBoxLayout(row)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(10)
+
+    outgoing = message.direction == "out"
+    arrow = QLabel("→" if outgoing else "←")
+    arrow.setFixedWidth(14)
+    arrow.setStyleSheet(
+        f"color: {theme.ACCENT if outgoing else theme.TEXT_MUTED}; font-weight: 600;")
+    layout.addWidget(arrow)
+
+    body = message.text or (f"[{message.media_kind}]" if message.media_kind else "")
+    text = QLabel(body)
+    text.setWordWrap(True)
+    text.setTextInteractionFlags(Qt.TextSelectableByMouse)
+    if message.status == MessageStatus.FAILED:
+        # A failed send is the one thing in the transcript worth colouring.
+        text.setStyleSheet(f"color: {theme.DANGER};")
+    layout.addWidget(text, 1)
+
+    when = QLabel(message.detected_at.strftime("%H:%M") if message.detected_at else "")
+    when.setStyleSheet(f"color: {theme.TEXT_MUTED};")
+    layout.addWidget(when)
+
+    return row

@@ -8,10 +8,10 @@ The sequence is deliberately linear and every step can only fail in one way,
 because "it didn't start and I don't know why" is the worst outcome for an
 application that is meant to run unattended once configured.
 
-After this, no further intervention is expected: the engine discovers the
-chats, mirrors them to MongoDB and JSON, polls every three seconds, registers
-whatever is new, calls the webhook for automation-enabled chats, persists all
-of it, and sends replies through UI Automation.
+After this, no further intervention is expected: the service listens for
+OpenWA's webhook deliveries, registers whatever chat is new, stores every
+message in MongoDB and the JSON mirror, and answers the chats that are
+switched on — sending back through OpenWA's API.
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ from wadam.storage.json_backup import JsonBackupStore
 from wadam.storage.mongo import MongoStore, MongoUnavailableError
 from wadam.storage.repository import Repository
 from wadam.ui import theme
+from wadam.reply import reply_for
 from wadam.ui.engine_host import EngineHost
 from wadam.ui.main_window import MainWindow
 from wadam.ui.first_run import START, FirstRunDialog, needs_setup
@@ -123,7 +124,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     app.setFont(QFont("Segoe UI", 10))
 
     startup = _Startup()
-    # First run: ask the only two things the application cannot work out for
+    # First run: ask the handful of things the application cannot work out for
     # itself, write .env, and never ask again. Anything already configured
     # skips straight past this.
     env_path = default_env_path()
@@ -145,8 +146,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     if startup.warnings:
         StartupWarningDialog(startup.warnings).exec()
 
-    host = EngineHost(settings, repository)
-    api = SendApiHost(settings, repository, host.engine)
+    host = EngineHost(settings, repository, reply_for)
+    api = SendApiHost(settings, repository, host.service)
     window = MainWindow(settings, repository, host, api)
 
     try:
@@ -159,8 +160,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     window.show()
     host.start()
 
-    # After the engine, because a request arriving before the loop exists would
-    # fail for a reason the caller could do nothing about.
+    # After the listener, because a request arriving before the service exists
+    # would fail for a reason the caller could do nothing about.
     if api.enabled:
         try:
             api.start()

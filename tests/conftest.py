@@ -1,11 +1,6 @@
 """Shared fixtures — notably, running the same tests against both stores.
 
-Two test doubles have now been caught lying: `FakeCollection.find_one` matched
-only the query's first key, and `FakeMongo` was missing the `outgoing`
-collection entirely. Both times the production code was correct and the double
-was not, which is the failure mode that makes doubles worse than useless — they
-produce confidence in proportion to how wrong they are.
-
+Test doubles here have been caught lying more than once (see `tests/fakes.py`).
 So the storage-dependent suites run **twice**: once against the dict-backed
 fake (fast, always available) and once against a real `mongod`. Anything that
 passes on the fake and fails on the real one is a bug in the fake; anything
@@ -67,7 +62,7 @@ def storage(request, tmp_path: Path):
     backup.ensure_folder()
 
     if request.param == "fake":
-        from tests.test_storage import FakeMongo
+        from tests.fakes import FakeMongo
 
         store = FakeMongo()
     else:
@@ -92,9 +87,10 @@ def storage(request, tmp_path: Path):
 def reopen(tmp_path: Path):
     """Simulate a restart: a NEW Repository over the SAME stores.
 
-    The whole point of a durable queue is that it survives the process, so
-    recovery tests must reconstruct the repository rather than reusing the
-    instance that already has everything in memory."""
+    Deduplication has to survive the process — a webhook delivery retried
+    across a restart must still be recognised — so tests for it reconstruct the
+    repository rather than reusing the instance that already has the keys in
+    memory."""
     def _reopen(repository: Repository, settings: Settings) -> Repository:
         restarted = Repository(settings, repository._mongo,
                                JsonBackupStore(settings.json_backup_folder, 0))

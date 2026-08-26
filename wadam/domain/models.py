@@ -8,13 +8,31 @@ from drifting apart.
 Datetimes are always timezone-aware UTC in memory. MongoDB stores them as BSON
 dates (which are UTC but come back naive), so `from_document` re-attaches the
 timezone; JSON stores them as ISO-8601 strings.
+
+**What moving to OpenWA deleted from this file.** Two hashes and a queue:
+
+* `chat_id_for(chat_name)` derived a chat's id from its display name, because
+  WhatsApp Desktop's accessibility tree exposed no durable identifier — a
+  sidebar row was a flattened string of name + preview + timestamp, all of
+  which change. The honest consequence was that renaming a contact produced a
+  *new* chat with its own configuration. OpenWA supplies a real id
+  (`216298915164281@lid`), so the hash and its consequence are both gone.
+* `message_key_for(...)` hashed a message's content, because re-reading the
+  same visible bubble every three seconds would otherwise store it repeatedly.
+  It could not tell two people genuinely sending "ok" a minute apart from one
+  message read twice. WhatsApp's own message id replaces it.
+* `OutgoingMessage` / `OutgoingStatus` was a durable send queue, needed because
+  a UI-Automation send took seconds, could not run concurrently, and might
+  leave the compose box without ever reaching the conversation. A send is now
+  an HTTP call whose response says whether it worked.
+
+`PollState` and `WebhookRecord` went with them: there is no polling loop, and
+no per-chat outbound webhook to keep a delivery record for.
 """
 
 from __future__ import annotations
 
-import hashlib
 import re
-import uuid
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -40,37 +58,13 @@ def _as_utc(value: Any) -> Optional[datetime]:
     return None
 
 
-_ID_CLEAN_RE = re.compile(r"\s+")
-
-
-def chat_id_for(chat_name: str) -> str:
-    """A stable id for a chat, derived from its display name.
-
-    WhatsApp Desktop's accessibility tree exposes no durable identifier for a
-    chat — a row is a flattened string of name + preview + timestamp, all of
-    which change. The name is the only stable part, so the id is a hash of it.
-
-    The consequence, stated plainly: renaming a contact or group produces a NEW
-    chat here, with its own configuration. That's the honest trade for having no
-    real id.
-
-    Since a discovered chat now arrives with automation ON, a rename no longer
-    quietly stops the automation — it re-baselines it. The renamed chat is
-    seeded from scratch (so nothing already on screen is answered) and any
-    number or webhook override typed against the old name is left behind on the
-    old row, which stays in the list until deleted.
-    """
-    normalized = _ID_CLEAN_RE.sub(" ", (chat_name or "").strip()).casefold()
-    return hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:24]
-
-
 def phone_digits(value: str) -> str:
     """The digits of `value` when it looks like a phone number, else "".
 
     "Looks like" means at least seven digits and almost nothing else — a couple
-    of stray non-phone characters are tolerated (a trailing tilde, a stray
-    letter), but a name is not. This is what stops "CSE - C 2023-27" from being
-    read as a phone number."""
+    of stray non-phone characters are tolerated, but a name is not. This is
+    what stops "CSE - C 2023-27" from being read as a phone number.
+    """
     digits = re.sub(r"\D", "", value or "")
     if len(digits) < 7:
         return ""
@@ -80,140 +74,67 @@ def phone_digits(value: str) -> str:
     return digits
 
 
-def message_key_for(chat_id: str, sender: str, text: str, time_text: str,
-                    direction: str, occurrence: int = 0) -> str:
-    """The deduplication key for a message bubble.
+def phone_from_chat_id(chat_id: str) -> str:
+    """The phone number in an OpenWA chat id, when there genuinely is one.
 
-    Every poll re-reads the same visible tail of the conversation, so identity
-    has to come from content: which chat, who sent it, what it said, the
-    bubble's own clock label, and which way it went.
-
-    `occurrence` is what makes two IDENTICAL messages two messages. It is the
-    index of this bubble among the identical ones in the same read — the first
-    "OK" is 0, the second is 1 — so:
-
-        the same physical bubble, re-read every 3 seconds  -> the same key
-        two distinct bubbles that happen to read alike     -> different keys
-
-    Both halves matter. Without the index, a genuine repeat is silently dropped
-    at storage and never reaches `wa_events`; measured live, two "OK"s sent
-    seconds apart produced one database record. Without the content hash, every
-    poll would store the visible tail again and answer it again.
-
-    Deliberately NOT a UIA RuntimeId. Those are unique per element now but are
-    re-issued when the tree is virtualised, so a scrolled conversation would
-    hand back new ids for the same bubbles and store them all a second time.
-
-    The remaining gap: if an older identical bubble scrolls out of the read
-    window the survivor's index shifts, which can store one extra copy. Bounded
-    and visible, unlike the loss it replaces.
+    `918985370703@c.us` yields the number. `216298915164281@lid` yields ""
+    — a LID is an opaque identifier, and reading it as a phone number would
+    display a plausible-looking number belonging to nobody.
     """
-    raw = "".join((chat_id, sender or "", text or "", time_text or "", direction,
-                   f"#{occurrence}" if occurrence else ""))
-    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+    if not chat_id or "@" not in chat_id:
+        return ""
+    local, _, domain = chat_id.partition("@")
+    return phone_digits(local) if domain == "c.us" else ""
 
 
-def outgoing_key_for(chat_id: str, text: str, moment: Optional[datetime] = None) -> str:
-    """The key for a message this application SENDS, as opposed to one it read.
+class MessageStatus:
+    """The life of one message.
 
-    Deliberately not `message_key_for`. That key is content-derived because a
-    bubble read from WhatsApp has no identity of its own, which means two
-    identical messages collapse into one — correct when re-reading the same
-    visible tail every three seconds, and wrong here. When we send something we
-    know for certain it is a distinct event, so the send moment goes into the
-    key and a legitimate repeat gets its own record.
+    Five states, down from eleven. The ones that went were all about a send
+    that might silently not have happened: DISPATCHING, AWAITING_SEND and
+    INTERRUPTED existed so a crash mid-send could be reconstructed, and SEEDED
+    marked messages already on screen when a chat was first enabled.
+    """
 
-    Found by a live relay run: three messages went out and only two were
-    stored, because the third repeated the first."""
-    stamp = (moment or utcnow()).isoformat()
-    raw = "".join((chat_id, "You", text or "", stamp, "out"))
-    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+    PENDING = "pending"        # stored; nothing decided yet
+    COLLECTED = "collected"    # stored; no reply wanted, and that is fine
+    REPLIED = "replied"        # answered
+    FAILED = "failed"          # the send did not happen
+    SENT = "sent"              # an outgoing message this application originated
 
 
 @dataclass
 class ChatConfig:
-    """One WhatsApp chat and its automation configuration + live status.
+    """One WhatsApp chat and its automation setting.
 
-    Created automatically the first time a chat is seen in the sidebar, with
-    automation ON and a webhook derived from the template — never through a
-    dialog. Unticking the box switches it off and deletes everything the chat
-    stored; the row itself stays, which is what stops discovery from switching
-    it back on.
+    Registered the first time a message arrives from it, with automation OFF.
+    winSpark defaulted it ON because sidebar discovery found every chat whether
+    it had ever spoken or not; here a chat only exists once someone has
+    messaged it, and answering a stranger automatically on first contact is
+    precisely the behaviour that gets a number restricted.
     """
 
     chat_id: str = ""
-    chat_name: str = ""
-    #: The contact's number, digits only, resolved at discovery where WhatsApp
-    #: exposes it. First-class because the webhook URL is built from it. Empty
-    #: means "not resolved" and is never guessed at — a wrong number would send
-    #: someone else's conversation to a webhook.
-    phone_number: str = ""
-    #: When the contact-info panel was last opened to look for a number.
-    #: Set whether or not one was found, because "we looked and there was
-    #: nothing" is the answer worth remembering: a community has no number, and
-    #: without this its panel was opened and closed on every single scan.
-    #: Cleared when the number is cleared, so emptying the field re-arms the
-    #: search rather than leaving it permanently given up on.
-    phone_probed_at: Optional[datetime] = None
+    """OpenWA's identifier, verbatim. Durable across renames."""
 
-    # --- configuration -----------------------------------------------------
-    #: The URL actually called for this chat. **Derived**, not typed in:
-    #: regenerated from the global template and `phone_number` on every
-    #: discovery pass, so changing the template updates every chat. Stored
-    #: rather than computed at each use so the existing webhook, relay and
-    #: recovery paths did not all need rewriting around a new signature.
-    webhook_url: str = ""
-    #: Set only when a chat deliberately points somewhere else. Wins over the
-    #: template. The simplified UI does not offer this; the data model keeps it
-    #: so an operator editing the database is not fighting the application.
-    webhook_override: str = ""
+    chat_name: str = ""
+    phone_number: str = ""
+    """Derived from the chat id when it is phone-shaped; empty for LIDs.
+    Never guessed at."""
+
     automation_enabled: bool = False
-    # The identifier the inbound send API addresses this chat by — by default
-    # --- sidebar mirror (what the chat list renders) -----------------------
-    last_message_preview: str = ""
-    timestamp_text: str = ""
-    unread_count: int = 0
-    is_pinned: bool = False
-    is_muted: bool = False
     is_group: bool = False
 
-    #: Messages received for this chat that have NOT yet finished the
-    #: automation round trip. Recomputed on every snapshot, never read back
-    #: from storage — a stale count is worse than no count.
-    pending_count: int = 0
-
-    # --- live status -------------------------------------------------------
-    last_poll_utc: Optional[datetime] = None
+    # --- what the chat list renders ---------------------------------------
+    last_message_preview: str = ""
     last_incoming_text: str = ""
     last_incoming_sender: str = ""
     last_incoming_utc: Optional[datetime] = None
     last_outgoing_text: str = ""
     last_outgoing_utc: Optional[datetime] = None
-    last_webhook_status: str = ""       # e.g. "200 OK", "timeout", "no reply"
-    last_webhook_response: str = ""     # trimmed body / reply text
-    last_webhook_utc: Optional[datetime] = None
-    webhook_retry_count: int = 0        # attempts spent on the most recent call
-    # The relay half: what the last GET of this chat's webhook produced, and
-    # the text it last sent — which doubles as the consecutive-duplicate guard.
-    last_relay_status: str = ""
-    last_relay_text: str = ""
-    last_relay_utc: Optional[datetime] = None
-    # Set the first time this chat's endpoint answers a poll with "nothing
-    # waiting". That proves it dequeues, which retires the content-based
-    # duplicate guard for good — see RelayService.should_send.
-    relay_dequeues: bool = False
     messages_stored: int = 0
     last_error: str = ""
 
-    # --- bookkeeping -------------------------------------------------------
-    # False until the chat's existing backlog has been read once and recorded
-    # WITHOUT triggering automation. Without this, enabling a webhook on a busy
-    # chat would fire it at every message already on screen.
-    seeded: bool = False
-    # Hash of the last sidebar row text seen, so the poll can tell "this chat
-    # changed" from "this chat is the same as three seconds ago" without
-    # opening it.
-    row_signature: str = ""
     created_at: datetime = field(default_factory=utcnow)
     updated_at: datetime = field(default_factory=utcnow)
 
@@ -225,84 +146,24 @@ class ChatConfig:
         return _build(cls, document)
 
 
-class MessageStatus:
-    """The lifecycle of a message, persisted at every transition.
-
-    The states exist so that a crash at any point is *recoverable without
-    guessing*. Each one answers "what has already happened to the outside
-    world?", which is the only question that matters when deciding whether it
-    is safe to resume:
-
-    ============== ========================================= =================
-    state          the outside world has…                    on restart
-    ============== ========================================= =================
-    SEEDED         nothing — pre-existing backlog            leave alone
-    PENDING        nothing — stored, webhook not yet called  safe to process
-    DISPATCHING    unknown — the webhook call was in flight  do NOT retry
-    WEBHOOK_OK     seen the message, chose not to reply      done
-    WEBHOOK_FAILED seen it, or not; it gave up either way    done
-    AWAITING_SEND  replied; our send is unconfirmed          verify, then send
-    REPLIED        received our reply, verified              done
-    REPLY_FAILED   replied; our send provably did not land   done
-    IGNORED        nothing — automation off, or no webhook   leave alone
-    INTERRUPTED    unknown — was DISPATCHING when we died    left for a human
-    ============== ========================================= =================
-
-    DISPATCHING is the important one. It is written *before* the webhook call,
-    so a message found in that state after a crash might have already reached
-    the endpoint and might have already caused a side effect there. Retrying it
-    would risk a duplicate webhook call, which the reliability requirements
-    forbid outright — so it is marked INTERRUPTED, logged loudly, and left for
-    a person to decide about. Losing an automatic reply is recoverable; sending
-    someone's customer two of them is not.
-    """
-
-    SEEDED = "seeded"
-    PENDING = "pending"
-    DISPATCHING = "dispatching"
-    WEBHOOK_OK = "webhook_ok"
-    WEBHOOK_FAILED = "webhook_failed"
-    AWAITING_SEND = "awaiting_send"
-    REPLIED = "replied"
-    REPLY_FAILED = "reply_failed"
-    IGNORED = "ignored"
-    INTERRUPTED = "interrupted"
-    SENT = "sent"  # an outgoing message we originated
-
-    #: States that mean work was in progress when the process stopped.
-    INCOMPLETE = (PENDING, DISPATCHING, AWAITING_SEND)
-
-
 @dataclass
 class StoredMessage:
-    """One message bubble, persisted the moment it is detected — before the
-    webhook is called, before anything is sent. Nothing in this application is
-    allowed to exist only in memory."""
+    """One message, persisted the moment it is understood — before any reply is
+    decided. Nothing in this application is allowed to exist only in memory."""
 
     message_key: str = ""
+    """WhatsApp's own message id for inbound messages. Unique-indexed, so a
+    retried webhook delivery cannot store the same message twice."""
+
     chat_id: str = ""
     chat_name: str = ""
-    #: The chat's number as known when this message was stored. Denormalised on
-    #: purpose: the specification asks messages to preserve it, and a consumer
-    #: reading the messages collection should not have to join to find out whose
-    #: number a message belongs to. Backfilled when a number is set later.
-    phone_number: str = ""
     sender: str = ""
     text: str = ""
-    direction: str = "in"          # "in" (received) | "out" (sent by us)
-    media_kind: str = ""           # photo | voice | video | document | sticker | gif | ""
-    media_note: str = ""           # duration / filename / caption
-    time_text: str = ""            # the bubble's own clock label, e.g. "9:21 pm"
-    # Where an outgoing message came from: "webhook_reply" (the pipeline
-    # answered an incoming message), "api" (something POSTed it to the send
-    # API), or "" for anything simply read back out of WhatsApp.
-    origin: str = ""
-    # The id the endpoint gave a relayed message, when it gave one. Empty for
-    # everything else. This is what makes "send the same text twice" possible.
-    external_ref: str = ""
+    direction: str = "in"      # "in" (received) | "out" (sent by us)
+    media_kind: str = ""       # image | video | audio | document | sticker | ""
+    origin: str = ""           # "reply" | "api" | ""
     detected_at: datetime = field(default_factory=utcnow)
-    status: str = MessageStatus.PENDING  # see MessageStatus for the lifecycle
-    webhook_id: str = ""
+    status: str = MessageStatus.PENDING
     reply_text: str = ""
     error: str = ""
 
@@ -314,124 +175,16 @@ class StoredMessage:
         return _build(cls, document)
 
 
-class OutgoingStatus:
-    """The life of a queued outgoing message.
-
-    Separate from `MessageStatus` on purpose. That one describes an *incoming*
-    message's journey through the webhook; this describes an *outgoing* one's
-    journey to the screen, and the two failure vocabularies are different —
-    "the endpoint 5xx'd" and "the bubble never appeared" want different
-    responses from an operator."""
-
-    QUEUED = "queued"           # persisted, nothing attempted
-    SENDING = "sending"         # a worker has it; the outcome is unknown
-    VERIFYING = "verifying"     # left the compose box, delivery unconfirmed
-    DELIVERED = "delivered"     # a new outgoing bubble was found in the chat
-    UNVERIFIED = "unverified"   # transport succeeded, delivery unproven
-    FAILED = "failed"           # gave up after the retry policy
-    CANCELLED = "cancelled"     # its chat was deleted underneath it
-
-    #: States a restart must pick back up.
-    RESUMABLE = (QUEUED,)
-    #: In-flight when the process died — ambiguous, needs verifying not resending.
-    AMBIGUOUS = (SENDING, VERIFYING)
-    FINAL = (DELIVERED, UNVERIFIED, FAILED, CANCELLED)
-
-
-@dataclass
-class OutgoingMessage:
-    """One message waiting to reach a chat.
-
-    Persisted before anything is attempted, so the queue survives a crash. The
-    per-chat `sequence` preserves ordering: two replies to the same
-    conversation must arrive in the order they were produced, whatever the
-    worker does in between."""
-
-    outgoing_id: str = field(default_factory=lambda: uuid.uuid4().hex)
-    chat_id: str = ""
-    chat_name: str = ""
-    text: str = ""
-    origin: str = ""                 # "webhook_reply" | "api" | "relay"
-    status: str = OutgoingStatus.QUEUED
-    sequence: int = 0                # per chat, ascending
-    attempts: int = 0
-    max_attempts: int = 3
-    error: str = ""
-    verification: str = ""           # Verification.* once attempted
-    external_ref: str = ""           # a relay message id, when there was one
-    source_message_key: str = ""     # the incoming message this answers
-    created_at: datetime = field(default_factory=utcnow)
-    updated_at: datetime = field(default_factory=utcnow)
-    delivered_at: Optional[datetime] = None
-
-    @property
-    def exhausted(self) -> bool:
-        return self.attempts >= self.max_attempts
-
-    def to_document(self) -> dict[str, Any]:
-        return asdict(self)
-
-    @classmethod
-    def from_document(cls, document: dict[str, Any]) -> "OutgoingMessage":
-        return _build(cls, document)
-
-
-@dataclass
-class WebhookRecord:
-    """One webhook invocation: what was sent, what came back, how many attempts
-    it took."""
-
-    webhook_id: str = field(default_factory=lambda: uuid.uuid4().hex)
-    chat_id: str = ""
-    chat_name: str = ""
-    message_key: str = ""
-    url: str = ""
-    request: dict[str, Any] = field(default_factory=dict)
-    status_code: int = 0
-    ok: bool = False
-    attempts: int = 0
-    response_body: str = ""
-    reply_text: str = ""
-    error: str = ""
-    duration_ms: int = 0
-    created_at: datetime = field(default_factory=utcnow)
-
-    def to_document(self) -> dict[str, Any]:
-        return asdict(self)
-
-    @classmethod
-    def from_document(cls, document: dict[str, Any]) -> "WebhookRecord":
-        return _build(cls, document)
-
-
 @dataclass
 class AutomationLog:
-    """A single line of the activity log — the thing you read when a message
-    didn't get answered and you need to know which step gave up.
+    """One line of the activity log the UI renders."""
 
-    The structured fields below are all optional and default to empty, because
-    most lines (a chat discovered, a poll failure) have no direction or webhook
-    to speak of. When a line *is* about a message, it carries the whole picture:
-    which chat, which way the message was going, which endpoint, what came back,
-    how many retries it cost, and what went wrong — so a question like "why did
-    this chat stop replying at 14:36?" is answerable from the log alone."""
-
-    log_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    correlation_id: str = ""
     level: str = "INFO"
-    event: str = ""       # short machine-ish tag: "chat.discovered", "webhook.failed"
+    event: str = ""
     chat_id: str = ""
     chat_name: str = ""
     message: str = ""
-    direction: str = ""       # "in" | "out" | ""
-    # Ties every line about one message together: the incoming message_key, or
-    # the outgoing_id once it is queued. Without it a log can say a chat had
-    # trouble but not WHICH message — and "which one" is the first question
-    # anybody asks when a reply goes missing.
-    correlation_id: str = ""
-    webhook_url: str = ""
-    response: str = ""
-    retry_count: int = 0
-    error: str = ""
     created_at: datetime = field(default_factory=utcnow)
 
     def to_document(self) -> dict[str, Any]:
@@ -461,30 +214,9 @@ class ApplicationState:
         return _build(cls, document)
 
 
-@dataclass
-class PollState:
-    """The one document describing the polling loop's health."""
-
-    cycle_count: int = 0
-    last_cycle_utc: Optional[datetime] = None
-    last_cycle_ms: int = 0
-    whatsapp_found: bool = False
-    chats_seen: int = 0
-    queued_chats: int = 0
-    last_error: str = ""
-    updated_at: datetime = field(default_factory=utcnow)
-
-    def to_document(self) -> dict[str, Any]:
-        return asdict(self)
-
-    @classmethod
-    def from_document(cls, document: dict[str, Any]) -> "PollState":
-        return _build(cls, document)
-
-
 def _build(cls, document: dict[str, Any]):
     """Construct a dataclass from a stored document, ignoring unknown keys
-    (so an older document from a previous version still loads) and repairing
+    (so a document written by an older version still loads) and repairing
     datetimes."""
     known = {f.name: f for f in fields(cls)}
     kwargs: dict[str, Any] = {}
@@ -497,5 +229,4 @@ def _build(cls, document: dict[str, Any]):
             kwargs[name] = _as_utc(value)
         else:
             kwargs[name] = value
-    instance = cls(**kwargs)
-    return instance
+    return cls(**kwargs)

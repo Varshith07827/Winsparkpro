@@ -1,76 +1,80 @@
-"""Bridges the engine's asyncio loop to Qt.
+"""Bridges the service to Qt.
 
-The engine runs its own event loop on its own thread — it has to, because a
-three-second poll cannot be at the mercy of the GUI thread's paint cycle, and
-the GUI cannot be at the mercy of a webhook that takes twenty seconds to answer.
+The service runs an HTTP server on its own threads — it has to, because the
+GUI cannot be at the mercy of a reply function that takes twenty seconds, and a
+webhook delivery cannot be at the mercy of the GUI's paint cycle.
 
 Traffic crosses the boundary in exactly two ways, and no others:
 
-* **engine → UI**: the engine calls `on_snapshot` with an immutable snapshot;
+* **service → UI**: the service calls `on_snapshot` with an immutable snapshot;
   this object re-emits it as a Qt signal. Emitting a signal from a non-GUI
   thread is safe — Qt queues it onto the receiving thread's event loop.
-* **UI → engine**: `AutomationEngine.submit` schedules a coroutine on the
-  engine loop with `run_coroutine_threadsafe`.
+* **UI → service**: direct method calls. They are cheap and take the
+  repository's lock, so there is nothing to marshal.
 
-The UI never touches the repository, the reader, or WhatsApp directly.
+This used to run an asyncio loop and marshal commands into it with
+`run_coroutine_threadsafe`, because the engine was a long-lived polling
+coroutine that owned an automation lock. There is no loop and no lock now: the
+HTTP server is the scheduler.
+
+The UI still never touches the repository to *write*. It reads from the
+snapshot and asks the service to change things.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
-import threading
-from typing import Callable, Optional
+from typing import Optional
 
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, QTimer, Signal
 
 from wadam.config import Settings
-from wadam.engine.engine import AutomationEngine, EngineSnapshot
+from wadam.engine.service import AutomationService, EngineSnapshot
 from wadam.storage.repository import Repository
 
 logger = logging.getLogger(__name__)
+
+#: How often the session indicator asks OpenWA how it is. Slow on purpose:
+#: it is a status light, not a heartbeat, and each tick is an HTTP round trip.
+SESSION_POLL_MS = 10_000
 
 
 class EngineHost(QObject):
     snapshot_ready = Signal(object)
     engine_stopped = Signal(str)  # error text, empty on a clean stop
 
-    def __init__(self, settings: Settings, repository: Repository,
+    def __init__(self, settings: Settings, repository: Repository, reply_fn,
                  parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
         self._settings = settings
         self._repository = repository
-        self._thread: Optional[threading.Thread] = None
-        self.engine = AutomationEngine(settings, repository, self._on_snapshot)
+        self.service = AutomationService(settings, repository, reply_fn, self._on_snapshot)
+        self._session_timer = QTimer(self)
+        self._session_timer.setInterval(SESSION_POLL_MS)
+        self._session_timer.timeout.connect(self._poll_session)
 
     def _on_snapshot(self, snapshot: EngineSnapshot) -> None:
         self.snapshot_ready.emit(snapshot)
 
     def start(self) -> None:
-        if self._thread is not None:
-            return
-        self._thread = threading.Thread(target=self._run, name="wadam-engine", daemon=True)
-        self._thread.start()
-        # Give the loop a moment to exist before the UI starts submitting
-        # commands into it; a command submitted too early would fail loudly for
-        # no reason the user could act on.
-        self.engine.wait_until_ready(timeout=10.0)
-
-    def _run(self) -> None:
-        error = ""
         try:
-            asyncio.run(self.engine.run())
-        except Exception as ex:  # noqa: BLE001
-            error = f"{type(ex).__name__}: {ex}"
-            logger.exception("The automation engine stopped unexpectedly")
-        finally:
-            self.engine_stopped.emit(error)
+            self.service.start()
+        except OSError as ex:
+            # A port already in use is the common one, and it is worth naming
+            # precisely: the window would otherwise just sit there receiving
+            # nothing, looking like OpenWA was misconfigured.
+            message = (f"Could not listen on {self._settings.webhook_host}:"
+                       f"{self._settings.webhook_port} — {ex}")
+            logger.error(message)
+            self.engine_stopped.emit(message)
+            return
+        self._poll_session()
+        self._session_timer.start()
 
-    def stop(self, timeout: float = 8.0) -> None:
-        self.engine.request_stop()
-        if self._thread is not None:
-            self._thread.join(timeout=timeout)
-            self._thread = None
+    def _poll_session(self) -> None:
+        self.service.refresh_session()
+        self.service.publish()
 
-    def submit(self, coroutine_factory: Callable[[], object]):
-        return self.engine.submit(coroutine_factory)
+    def stop(self, timeout: float = 5.0) -> None:
+        self._session_timer.stop()
+        self.service.stop(timeout=timeout)

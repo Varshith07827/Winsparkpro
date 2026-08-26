@@ -1,15 +1,13 @@
-# WhatsApp Desktop Automation Manager — runtime dependencies.
+# WhatsApp Automation Manager — runtime dependencies.
 #
 #   python -m venv .venv
-#   .venv\Scripts\activate
-#   python -m pip install -r requirements.txt
-
-# Windows UI Automation — the ONLY supported message transport (Option A).
-uiautomation>=2.0; sys_platform == "win32"
-pywin32>=306; sys_platform == "win32"
-
-# Window/process discovery (finding WhatsApp.exe).
-psutil>=5.9
+#   .venv\Scripts\python.exe -m pip install -r requirements.txt
+#
+# Three packages left when the UI-Automation transport did: `uiautomation` and
+# `pywin32` drove WhatsApp Desktop's accessibility tree, and `psutil` found the
+# WhatsApp.exe window to drive. OpenWA is the transport now, reached over HTTP
+# with the standard library, so none of them have anything to do — and with
+# them went the last reason this had to run on Windows.
 
 # Primary datastore. The [srv] extra pulls in dnspython, which pymongo REQUIRES
 # to resolve a mongodb+srv:// (Atlas) address — without it every Atlas

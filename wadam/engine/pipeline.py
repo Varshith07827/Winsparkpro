@@ -1,252 +1,213 @@
-"""The message processing pipeline.
+"""What happens to one inbound message.
 
-    message detected
-        ↓
-    save MongoDB          ← the caller does this before we are entered
-        ↓
-    write JSON
-        ↓
-    mark DISPATCHING  →  save  →  write JSON     ← the crash-safety point
-        ↓
-    webhook
-        ↓
-    receive response
-        ↓
-    save response  →  write JSON
-        ↓
-    mark AWAITING_SEND  →  save  →  write JSON
-        ↓
-    send message (UI Automation)
-        ↓
-    verify
-        ↓
-    mark REPLIED  →  save  →  write JSON
+    OpenWA ──▶ signature ──▶ known chat? ──▶ automation on? ──▶ store
+                                                                  │
+                                          reply wanted? ◀──────────┘
+                                                │
+                                          cooldown ──▶ send ──▶ store
 
-**Persistence is never skipped and nothing is processed only in memory.** Each
-transition reaches MongoDB and the JSON mirror *before* the next step runs, so a
-crash anywhere leaves a record of exactly how far the message got — and, more
-usefully, of what the outside world has already seen.
+Every check answers HTTP 200 except a bad signature. A 4xx or 5xx tells OpenWA
+the delivery failed and earns a retry, and there is nothing to retry about a
+message that was correctly ignored — it would be ignored again, three more
+times. A bad signature is the one case where repeating the request verbatim
+really is wrong.
 
-That last part is what makes recovery possible without guessing. `DISPATCHING`
-is written before the webhook call and `AWAITING_SEND` before the send, so on
-restart the engine can tell "the endpoint definitely has not seen this" from
-"it might have". See `MessageStatus` for the full table and
-`AutomationEngine._recover_incomplete` for what is done with each state.
+**A failed send also answers 200.** A retry would re-run the decision and could
+deliver twice. This is not theoretical: on the first live message through this
+architecture, OpenWA 0.7.2 returned HTTP 500 for a message it had *already*
+delivered, and a retrying client would have sent four copies. A duplicate is
+worse than a miss — the same judgment winSpark made when it refused to retry an
+UNVERIFIED send.
 
-Two things this pipeline will not do:
-
-* **Send a reply it has not verified.** A send whose compose box did not clear
-  is recorded as `reply_failed`, and no outgoing message is claimed.
-* **Retry a webhook it cannot prove was never delivered.** Losing an automatic
-  reply is recoverable; sending someone's customer two of them is not.
+Persistence still comes before decisions: the message is stored the moment it
+is understood, so a crash anywhere leaves a record of how far it got.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from dataclasses import dataclass
+from typing import Callable, Optional
 
-from wadam.domain.models import (
-    ChatConfig,
-    MessageStatus,
-    StoredMessage,
-    WebhookRecord,
-    outgoing_key_for,
-    utcnow,
-)
-from wadam.engine.webhook import WebhookClient, build_payload, optional_reply
-from wadam.engine import send_guard
-from wadam.storage.repository import Repository
-from wadam.whatsapp.sender import WhatsAppSender
+from wadam.domain.models import ChatConfig, MessageStatus, StoredMessage, utcnow
+from wadam.engine.guards import Cooldown
+from wadam.openwa import InboundMessage, OpenWAClient, SendError
 
 logger = logging.getLogger(__name__)
 
+#: Decides the reply. Returns the text to send, or None to stay silent.
+#: Silence is a successful outcome, not an error — most messages in a live chat
+#: do not want an answer, and an endpoint forced to invent one for every message
+#: will eventually say something stupid.
+ReplyFn = Callable[[InboundMessage, ChatConfig], Optional[str]]
+
+
+@dataclass
+class Outcome:
+    """What the pipeline did, for the HTTP response and the metrics."""
+
+    action: str  # replied | skipped | send_failed | ignored
+    reason: str = ""
+    chat_id: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.action != "send_failed"
+
+    def as_response(self) -> dict:
+        body = {"ok": self.ok, "action": self.action}
+        if self.reason:
+            body["reason"] = self.reason
+        if self.chat_id:
+            body["chatId"] = self.chat_id
+        return body
+
 
 class MessagePipeline:
-    def __init__(self, repository: Repository, webhook: WebhookClient, sender: WhatsAppSender,
-                 to_thread, delivery=None, metrics=None) -> None:
+    """Turns a delivered message into a stored record and, sometimes, a reply."""
+
+    def __init__(self, repository, client: OpenWAClient, reply_fn: ReplyFn,
+                 cooldown: Cooldown, metrics=None, answer_groups: bool = False) -> None:
         self._repo = repository
-        self._webhook = webhook
-        self._sender = sender
-        # When present, replies are QUEUED rather than sent inline. Producing a
-        # reply and delivering it are different jobs with different failure
-        # modes: a webhook that answered is a success even if WhatsApp is
-        # locked, and the reply should wait rather than be lost.
-        self._delivery = delivery
+        self._client = client
+        self._reply_fn = reply_fn
+        self._cooldown = cooldown
         self._metrics = metrics
-        # Injected rather than imported so every blocking repository call in
-        # here is visibly off the event loop.
-        self._to_thread = to_thread
+        self._answer_groups = answer_groups
 
-    # -- the normal path ---------------------------------------------------
+    def process(self, msg: InboundMessage) -> Outcome:
+        """Handle one inbound message. Never raises."""
+        if msg.is_outgoing:
+            return Outcome("skipped", "outgoing message")
 
-    async def process(self, chat: ChatConfig, message: StoredMessage) -> None:
-        """Record an incoming message. That is the whole inbound flow.
+        chat = self._ensure_chat(msg)
 
-            WhatsApp ─▶ reader ─▶ MongoDB (wa_events) ─▶ your monitoring app
+        stored = self._store_incoming(msg, chat)
+        if stored is None:
+            return Outcome("skipped", "duplicate delivery", msg.chat_id)
 
-        winSpark is the **collector** on this side. It does not call anything
-        and it does not answer: whatever reads `wa_events` decides what to do
-        with a message, and if a reply is wanted it comes back through the
-        outbound bridge (`POST /wam/`) like any other outbound message.
-
-        This used to POST the message to the chat's webhook and send whatever
-        came back — an inbound→webhook→reply loop that was never part of the
-        product. It is gone. The two flows are independent by design:
-        **receiving a WhatsApp message can no longer cause winSpark to send
-        one**, which is also what makes an accidental reply loop structurally
-        impossible rather than merely guarded against.
-
-        The message is already persisted when this is called."""
-        await self._to_thread(self._repo.flush_json, True)
-        await self._finish(chat, message, status=MessageStatus.WEBHOOK_OK,
-                           webhook_status="collected")
-        self._log(chat, "INFO", "message.collected", message,
-                  "Stored in wa_events. Inbound is collect-only; nothing is sent.")
-
-    async def _call_webhook(self, chat: ChatConfig, message: StoredMessage):
-        """Call the endpoint and persist everything about the attempt. Returns
-        the outcome, or None when it failed and the message is finished."""
-        payload = build_payload(chat, message)
-        outcome = await self._webhook.call(chat.webhook_url, payload)
-
-        record = WebhookRecord(
-            chat_id=chat.chat_id,
-            chat_name=chat.chat_name,
-            message_key=message.message_key,
-            url=chat.webhook_url,
-            request=payload,
-            status_code=outcome.status_code,
-            ok=outcome.ok,
-            attempts=outcome.attempts,
-            response_body=outcome.body,
-            reply_text=outcome.reply_text,
-            error=outcome.error,
-            duration_ms=outcome.duration_ms,
-        )
-        await self._to_thread(self._repo.save_webhook, record)
         if self._metrics:
-            self._metrics.record_webhook(outcome.ok, outcome.duration_ms)
+            self._metrics.record_received()
 
-        message.webhook_id = record.webhook_id
-        chat.last_webhook_utc = utcnow()
-        chat.last_webhook_status = outcome.status_text
-        chat.last_webhook_response = (outcome.reply_text or outcome.body or outcome.error)[:1000]
-        # "Attempts spent on the most recent call", not a lifetime total — a
-        # lifetime total never goes down, so it never tells you whether the
-        # endpoint is healthy *now*.
-        chat.webhook_retry_count = max(0, outcome.attempts - 1)
+        if not chat.automation_enabled:
+            return Outcome("skipped", "automation off for this chat", msg.chat_id)
 
-        if not outcome.ok:
-            message.error = outcome.error
-            await self._finish(chat, message, status=MessageStatus.WEBHOOK_FAILED,
-                               webhook_status=outcome.status_text, error=outcome.error)
-            self._log(chat, "ERROR", "webhook.failed", message,
-                      f"{outcome.status_text} after {outcome.attempts} attempt(s): {outcome.error}",
-                      retry_count=max(0, outcome.attempts - 1))
-            return None
-        return outcome
+        if msg.is_group and not self._answer_groups:
+            return Outcome("skipped", "group chat", msg.chat_id)
 
-    async def _send_reply(self, chat: ChatConfig, message: StoredMessage, reply: str,
-                          webhook_status: str) -> None:
-        if self._delivery is not None:
-            await self._delivery.enqueue(chat, reply, origin="webhook_reply",
-                                         source_message_key=message.message_key)
-            # The reply is durably queued; delivery and verification are the
-            # queue's job now. The incoming message's own journey ends here.
-            await self._finish(chat, message, status=MessageStatus.REPLIED,
-                               webhook_status=webhook_status)
-            self._log(chat, "INFO", "reply.queued", message,
-                      f"Reply queued for delivery: {reply[:120]}")
-            return
+        try:
+            answer = self._reply_fn(msg, chat)
+        except Exception:
+            # A bug in the reply function must not take the service down, and
+            # must not be retried into a loop of the same exception.
+            logger.exception("reply function raised on message %s", msg.message_id)
+            self._finish(stored, MessageStatus.FAILED, error="reply function raised")
+            return Outcome("ignored", "reply function raised", msg.chat_id)
 
-        send_guard.check("webhook_reply", chat_name=chat.chat_name, text=reply)
-        result = await self._sender.send_async(chat.chat_name, reply)
+        if not answer or not answer.strip():
+            self._finish(stored, MessageStatus.COLLECTED)
+            return Outcome("skipped", "no reply wanted", msg.chat_id)
 
-        if not result.ok:
-            message.error = result.detail
-            await self._finish(chat, message, status=MessageStatus.REPLY_FAILED,
-                               webhook_status=webhook_status, error=result.detail)
-            self._log(chat, "ERROR", "reply.failed", message, result.detail)
-            return
+        # Asked last, and only for a message actually about to be answered: a
+        # cooldown consumed by a message the reply function ignored would
+        # silence the next one that mattered.
+        if not self._cooldown.allow(msg.chat_id):
+            remaining = self._cooldown.remaining(msg.chat_id)
+            self._finish(stored, MessageStatus.COLLECTED)
+            return Outcome("skipped", f"cooldown, {remaining:.0f}s remaining", msg.chat_id)
 
-        # The reply we sent is a message in its own right and is stored as one,
-        # so the record of the conversation is complete from this side too. The
-        # poll will later read the same bubble back out of WhatsApp; ingestion
-        # recognises it as ours (Repository.recently_originated) and does not
-        # store it a second time.
-        outgoing = StoredMessage(
-            message_key=outgoing_key_for(chat.chat_id, reply),
+        return self._send_reply(msg, chat, stored, answer)
+
+    # ── the pieces ────────────────────────────────────────────────────
+
+    def _ensure_chat(self, msg: InboundMessage) -> ChatConfig:
+        """Find the chat, or register it the first time it is seen.
+
+        Discovery used to be a three-second scrape of the sidebar. It is now a
+        side effect of a message arriving — cheaper, and more accurate: the
+        chat id comes from OpenWA and is durable, so a renamed contact stays
+        the same chat instead of silently becoming a new one.
+
+        A new chat arrives with automation OFF. winSpark defaulted it ON
+        because discovery found every chat in the sidebar whether it had ever
+        spoken or not; here a chat only appears once someone has messaged it,
+        and answering a stranger automatically on first contact is exactly the
+        behaviour that gets a number restricted.
+        """
+        chat = self._repo.get_chat(msg.chat_id)
+        if chat is not None:
+            if msg.chat_name and chat.chat_name != msg.chat_name:
+                chat.chat_name = msg.chat_name
+                self._repo.save_chat(chat)
+            return chat
+
+        chat = ChatConfig(
+            chat_id=msg.chat_id,
+            chat_name=msg.chat_name or msg.chat_id,
+            automation_enabled=False,
+        )
+        self._repo.save_chat(chat)
+        logger.info("registered new chat %s (%s), automation off", chat.chat_name, chat.chat_id)
+        return chat
+
+    def _store_incoming(self, msg: InboundMessage, chat: ChatConfig) -> Optional[StoredMessage]:
+        """Persist the message. None if it was already stored.
+
+        The key is WhatsApp's own message id, so deduplication survives a
+        restart — the old content hash could not tell two people genuinely
+        sending "ok" a minute apart from one message read twice.
+        """
+        stored = StoredMessage(
+            message_key=msg.message_id or f"in:{msg.chat_id}:{utcnow().timestamp()}",
+            chat_id=msg.chat_id,
+            chat_name=chat.chat_name,
+            sender=msg.sender,
+            text=msg.text,
+            direction="in",
+            media_kind=msg.media_kind,
+            status=MessageStatus.PENDING,
+        )
+        return stored if self._repo.save_message(stored) else None
+
+    def _send_reply(self, msg: InboundMessage, chat: ChatConfig,
+                    stored: StoredMessage, answer: str) -> Outcome:
+        try:
+            self._client.send_text(msg.chat_id, answer)
+        except SendError as error:
+            logger.error("send to %s failed: %s", msg.chat_id, error)
+            self._finish(stored, MessageStatus.FAILED, error=str(error))
+            if self._metrics:
+                self._metrics.record_send(False)
+            return Outcome("send_failed", str(error), msg.chat_id)
+
+        stored.reply_text = answer
+        self._finish(stored, MessageStatus.REPLIED)
+        self.record_outgoing(chat, answer, origin="reply")
+        if self._metrics:
+            self._metrics.record_send(True)
+        logger.info("replied to %s: %s", chat.chat_name, answer[:80])
+        return Outcome("replied", "", msg.chat_id)
+
+    def record_outgoing(self, chat: ChatConfig, text: str, origin: str) -> None:
+        """Store a message this application sent, and update the chat's preview.
+
+        Public because the send API sends messages the pipeline never saw an
+        inbound half for, and those belong in the same history.
+        """
+        self._repo.save_message(StoredMessage(
+            message_key=f"out:{chat.chat_id}:{utcnow().timestamp()}",
             chat_id=chat.chat_id,
             chat_name=chat.chat_name,
-            phone_number=chat.phone_number,
-            sender="You",
-            text=reply,
+            text=text,
             direction="out",
-            status=MessageStatus.SENT,
-            webhook_id=message.webhook_id,
-        )
-        await self._to_thread(self._repo.save_message, outgoing)
+            origin=origin,
+            status=MessageStatus.REPLIED,
+        ))
+        chat.last_message_preview = text
+        self._repo.save_chat(chat)
 
-        chat.last_outgoing_text = reply
-        chat.last_outgoing_utc = utcnow()
-        chat.last_error = ""
-        await self._finish(chat, message, status=MessageStatus.REPLIED,
-                           webhook_status=webhook_status)
-        self._log(chat, "INFO", "reply.sent", message,
-                  f"Replied via {result.strategy}: {reply[:120]}")
-
-    # -- recovery ----------------------------------------------------------
-
-    async def resume_send(self, chat: ChatConfig, message: StoredMessage,
-                          already_sent: Optional[bool]) -> None:
-        """Finish a reply that was persisted but whose send was never confirmed.
-
-        `already_sent` is the caller's verdict after reading the conversation:
-        True when the reply text is already in the chat (it did land before the
-        crash), False when it is not, None when the chat could not be read. The
-        check exists so recovery cannot produce a duplicate outgoing message —
-        the reliability requirements forbid that as firmly as duplicate webhook
-        calls."""
-        if already_sent:
-            chat.last_outgoing_text = message.reply_text
-            chat.last_outgoing_utc = chat.last_outgoing_utc or utcnow()
-            await self._finish(chat, message, status=MessageStatus.REPLIED,
-                               webhook_status=chat.last_webhook_status)
-            self._log(chat, "INFO", "recovery.already_sent", message,
-                      "The reply was already in the chat — marked replied, nothing re-sent.")
-            return
-
-        if already_sent is None:
-            self._log(chat, "WARNING", "recovery.unverifiable", message,
-                      "Could not read the chat to check whether the reply had been sent; "
-                      "leaving it for the next cycle rather than risking a duplicate.")
-            return
-
-        self._log(chat, "INFO", "recovery.resending", message,
-                  f"Resuming an unsent reply from before the restart: {message.reply_text[:80]}")
-        await self._send_reply(chat, message, message.reply_text,
-                               webhook_status=chat.last_webhook_status)
-
-    # -- shared ------------------------------------------------------------
-
-    async def _finish(self, chat: ChatConfig, message: StoredMessage, *, status: str,
-                      webhook_status: str = "", error: str = "") -> None:
-        message.status = status
+    def _finish(self, stored: StoredMessage, status: str, error: str = "") -> None:
+        stored.status = status
         if error:
-            message.error = error
-            chat.last_error = error
-        if webhook_status:
-            chat.last_webhook_status = webhook_status
-        await self._to_thread(self._repo.update_message, message)
-        await self._to_thread(self._repo.save_chat, chat)
-        await self._to_thread(self._repo.flush_json, True)
-
-    def _log(self, chat: ChatConfig, level: str, event: str, message: StoredMessage,
-             text: str, retry_count: int = 0) -> None:
-        self._repo.log(
-            level, event, chat_id=chat.chat_id, chat_name=chat.chat_name, message=text,
-            direction=message.direction, correlation_id=message.message_key,
-            webhook_url=chat.webhook_url,
-            response=message.reply_text, retry_count=retry_count, error=message.error,
-        )
+            stored.error = error
+        self._repo.update_message(stored)

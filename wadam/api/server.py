@@ -11,9 +11,11 @@ This is a **remote send capability for someone's personal WhatsApp account**,
 which is why the defaults are the shape they are:
 
 * **Off unless a port is configured.** Nothing listens by default.
-* **A token is always required.** Not "when public" — always. An unauthenticated
-  endpoint that sends messages from your account is a hazard on a shared machine
-  as much as on a network.
+* **A token is required off loopback.** The line is drawn at reachability:
+  127.0.0.1 cannot be reached from another machine at all, so an
+  unauthenticated listener there exposes this machine only to itself. Bound
+  anywhere else, the token is the only thing between the network and someone's
+  WhatsApp account, and `config.py` refuses to start without one.
 * **Bound to 127.0.0.1 unless told otherwise.** The default cannot be reached
   from another machine at all. Binding publicly is a deliberate act, and the
   startup screen says so.
@@ -22,11 +24,9 @@ Built on the standard library's `ThreadingHTTPServer`: one POST handler and a
 health check do not justify a web framework, and this keeps the dependency list
 at seven packages.
 
-**The response is not sent until the message is.** A request blocks until the
-send has been verified — the compose box observed clearing — and only then
-returns 200. That is slower than accepting and queueing, and it is the right
-trade: the caller learns whether the message actually arrived, which is the
-whole point of the verification the rest of this application does.
+**The response is not sent until the message is.** A request blocks on the HTTP
+call to OpenWA and only then returns 200, so the caller learns whether the
+gateway accepted the message rather than merely that it was queued.
 """
 
 from __future__ import annotations

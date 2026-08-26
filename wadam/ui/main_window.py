@@ -1,15 +1,16 @@
 """The main window — a chat list and, when you pick one, where it sends.
 
     ┌───────────────────────────────┬──────────────────────────────────────┐
-    │ profile                    ⟳  │ Alice                                │
-    │ search                        ├──────────────────────────────────────┤
-    │───────────────────────────────│ Webhook                              │
-    │ ☑ Alice        Hello there  3 │ https://noteify.org/ntext/whook/?…   │
-    │ ☐ Team chat    Are you…       │                                      │
+    │ search                        │ Alice                                │
+    │───────────────────────────────├──────────────────────────────────────┤
+    │ ☑ Alice        Hello there  3 │  ← ping                    9:21 pm   │
+    │ ☐ Team chat    Are you…       │  → pong                    9:21 pm   │
     │ ☑ Bob          Send the file  │                                      │
     ├───────────────────────────────┴──────────────────────────────────────┤
-    │ status bar: poll cadence · queue · MongoDB · JSON                    │
+    │ session ready · 12 delivered · 4 replied · MongoDB · JSON            │
     └──────────────────────────────────────────────────────────────────────┘
+
+The tick box is the only control. Everything else is a read of what happened.
 
 **The checkbox is the entire user interface.** Ticking it turns a chat's
 automation on, immediately, with no dialog and no save button; clicking the row
@@ -34,12 +35,10 @@ a user of this tool has to look at, and all of them remain in the logs.
 from __future__ import annotations
 
 import logging
-from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import (
     QApplication,
     QHBoxLayout,
@@ -53,7 +52,7 @@ from PySide6.QtWidgets import (
 
 from wadam import constants
 from wadam.config import Settings
-from wadam.engine.engine import EngineSnapshot
+from wadam.engine.service import EngineSnapshot
 from wadam.storage.repository import Repository
 from wadam.ui import theme
 from wadam.ui.chat_list import ChatListPanel
@@ -64,15 +63,6 @@ if TYPE_CHECKING:  # pragma: no cover - annotation only
     from wadam.api.host import SendApiHost
 
 logger = logging.getLogger(__name__)
-
-
-@contextmanager
-def _busy_cursor():
-    QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
-    try:
-        yield
-    finally:
-        QApplication.restoreOverrideCursor()
 
 
 class MainWindow(QMainWindow):
@@ -103,12 +93,9 @@ class MainWindow(QMainWindow):
         # The checkbox in the list IS the automation control. There is no
         # second one on the right, and no save button anywhere.
         self._chat_list.automation_toggled.connect(self._on_automation_toggled)
-        self._chat_list.refresh_requested.connect(self._on_rescan)
         splitter.addWidget(self._chat_list)
 
         self._config = ChatDetailsPanel()
-        self._config.phone_saved.connect(self._on_phone_saved)
-        self._config.webhook_saved.connect(self._on_webhook_saved)
         splitter.addWidget(self._config)
 
         splitter.setStretchFactor(0, 0)
@@ -138,12 +125,12 @@ class MainWindow(QMainWindow):
         row.setContentsMargins(16, 0, 16, 0)
         row.setSpacing(20)
 
-        self._status_poll = QLabel("polling every 3s")
-        self._status_queue = QLabel("")
+        self._status_session = QLabel("session —")
+        self._status_listen = QLabel("")
         self._status_api = QLabel("")
         self._status_mongo = QLabel("MongoDB —")
         self._status_json = QLabel("JSON —")
-        for widget in (self._status_poll, self._status_queue):
+        for widget in (self._status_session, self._status_listen):
             row.addWidget(widget)
         row.addStretch(1)
         row.addWidget(self._status_api)
@@ -155,23 +142,29 @@ class MainWindow(QMainWindow):
 
     def _on_snapshot(self, snapshot: EngineSnapshot) -> None:
         self._snapshot = snapshot
-        self._chat_list.set_chats(snapshot.chats, snapshot.whatsapp_found)
+        self._chat_list.set_chats(snapshot.chats, snapshot.openwa_ok)
 
-
-
-        self._status_poll.setText(
-            f"cycle {snapshot.cycle_count} · {snapshot.last_cycle_ms}ms · "
-            f"every {constants.POLL_INTERVAL_SECONDS}s"
+        phone = f" · {snapshot.session_phone}" if snapshot.session_phone else ""
+        self._set_status(
+            self._status_session,
+            f"session {snapshot.session_status}{phone}",
+            snapshot.openwa_ok,
         )
-        # Two different queues, and conflating them hides the important one:
-        # `queued_jobs` is chats waiting to be read, `queue_depth` is messages
-        # waiting to be delivered.
-        parts = []
-        if snapshot.queued_jobs:
-            parts.append(f"{snapshot.queued_jobs} to read")
-        if snapshot.queue_depth:
-            parts.append(f"{snapshot.queue_depth} to send")
-        self._status_queue.setText(" · ".join(parts) if parts else "queue empty")
+        # What the listener has actually done, which is the question asked when
+        # a chat is ticked and nothing happens. A delivery count of zero says
+        # "OpenWA is not reaching this process" far more clearly than a green
+        # session light says the opposite.
+        metrics = snapshot.metrics
+        if snapshot.listening:
+            summary = f"{metrics.deliveries} delivered · {metrics.replies_sent} replied"
+            if metrics.send_failures:
+                summary += f" · {metrics.send_failures} failed"
+            if metrics.rejected:
+                summary += f" · {metrics.rejected} unsigned"
+            self._status_listen.setText(summary)
+        else:
+            self._status_listen.setText("not listening")
+
         self._refresh_api_status()
         self._set_status(self._status_mongo, f"MongoDB {snapshot.mongo_status}", snapshot.mongo_ok)
         self._set_status(self._status_json, f"JSON {snapshot.json_status}", snapshot.json_ok)
@@ -198,7 +191,7 @@ class MainWindow(QMainWindow):
 
     def _refresh_selected(self) -> None:
         chat_id = self._chat_list.selected_id
-        self._config.set_chat(self._repository.get_chat(chat_id) if chat_id else None)
+        self._show_chat(chat_id)
 
     def _on_engine_stopped(self, error: str) -> None:
         if error:
@@ -206,82 +199,28 @@ class MainWindow(QMainWindow):
 
     # -- actions -----------------------------------------------------------
 
-    def _on_phone_saved(self, chat_id: str, phone_number: str) -> None:
-        self._host.submit(
-            lambda: self._host.engine.set_chat_phone_number(chat_id, phone_number))
-
-    def _on_webhook_saved(self, chat_id: str, url: str) -> None:
-        self._host.submit(lambda: self._host.engine.set_chat_webhook(chat_id, url))
-
     def _on_chat_selected(self, chat_id: str) -> None:
-        self._config.set_chat(self._repository.get_chat(chat_id))
+        self._show_chat(chat_id)
+
+    def _show_chat(self, chat_id: str) -> None:
+        """Render one chat and its transcript, or the empty state."""
+        if not chat_id:
+            self._config.set_chat(None, [])
+            return
+        chat = self._repository.get_chat(chat_id)
+        messages = self._repository.messages_for(chat_id) if chat else []
+        self._config.set_chat(chat, messages)
 
     def _on_automation_toggled(self, chat_id: str, enabled: bool) -> None:
-        if not enabled and not self._confirm_purge(chat_id):
-            return
-        self._host.submit(lambda: self._host.engine.set_chat_automation(chat_id, enabled))
+        """The one control in the window. Immediate and silent, both ways.
 
-    def _confirm_purge(self, chat_id: str) -> bool:
-        """Unticking deletes the chat's stored history, so it asks first.
-
-        The one dialog in an interface that deliberately has none. Ticking a box
-        is still immediate and silent; this is the other direction, where a
-        stray click on a 14-pixel target would otherwise destroy a history that
-        nothing can restore. It names the counts rather than saying "all
-        records", because "delete everything?" tells a user nothing about what
-        they are about to lose."""
-        chat = self._repository.get_chat(chat_id)
-        if chat is None:
-            return False
-
-        # Refused rather than half-done. The purge deletes from MongoDB and from
-        # the JSON backup; with the database unreachable only the backup would
-        # go, and the UI would report a deletion that did not happen.
-        if self._snapshot is not None and not self._snapshot.mongo_ok:
-            QMessageBox.warning(
-                self, "Database unreachable",
-                f"Turning automation off deletes this chat's stored records, and "
-                f"{self._snapshot.mongo_status}.\n\n"
-                "Nothing was changed. Try again once the database is back.",
-            )
-            return False
-
-        with _busy_cursor():
-            counts = self._repository.chat_record_counts(chat_id)
-        total = sum(counts.values())
-        if not total:
-            return True      # nothing to lose, so nothing to ask about
-        confirm = QMessageBox(self)
-        confirm.setIcon(QMessageBox.Warning)
-        confirm.setWindowTitle("Turn off automation")
-        confirm.setText(f"Delete everything stored for {chat.chat_name}?")
-        confirm.setInformativeText(
-            f"{counts['messages']} message(s), {counts['webhooks']} webhook call(s) "
-            f"and {counts['outgoing']} queued send(s) will be removed from "
-            f"{self._settings.database_name}.\n\n"
-            "The chat stays in the list and can be switched back on, but this "
-            "history cannot be recovered."
-        )
-        confirm.setStandardButtons(QMessageBox.Cancel | QMessageBox.Yes)
-        confirm.setDefaultButton(QMessageBox.Cancel)
-        confirm.button(QMessageBox.Yes).setText("Turn off and delete")
-        return confirm.exec() == QMessageBox.Yes
-
-
-
-
-
-    def _on_rescan(self) -> None:
-        """Manual refresh: re-read the whole WhatsApp chat list.
-
-        Deliberately only a re-read. It does not touch the outgoing queue, does
-        not reset any message state and cannot duplicate anything — the drainer
-        owns all of that and is not consulted here."""
-        self._host.submit(lambda: self._host.engine.rescan())
-
-
-
-
+        winSpark asked for confirmation here, because unticking also *deleted*
+        everything the chat had stored and a stray click on a 14-pixel target
+        would destroy a history nothing could restore. Turning automation off
+        no longer deletes anything — it stops replies — so the dialog that
+        existed to guard the deletion went with it.
+        """
+        self._host.service.set_chat_automation(chat_id, enabled)
 
     # -- theming -----------------------------------------------------------
 

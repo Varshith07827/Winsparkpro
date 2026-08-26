@@ -1,93 +1,61 @@
-"""The processing pipeline and the ingestion rules around it.
+"""What happens to one inbound message.
 
-Two things are being pinned down here:
-
-1. **Nothing is processed only in memory.** After a message goes through the
-   pipeline, MongoDB and the JSON mirror both hold the message, the webhook
-   record, the reply, and the updated chat status.
-2. **The first read of a chat never triggers anything.** Messages that were
-   already on screen when this application first looked belong to the past.
-
-The webhook is exercised against a real HTTP server on localhost rather than a
-mock, because the thing most likely to be wrong about a webhook client is how
-it talks HTTP.
+Nothing here touches WhatsApp, OpenWA, or the network — the send client is a
+fake that records calls. That is the point of keeping the pipeline free of
+HTTP: the rules that decide whether a message is answered are the part worth
+testing, and they test in milliseconds.
 """
 
 from __future__ import annotations
 
-import asyncio
-import json
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 import pytest
 
-from wadam import constants
 from wadam.config import Settings
-from wadam.domain.models import ChatConfig, StoredMessage, chat_id_for, message_key_for
+from wadam.domain.models import ChatConfig, MessageStatus
+from wadam.engine.guards import Cooldown
 from wadam.engine.pipeline import MessagePipeline
-from wadam.engine.webhook import WebhookClient
+from wadam.openwa import InboundMessage, SendError
 from wadam.storage.json_backup import JsonBackupStore
 from wadam.storage.repository import Repository
-from wadam.whatsapp.reader import WhatsAppMessage
-from wadam.whatsapp.sender import SendResult
+from tests.fakes import FakeMongo
 
-from tests.test_storage import FakeMongo
-
-
-# ---------------------------------------------------------------------------
-# A real HTTP endpoint
-# ---------------------------------------------------------------------------
+CHAT_ID = "216298915164281@lid"
 
 
-class _Handler(BaseHTTPRequestHandler):
-    reply = "pong"
-    status = 200
-    received: list[dict] = []
+class FakeClient:
+    """Records sends instead of making them. Can be told to fail."""
 
-    def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler naming
-        length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(length).decode("utf-8")
-        type(self).received.append(json.loads(body))
-        payload = json.dumps({"reply": type(self).reply}).encode("utf-8")
-        self.send_response(type(self).status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
-
-    def log_message(self, *_a):
-        pass  # keep the test output readable
-
-
-@pytest.fixture()
-def endpoint():
-    _Handler.received = []
-    _Handler.reply = "pong"
-    _Handler.status = 200
-    server = HTTPServer(("127.0.0.1", 0), _Handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    yield f"http://127.0.0.1:{server.server_port}/hook", _Handler
-    server.shutdown()
-    server.server_close()
-
-
-class FakeSender:
-    def __init__(self, ok: bool = True) -> None:
-        self.ok = ok
+    def __init__(self, fail_with: str | None = None) -> None:
         self.sent: list[tuple[str, str]] = []
+        self._fail_with = fail_with
 
-    async def send_async(self, chat_name: str, text: str) -> SendResult:
-        self.sent.append((chat_name, text))
-        if self.ok:
-            return SendResult.succeeded("uia-value-pattern + send-button-invoke")
-        return SendResult.failed("the compose box still had text after send-button-invoke")
+    def send_text(self, chat_id: str, text: str) -> dict:
+        if self._fail_with:
+            raise SendError(self._fail_with, status=500)
+        self.sent.append((chat_id, text))
+        return {"ok": True}
+
+
+def message(text: str = "hi", chat_id: str = CHAT_ID, message_id: str = "m1",
+            outgoing: bool = False, group: bool = False,
+            media_kind: str = "") -> InboundMessage:
+    return InboundMessage(
+        chat_id=chat_id,
+        chat_name="Alice",
+        message_id=message_id,
+        text=text,
+        sender="259094657142792@lid",
+        media_kind=media_kind,
+        is_group=group,
+        is_outgoing=outgoing,
+        raw={},
+    )
 
 
 @pytest.fixture()
-def repo(tmp_path: Path) -> Repository:
+def repo(tmp_path: Path):
     settings = Settings(mongodb_uri="mongodb://localhost:27017", database_name="test",
                         json_backup_folder=tmp_path, json_autosave_interval=0)
     backup = JsonBackupStore(tmp_path, autosave_interval=0)
@@ -98,182 +66,239 @@ def repo(tmp_path: Path) -> Repository:
     repository.stop()
 
 
-def make_chat(repo: Repository, webhook: str, automation: bool = True) -> ChatConfig:
-    chat = ChatConfig(chat_id=chat_id_for("Alice"), chat_name="Alice",
-                      webhook_url=webhook, automation_enabled=automation, seeded=True)
-    repo.save_chat(chat)
-    return chat
-
-
-def make_message(chat: ChatConfig, text: str = "ping") -> StoredMessage:
-    message = StoredMessage(
-        message_key=message_key_for(chat.chat_id, "Alice", text, "9:21 pm", "in"),
-        chat_id=chat.chat_id, chat_name=chat.chat_name, sender="Alice",
-        text=text, direction="in", time_text="9:21 pm", status="pending",
+def build(repo, reply="pong", cooldown=60.0, answer_groups=False, client=None):
+    client = client or FakeClient()
+    pipeline = MessagePipeline(
+        repository=repo,
+        client=client,
+        reply_fn=(reply if callable(reply) else (lambda m, c: reply)),
+        cooldown=Cooldown(cooldown),
+        answer_groups=answer_groups,
     )
-    return message
+    return pipeline, client
 
 
-def build_pipeline(repo: Repository, sender: FakeSender) -> MessagePipeline:
-    return MessagePipeline(repo, WebhookClient(timeout=5, max_retries=1), sender, asyncio.to_thread)
+def enable(repo, chat_id=CHAT_ID):
+    chat = repo.get_chat(chat_id)
+    chat.automation_enabled = True
+    repo.save_chat(chat)
 
 
-def read_json(folder: Path, name: str):
-    return json.loads((folder / name).read_text(encoding="utf-8"))
+# ── registration ──────────────────────────────────────────────────────
 
 
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
+def test_an_unknown_chat_is_registered_with_automation_off(repo):
+    pipeline, client = build(repo)
+
+    outcome = pipeline.process(message())
+
+    chat = repo.get_chat(CHAT_ID)
+    assert chat is not None
+    assert chat.automation_enabled is False
+    assert outcome.action == "skipped"
+    assert client.sent == []
 
 
+def test_a_renamed_contact_stays_the_same_chat(repo):
+    """The id comes from OpenWA and is durable. winSpark hashed the display
+    name, so a rename silently created a second chat with its own settings."""
+    pipeline, _ = build(repo)
+    pipeline.process(message(message_id="m1"))
+    enable(repo)
+
+    renamed = message(message_id="m2")
+    object.__setattr__(renamed, "chat_name", "Alice Cooper")
+    pipeline.process(renamed)
+
+    assert len(repo.list_chats()) == 1
+    assert repo.get_chat(CHAT_ID).chat_name == "Alice Cooper"
+    assert repo.get_chat(CHAT_ID).automation_enabled is True
 
 
+# ── the message is stored before anything is decided ──────────────────
 
 
+def test_an_incoming_message_is_stored_even_when_automation_is_off(repo):
+    pipeline, _ = build(repo)
 
-# ---------------------------------------------------------------------------
-# Ingestion / seeding
-# ---------------------------------------------------------------------------
+    pipeline.process(message("hello"))
+
+    stored = repo.messages_for(CHAT_ID)
+    assert [m.text for m in stored] == ["hello"]
+    assert stored[0].direction == "in"
 
 
-class _EngineHarness:
-    """The engine's ingestion logic without its polling loop or STA thread.
+def test_a_reply_is_stored_alongside_the_message_it_answered(repo):
+    pipeline, client = build(repo)
+    pipeline.process(message(message_id="m0"))
+    enable(repo)
 
-    `_ingest` is a plain method that only touches the repository, so binding it
-    to a stand-in is enough to test the seeding rule without starting COM.
+    pipeline.process(message("ping", message_id="m1"))
+
+    texts = [(m.direction, m.text) for m in repo.messages_for(CHAT_ID)]
+    assert ("in", "ping") in texts
+    assert ("out", "pong") in texts
+    assert client.sent == [(CHAT_ID, "pong")]
+
+
+# ── rule: loop protection ─────────────────────────────────────────────
+
+
+def test_an_outgoing_message_is_never_answered(repo):
+    """The account's own traffic. Answering it is a loop with extra steps."""
+    pipeline, client = build(repo)
+
+    outcome = pipeline.process(message(outgoing=True))
+
+    assert outcome.action == "skipped"
+    assert outcome.reason == "outgoing message"
+    assert client.sent == []
+
+
+def test_group_chats_are_ignored_by_default(repo):
+    pipeline, client = build(repo)
+    pipeline.process(message(message_id="m0", group=True))
+    enable(repo)
+
+    outcome = pipeline.process(message(message_id="m1", group=True))
+
+    assert outcome.reason == "group chat"
+    assert client.sent == []
+
+
+def test_group_chats_are_answered_when_enabled(repo):
+    pipeline, client = build(repo, answer_groups=True)
+    pipeline.process(message(message_id="m0", group=True))
+    enable(repo)
+
+    outcome = pipeline.process(message(message_id="m1", group=True))
+
+    assert outcome.action == "replied"
+    assert client.sent == [(CHAT_ID, "pong")]
+
+
+# ── rule: deduplication ───────────────────────────────────────────────
+
+
+def test_a_retried_delivery_is_not_answered_twice(repo):
+    pipeline, client = build(repo)
+    pipeline.process(message(message_id="m0"))
+    enable(repo)
+
+    pipeline.process(message("ping", message_id="m1"))
+    outcome = pipeline.process(message("ping", message_id="m1"))
+
+    assert outcome.reason == "duplicate delivery"
+    assert len(client.sent) == 1
+
+
+def test_the_same_text_from_two_messages_is_not_a_duplicate(repo):
+    """winSpark keyed on a hash of the content, so two people genuinely saying
+    "ok" a minute apart looked like one message read twice.
+
+    Cooldown off, so the only thing that could suppress the second send is
+    deduplication.
     """
+    pipeline, client = build(repo, cooldown=0)
+    pipeline.process(message(message_id="m0"))
+    enable(repo)
 
-    def __init__(self, repository: Repository) -> None:
-        self._repo = repository
+    pipeline.process(message("ok", message_id="m1"))
+    pipeline.process(message("ok", message_id="m2"))
 
-    _ingest = None  # bound below
-
-
-def make_harness(repo: Repository):
-    from wadam.engine.engine import AutomationEngine
-
-    harness = _EngineHarness(repo)
-    harness._ingest = AutomationEngine._ingest.__get__(harness, _EngineHarness)
-    return harness
+    assert len(client.sent) == 2
 
 
-def incoming(text: str, time_text: str = "9:00 am") -> WhatsAppMessage:
-    return WhatsAppMessage(sender="Alice", text=text, is_incoming=True, time_text=time_text)
+# ── rule: cooldown ────────────────────────────────────────────────────
 
 
-def test_the_first_read_records_the_backlog_without_automating_it(repo: Repository):
-    chat = ChatConfig(chat_id=chat_id_for("Alice"), chat_name="Alice",
-                      webhook_url="https://x.test/h", automation_enabled=True, seeded=False)
-    repo.save_chat(chat)
-    harness = make_harness(repo)
+def test_a_second_reply_to_the_same_chat_is_held_off(repo):
+    pipeline, client = build(repo)
+    pipeline.process(message(message_id="m0"))
+    enable(repo)
 
-    pending = asyncio.run(harness._ingest(chat, [incoming("old 1"), incoming("old 2", "9:01 am")]))
+    pipeline.process(message("ping", message_id="m1"))
+    outcome = pipeline.process(message("ping", message_id="m2"))
 
-    assert pending == [], "existing messages must never be answered"
-    assert chat.seeded is True
-    assert {m.status for m in repo.messages_for(chat.chat_id)} == {"seeded"}
-
-
-def test_messages_arriving_after_the_baseline_are_processed(repo: Repository):
-    chat = ChatConfig(chat_id=chat_id_for("Alice"), chat_name="Alice",
-                      webhook_url="https://x.test/h", automation_enabled=True, seeded=False)
-    repo.save_chat(chat)
-    harness = make_harness(repo)
-
-    asyncio.run(harness._ingest(chat, [incoming("old")]))
-    pending = asyncio.run(harness._ingest(chat, [incoming("old"), incoming("new", "9:05 am")]))
-
-    assert [m.text for m in pending] == ["new"]
-    assert chat.last_incoming_text == "new"
+    assert "cooldown" in outcome.reason
+    assert len(client.sent) == 1
 
 
-def test_re_reading_the_same_bubbles_produces_nothing(repo: Repository):
-    chat = ChatConfig(chat_id=chat_id_for("Alice"), chat_name="Alice",
-                      webhook_url="https://x.test/h", automation_enabled=True, seeded=True)
-    repo.save_chat(chat)
-    harness = make_harness(repo)
+def test_a_zero_cooldown_disables_it(repo):
+    pipeline, client = build(repo, cooldown=0)
+    pipeline.process(message(message_id="m0"))
+    enable(repo)
 
-    first = asyncio.run(harness._ingest(chat, [incoming("hello")]))
-    second = asyncio.run(harness._ingest(chat, [incoming("hello")]))
+    pipeline.process(message("ping", message_id="m1"))
+    pipeline.process(message("ping", message_id="m2"))
 
-    assert [m.text for m in first] == ["hello"]
-    assert second == [], "the 3s poll re-reads the same tail every cycle"
+    assert len(client.sent) == 2
 
 
-def test_our_own_messages_are_stored_but_never_processed(repo: Repository):
-    chat = ChatConfig(chat_id=chat_id_for("Alice"), chat_name="Alice",
-                      webhook_url="https://x.test/h", automation_enabled=True, seeded=True)
-    repo.save_chat(chat)
-    harness = make_harness(repo)
+def test_an_ignored_message_does_not_consume_the_cooldown(repo):
+    """A message the reply function stayed silent on must not silence the next
+    one that mattered."""
+    answers = {"speak": "here", "quiet": None}
+    pipeline, client = build(repo, reply=lambda m, c: answers.get(m.text))
+    pipeline.process(message(message_id="m0"))
+    enable(repo)
 
-    outgoing = WhatsAppMessage(sender="You", text="on my way", is_incoming=False, time_text="9:10 am")
-    pending = asyncio.run(harness._ingest(chat, [outgoing]))
+    pipeline.process(message("quiet", message_id="m1"))
+    outcome = pipeline.process(message("speak", message_id="m2"))
 
-    assert pending == []
-    stored = repo.messages_for(chat.chat_id)
-    assert [m.direction for m in stored] == ["out"]
-    assert chat.last_outgoing_text == "on my way"
-
-
-def test_automation_off_stores_without_processing(repo: Repository):
-    chat = ChatConfig(chat_id=chat_id_for("Alice"), chat_name="Alice",
-                      automation_enabled=False, seeded=True)
-    repo.save_chat(chat)
-    harness = make_harness(repo)
-
-    pending = asyncio.run(harness._ingest(chat, [incoming("hello")]))
-
-    assert pending == []
-    assert [m.status for m in repo.messages_for(chat.chat_id)] == ["ignored"]
+    assert outcome.action == "replied"
+    assert len(client.sent) == 1
 
 
-# ---------------------------------------------------------------------------
-# Inbound is collect-only
-# ---------------------------------------------------------------------------
+# ── silence and failure ───────────────────────────────────────────────
 
 
-def test_receiving_a_message_never_sends_anything(repo: Repository):
-    """The architecture, as an assertion.
+def test_no_reply_wanted_is_a_success(repo):
+    pipeline, client = build(repo, reply=None)
+    pipeline.process(message(message_id="m0"))
+    enable(repo)
 
-    winSpark collects on the inbound side: WhatsApp -> reader -> wa_events, and
-    a separate monitoring application reads that. It used to POST each incoming
-    message to the chat's webhook and send whatever came back, which was never
-    part of the product and made an accidental reply loop possible. Removing it
-    makes the loop structurally impossible rather than merely guarded."""
-    chat = make_chat(repo, "https://x.test/hook")
-    message = make_message(chat, "hello there")
-    repo.save_message(message)
-    sender = FakeSender()
-    pipeline = build_pipeline(repo, sender)
+    outcome = pipeline.process(message("anything", message_id="m1"))
 
-    asyncio.run(pipeline.process(chat, message))
-
-    assert sender.sent == [], "an incoming message must not send anything"
-    assert repo.messages_for(chat.chat_id)[0].text == "hello there"
+    assert outcome.ok is True
+    assert outcome.reason == "no reply wanted"
+    assert client.sent == []
+    assert repo.messages_for(CHAT_ID)[-1].status == MessageStatus.COLLECTED
 
 
-def test_the_raw_message_is_what_gets_kept(repo: Repository):
-    chat = make_chat(repo, "https://x.test/hook")
-    raw = "  spaced   text  éè  "
-    message = make_message(chat, raw)
-    repo.save_message(message)
-    pipeline = build_pipeline(repo, FakeSender())
+def test_a_failed_send_is_recorded_against_the_message(repo):
+    client = FakeClient(fail_with="engine not ready")
+    pipeline, _ = build(repo, client=client)
+    pipeline.process(message(message_id="m0"))
+    enable(repo)
 
-    asyncio.run(pipeline.process(chat, message))
+    outcome = pipeline.process(message("ping", message_id="m1"))
 
-    assert repo.messages_for(chat.chat_id)[0].text == raw
+    assert outcome.action == "send_failed"
+    assert outcome.ok is False
+    failed = [m for m in repo.messages_for(CHAT_ID) if m.status == MessageStatus.FAILED]
+    assert failed and "engine not ready" in failed[0].error
 
 
-def test_a_chat_with_no_webhook_is_collected_just_the_same(repo: Repository):
-    """A webhook URL is irrelevant to collection now — it addresses the
-    OUTBOUND bridge, and inbound does not use it."""
-    chat = make_chat(repo, "")
-    message = make_message(chat, "still collected")
-    repo.save_message(message)
-    sender = FakeSender()
+def test_a_raising_reply_function_does_not_escape(repo):
+    def boom(msg, chat):
+        raise ValueError("bad rule")
 
-    asyncio.run(build_pipeline(repo, sender).process(chat, message))
+    pipeline, client = build(repo, reply=boom)
+    pipeline.process(message(message_id="m0"))
+    enable(repo)
 
-    assert sender.sent == []
-    assert repo.messages_for(chat.chat_id)[0].text == "still collected"
+    outcome = pipeline.process(message("ping", message_id="m1"))
+
+    assert outcome.action == "ignored"
+    assert client.sent == []
+
+
+def test_media_arrives_with_its_kind_and_no_text(repo):
+    pipeline, _ = build(repo)
+
+    pipeline.process(message(text="", media_kind="image", message_id="m1"))
+
+    stored = repo.messages_for(CHAT_ID)[-1]
+    assert stored.media_kind == "image"
+    assert stored.text == ""

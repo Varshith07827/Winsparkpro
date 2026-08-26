@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
-    QToolButton,
+
     QVBoxLayout,
     QWidget,
 )
@@ -56,7 +56,6 @@ def _sort_key(chat: ChatConfig):
 class ChatListPanel(QWidget):
     chat_selected = Signal(str)          # chat_id
     automation_toggled = Signal(str, bool)   # chat_id, enabled
-    refresh_requested = Signal()
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -131,16 +130,11 @@ class ChatListPanel(QWidget):
         text_column.addLayout(meta_row)
         row.addLayout(text_column, 1)
 
-        # Manual refresh. Everything updates by itself; this is for the moment
-        # somebody wants to be sure, which is a real need even when the
-        # automatic path is working.
-        self._refresh = QToolButton()
-        self._refresh.setObjectName("refreshButton")
-        self._refresh.setText("⟳")
-        self._refresh.setToolTip("Refresh the chat list")
-        self._refresh.setCursor(Qt.PointingHandCursor)
-        self._refresh.clicked.connect(self.refresh_requested.emit)
-        row.addWidget(self._refresh)
+        # There was a manual refresh button here, for the moment somebody
+        # wanted to be sure the list was current. It existed because the list
+        # was a three-second scrape that could genuinely lag. The list is now
+        # driven by webhook deliveries and repaints the instant one lands, so
+        # the button had nothing left to do that waiting would not.
         # Styles the avatar only. NOT restyle() — that refreshes the list, which
         # does not exist yet at header-construction time.
         self._style_rail_avatar()

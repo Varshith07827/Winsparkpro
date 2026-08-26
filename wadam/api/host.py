@@ -1,187 +1,132 @@
-"""Wiring the send API to the engine.
+"""Wires the send API to OpenWA.
 
-Everything policy-shaped lives here rather than in the HTTP layer: which chat an
-identifier resolves to, and what each failure means in HTTP terms. `server.py`
-stays a transport.
+The API is the second way to send: something that wants to *push* a message in,
+rather than answer one that arrived. `SendApiServer` owns the socket and knows
+nothing about WhatsApp; this module is the policy.
 
-**A request is bounded by the enqueue, never by the send.** An HTTP request
-arrives on one of the server's worker threads, submits a coroutine to the
-engine's loop with `run_coroutine_threadsafe`, and waits only for the message to
-be written to the queue — about a millisecond. The physical send costs seconds
-and happens afterwards, on the engine's single drainer.
+**Resolution is a lookup, never a construction.** `wadam/api/resolver.py` used
+to search chats by phone number, chat id and name, because a UI-Automation send
+addressed a chat by whatever string could be found on screen. An OpenWA chat id
+is exact, so an `id` that is already one is used as-is, and anything else is
+matched against chats this application has actually seen. An identifier
+matching more than one chat is **refused with 409**, never delivered to a guess
+— that rule is inherited verbatim, because sending to the wrong person is the
+one failure that must not happen quietly.
 
-This used to block on the send itself, and the arithmetic was fatal: at ~17s per
-send a burst of twenty needs almost six minutes, so every caller past the third
-got a `timeout` response for a message that was in fact delivered. A caller that
-retried on timeout would have duplicated real messages. Delivery is now reported
-through `GET /wam/status/<outgoing_id>` instead of through the response to the
-send.
+The response is not sent until the message is: the request blocks on the HTTP
+call to OpenWA, so a 200 means the gateway accepted it.
 """
 
 from __future__ import annotations
 
-import concurrent.futures
 import logging
+from typing import List, Optional
 
-from wadam.api.resolver import resolve_chat
 from wadam.api.server import SendApiServer, SendResponse
 from wadam.config import Settings
-from wadam.engine.engine import AutomationEngine
+from wadam.domain.models import ChatConfig, phone_digits
+from wadam.engine.service import AutomationService
+from wadam.openwa import SendError
 from wadam.storage.repository import Repository
-
-# How long to wait for the ENGINE to accept a message, not for
-# WhatsApp to send it. Enqueue is two sub-millisecond writes.
-_ENQUEUE_TIMEOUT_SECONDS = 10.0
 
 logger = logging.getLogger(__name__)
 
 
 class SendApiHost:
+    """Starts the listener when a port is configured, and does the sending."""
+
     def __init__(self, settings: Settings, repository: Repository,
-                 engine: AutomationEngine) -> None:
+                 service: AutomationService) -> None:
         self._settings = settings
         self._repo = repository
-        self._engine = engine
+        self._service = service
         self.server = SendApiServer(
             host=settings.api_host,
             port=settings.api_port,
             token=settings.api_token,
             send=self._send,
-            status=self.status,
+            # No status endpoint: there is no queue to look a message up in. A
+            # send either happened by the time the request returns, or it did
+            # not and the response says so.
+            status=None,
         )
 
     @property
     def enabled(self) -> bool:
-        return self._settings.api_port > 0
+        return bool(self._settings.api_port)
 
     def start(self) -> None:
         if not self.enabled:
             return
         self.server.start()
-        if self.server.authentication_required:
-            self._repo.log("INFO", "api.started",
-                           message=f"Send API listening on {self.server.url}")
-        else:
-            # Not silent. Configuration only permits this on loopback, but the
-            # operator should still see it in the log every time it starts.
-            logger.warning("Send API is running WITHOUT a token on %s — any process on this "
-                           "machine can send WhatsApp messages", self.server.url)
-            self._repo.log("WARNING", "api.started",
-                           message=f"Send API listening on {self.server.url} with no token "
-                                   f"(loopback only — any local process can send messages).")
+        logger.info("send API listening on %s", self.server.url)
 
     def stop(self) -> None:
-        if self.server.running:
+        if self.enabled:
             self.server.stop()
 
-    # -- the callback the HTTP layer invokes -------------------------------
+    # ── resolution ────────────────────────────────────────────────────
+
+    def _resolve(self, identifier: str) -> tuple[Optional[ChatConfig], List[ChatConfig]]:
+        """Find the chat an identifier names.
+
+        Returns `(chat, candidates)`. A chat is returned only when exactly one
+        matched; `candidates` carries the ambiguity so the caller can say what
+        it refused to choose between.
+        """
+        wanted = identifier.strip()
+        chats = self._repo.list_chats()
+
+        exact = [c for c in chats if c.chat_id == wanted]
+        if exact:
+            return exact[0], exact
+
+        digits = phone_digits(wanted)
+        matches = [
+            c for c in chats
+            if c.chat_name.strip().casefold() == wanted.casefold()
+            or (digits and c.phone_number == digits)
+        ]
+        if len(matches) == 1:
+            return matches[0], matches
+        return None, matches
 
     def _send(self, identifier: str, text: str) -> SendResponse:
-        resolution = resolve_chat(self._repo.list_chats(), identifier)
+        chat, candidates = self._resolve(identifier)
 
-        if resolution.ambiguous:
-            # Two chats answer to this identifier. Picking one is the mistake
-            # this refuses to make; the caller is told both names so they can
-            # give one of them a distinct contact ID.
-            self._repo.log(
-                "WARNING", "api.ambiguous_id",
-                message=f"'{identifier}' matches {len(resolution.candidates)} chats: "
-                        + ", ".join(resolution.candidates),
-            )
+        if chat is None and len(candidates) > 1:
             return SendResponse(409, {
-                "ok": False, "code": "ambiguous_id",
-                # The advice has to be something the caller can actually do.
-                # Two chats sharing an exact name is the only way to get here
-                # now that abbreviated ids are gone, so the answer is the number
-                # for a one-to-one chat and the chat_id for a group.
-                "error": f"'{identifier}' matches {len(resolution.candidates)} chats "
-                         f"and nothing was sent. Address this chat by its full "
-                         f"phone number, or by its chat_id if it is a group.",
-                "candidates": list(resolution.candidates),
-                "resolves_by": ["phone_number", "chat_id", "chat_name"],
+                "ok": False, "code": "ambiguous",
+                "error": (f"{identifier!r} matches {len(candidates)} chats. "
+                          f"Use the chat id instead."),
+                "candidates": [c.chat_id for c in candidates],
             })
 
-        if not resolution.ok:
-            return SendResponse(404, {
-                "ok": False, "code": "chat_not_found",
-                "error": f"No chat matches '{identifier}'. Use the chat's full "
-                         f"phone number, or its exact name as shown in WhatsApp "
-                         f"(which is how a group is addressed, since a group has "
-                         f"no number).",
-            })
-
-        chat = resolution.chat
-        try:
-            future = self._engine.submit(
-                lambda: self._engine.queue_message(chat.chat_id, text, origin="api")
-            )
-        except Exception as ex:  # noqa: BLE001
-            return SendResponse(503, {"ok": False, "code": "engine_unavailable",
-                                      "error": str(ex)})
+        if chat is None:
+            # An identifier shaped like an OpenWA chat id is passed through
+            # even when unknown: a chat this application has never received a
+            # message from is still a real chat, and refusing would make the
+            # API useless for starting a conversation.
+            if "@" in identifier:
+                target, chat_name = identifier, identifier
+            else:
+                return SendResponse(404, {
+                    "ok": False, "code": "unknown_chat",
+                    "error": (f"No chat matches {identifier!r}. Use a full OpenWA chat id "
+                              f"(e.g. 918985370703@c.us) to reach one this application "
+                              f"has not seen yet."),
+                })
+        else:
+            target, chat_name = chat.chat_id, chat.chat_name
 
         try:
-            # Bounded by the ENQUEUE, not by the send. Writing to Mongo and the
-            # JSON mirror takes about a millisecond; if that cannot finish in
-            # ten seconds the machine has a much larger problem.
-            outcome = future.result(timeout=_ENQUEUE_TIMEOUT_SECONDS)
-        except concurrent.futures.TimeoutError:
-            return SendResponse(503, {
-                "ok": False, "code": "busy",
-                "error": "The engine did not accept the message within "
-                         f"{_ENQUEUE_TIMEOUT_SECONDS:.0f}s. Nothing was queued; "
-                         "this one is safe to retry.",
-                "chat": chat.chat_name,
-            })
-        except Exception as ex:  # noqa: BLE001 - the engine raised
-            logger.exception("Send API request failed inside the engine")
-            return SendResponse(500, {"ok": False, "code": "internal",
-                                      "error": f"{type(ex).__name__}: {ex}"})
+            self._service.client.send_text(target, text)
+        except SendError as error:
+            logger.error("send API could not send to %s: %s", target, error)
+            return SendResponse(502, {"ok": False, "code": "send_failed", "error": str(error)})
 
-        if not outcome.ok:
-            return SendResponse(502, {
-                "ok": False, "code": "send_failed", "error": outcome.error,
-                "chat": chat.chat_name, "chat_id": chat.chat_id,
-            })
+        if chat is not None:
+            self._service.pipeline.record_outgoing(chat, text, origin="api")
+            self._service.publish()
 
-        # 202, not 200: the message is ACCEPTED and durably queued, which is a
-        # different promise from "delivered". Callers that need delivery ask
-        # GET /wam/status/<outgoing_id>; the queue retries transport failures
-        # and verifies arrival against the conversation on its own.
-        return SendResponse(202, {
-            "ok": True,
-            "status": "queued",
-            "id": identifier,
-            "chat": chat.chat_name,
-            "chat_id": chat.chat_id,
-            "matched_by": resolution.matched_by,
-            "outgoing_id": outcome.outgoing_id,
-            "status_url": f"/wam/status/{outcome.outgoing_id}",
-        })
-
-    def status(self, outgoing_id: str) -> SendResponse:
-        """What happened to one queued message.
-
-        The states worth acting on: `delivered` is confirmed present in the
-        conversation; `failed` exhausted its retries and never left the compose
-        box, so it is safe to resend; `unverified` left the box but was never
-        found in the chat, and is deliberately NOT retried automatically —
-        resending risks a duplicate, which is the worse failure."""
-        message = self._engine.outgoing_status(outgoing_id)
-        if message is None:
-            return SendResponse(404, {
-                "ok": False, "code": "unknown_id",
-                "error": f"No queued message with id '{outgoing_id}'.",
-            })
-        return SendResponse(200, {
-            "ok": True,
-            "outgoing_id": message.outgoing_id,
-            "status": str(message.status),
-            "chat": message.chat_name,
-            "chat_id": message.chat_id,
-            "text": message.text,
-            "attempts": message.attempts,
-            "verification": message.verification or "",
-            "error": message.error or "",
-            "queued_at": message.created_at.isoformat() if message.created_at else "",
-            "delivered_at": message.delivered_at.isoformat() if message.delivered_at else "",
-        })
+        return SendResponse(200, {"ok": True, "chat": chat_name, "chatId": target})

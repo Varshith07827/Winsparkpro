@@ -39,11 +39,7 @@ from wadam.domain.models import (
     AutomationLog,
     ChatConfig,
     MessageStatus,
-    OutgoingMessage,
-    OutgoingStatus,
-    PollState,
     StoredMessage,
-    WebhookRecord,
     utcnow,
 )
 from wadam.storage.json_backup import AutosaveTimer, JsonBackupStore
@@ -63,15 +59,10 @@ class Repository:
         self._config_baseline: dict[str, dict] = {}
         self._messages: deque[StoredMessage] = deque(maxlen=constants.JSON_MESSAGE_LIMIT)
         self._message_keys: set[str] = set()
-        self._webhooks: deque[WebhookRecord] = deque(maxlen=constants.JSON_WEBHOOK_LIMIT)
         self._logs: deque[AutomationLog] = deque(maxlen=constants.JSON_LOG_LIMIT)
-        self._outgoing: dict[str, OutgoingMessage] = {}
         self._app_state = ApplicationState(version=constants.APP_VERSION)
-        self._poll_state = PollState()
         self._autosave = AutosaveTimer(self.flush_json, settings.json_autosave_interval or 15.0)
         self._recovered_from_json = False
-        # Epoch, so the first poll of a run always writes.
-        self._last_poll_written = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -125,13 +116,6 @@ class Repository:
                 message = StoredMessage.from_document(strip_object_id(document))
                 self._messages.appendleft(message)
                 self._message_keys.add(message.message_key)
-            for document in (self._mongo.webhooks.find({})
-                             .sort("created_at", -1).limit(constants.JSON_WEBHOOK_LIMIT)):
-                self._webhooks.appendleft(WebhookRecord.from_document(strip_object_id(document)))
-            for document in self._mongo.outgoing.find({}):
-                queued = OutgoingMessage.from_document(strip_object_id(document))
-                if queued.outgoing_id:
-                    self._outgoing[queued.outgoing_id] = queued
             state = self._mongo.application_state.find_one({"_id": constants.SINGLETON_ID})
             if state:
                 self._app_state = ApplicationState.from_document(strip_object_id(state))
@@ -143,10 +127,9 @@ class Repository:
     def _load_local_only(self) -> None:
         """Warm the things MongoDB no longer stores, from the JSON mirror.
 
-        Logs and poll counters are diagnostics. They were in MongoDB because
-        everything was, and that cost a billable write per log line and one per
-        ten cycles forever. The mirror already held both, so this is where they
-        come back from — and the window shows the same history it always did."""
+        Logs are diagnostics. They were in MongoDB because everything was, and
+        that cost a billable write per log line forever. The mirror already held
+        them, so this is where they come back from."""
         payload = self._backup.read_section(constants.JSON_LOGS)
         if isinstance(payload, list):
             for document in payload[-constants.JSON_LOG_LIMIT:]:
@@ -154,12 +137,6 @@ class Repository:
                     self._logs.append(AutomationLog.from_document(document))
                 except Exception:  # noqa: BLE001 - a bad line is not worth failing over
                     continue
-        state = self._backup.read_section(constants.JSON_APP_STATE)
-        if isinstance(state, dict) and isinstance(state.get("poll_state"), dict):
-            try:
-                self._poll_state = PollState.from_document(state["poll_state"])
-            except Exception:  # noqa: BLE001
-                pass
 
     def _drop_retired_collections(self) -> None:
         """Remove `automation_logs` and `poll_state` from an existing database.
@@ -291,46 +268,9 @@ class Repository:
             logger.error("Bulk chat save failed: %s", ex)
         self._mark_chats_dirty()
 
-    def touch_last_poll(self, chat_ids: list[str], when: datetime) -> None:
-        """Record "seen this cycle" for every chat in the sidebar — one Mongo
-        update for the whole list, not one per chat. The JSON mirror picks it
-        up on its next coalesced flush."""
-        if not chat_ids:
-            return
-        with self._lock:
-            for chat_id in chat_ids:
-                chat = self._chats.get(chat_id)
-                if chat is not None:
-                    chat.last_poll_utc = when
-
-        # In memory always; to MongoDB rarely.
-        #
-        # This is "when did we last look at this chat" — telemetry, worth
-        # roughly nothing after a restart, and it was a write on a 3-second
-        # timer whether or not anything happened. Measured: half of the entire
-        # idle cost of the application, 864,000 writes a month on a cluster
-        # where nobody had sent a message.
-        #
-        # A stale minute in a field nobody makes decisions from is not worth
-        # paying for. The JSON mirror still gets it on every flush, so the
-        # number on screen is as live as it ever was.
-        if (when - self._last_poll_written).total_seconds() < POLL_TOUCH_INTERVAL:
-            self._mark_chats_dirty()
-            return
-        self._last_poll_written = when
-        try:
-            self._mongo.chat_configs.update_many(
-                {"chat_id": {"$in": chat_ids}}, {"$set": {"last_poll_utc": when}}
-            )
-            self._mongo.note_success()
-        except Exception as ex:  # noqa: BLE001
-            self._mongo.note_failure(ex)
-        self._mark_chats_dirty()
-
     def delete_chat(self, chat_id: str) -> None:
-        """Remove a chat and everything belonging to it. If the chat still
-        exists in WhatsApp it will be rediscovered on the next poll — with a
-        clean configuration, which is the point of the button."""
+        """Remove a chat and everything belonging to it. It is registered
+        again, with a clean configuration, the next time it sends a message."""
         with self._lock:
             chat = self._chats.pop(chat_id, None)
             self._messages = deque(
@@ -338,16 +278,9 @@ class Repository:
                 maxlen=constants.JSON_MESSAGE_LIMIT,
             )
             self._message_keys = {m.message_key for m in self._messages}
-            self._webhooks = deque(
-                (w for w in self._webhooks if w.chat_id != chat_id),
-                maxlen=constants.JSON_WEBHOOK_LIMIT,
-            )
-            self._outgoing = {k: v for k, v in self._outgoing.items() if v.chat_id != chat_id}
         try:
             self._mongo.chat_configs.delete_one({"chat_id": chat_id})
             self._mongo.messages.delete_many({"chat_id": chat_id})
-            self._mongo.outgoing.delete_many({"chat_id": chat_id})
-            self._mongo.webhooks.delete_many({"chat_id": chat_id})
             self._mongo.note_success()
         except Exception as ex:  # noqa: BLE001
             self._mongo.note_failure(ex)
@@ -362,8 +295,11 @@ class Repository:
     #: state this process is actively mutating — `seeded`, the last_* fields,
     #: the counters — and copying those back over a live object would undo
     #: whatever happened since the last save.
-    CONFIG_FIELDS = ("automation_enabled", "webhook_url", "webhook_override",
-                     "phone_number")
+    #: The fields a human may edit directly in the database and expect the
+    #: running application to pick up. Down to two: the webhook is registered
+    #: in OpenWA now, not derived per chat, and the phone number comes from the
+    #: chat id rather than being typed in.
+    CONFIG_FIELDS = ("automation_enabled", "chat_name")
 
     def reload_chat_config(self) -> list[str]:
         """Re-read the configuration fields of every chat from MongoDB.
@@ -430,16 +366,8 @@ class Repository:
             # Rebuilt, not discarded: the key set is the fast duplicate check
             # for every OTHER chat too.
             self._message_keys = {m.message_key for m in self._messages}
-            self._webhooks = deque(
-                (w for w in self._webhooks if w.chat_id != chat_id),
-                maxlen=constants.JSON_WEBHOOK_LIMIT,
-            )
-            self._outgoing = {k: v for k, v in self._outgoing.items()
-                              if v.chat_id != chat_id}
         try:
             self._mongo.messages.delete_many({"chat_id": chat_id})
-            self._mongo.outgoing.delete_many({"chat_id": chat_id})
-            self._mongo.webhooks.delete_many({"chat_id": chat_id})
             self._mongo.note_success()
         except Exception as ex:  # noqa: BLE001
             self._mongo.note_failure(ex)
@@ -451,12 +379,7 @@ class Repository:
     def chat_record_counts(self, chat_id: str) -> dict:
         """How much a chat has stored, without touching any of it. The UI asks
         before it offers to delete, so the confirmation can name a number."""
-        return {
-            "messages": self.message_count(chat_id),
-            "webhooks": self._count(self._mongo.webhooks, chat_id, self._webhooks),
-            "outgoing": self._count(self._mongo.outgoing, chat_id,
-                                    self._outgoing.values()),
-        }
+        return {"messages": self.message_count(chat_id)}
 
     def _count(self, collection, chat_id: str, fallback) -> int:
         """How many records a chat has. MongoDB is the authority; the in-memory
@@ -572,76 +495,6 @@ class Repository:
             self._mongo.note_failure(ex)
         self._mark_messages_dirty()
 
-    def incomplete_messages(self) -> list[StoredMessage]:
-        """Messages that were mid-flight when the process last stopped.
-
-        Queried from MongoDB (the source of truth) rather than the in-memory
-        ring buffer, because a message stuck in an incomplete state is exactly
-        the kind that might be older than the buffer's window. The buffer is
-        the fallback for when the primary is unreachable — recovering some is
-        better than recovering none."""
-        try:
-            documents = list(self._mongo.messages.find(
-                {"status": {"$in": list(MessageStatus.INCOMPLETE)}}
-            ).sort("detected_at", 1))
-            self._mongo.note_success()
-            return [StoredMessage.from_document(strip_object_id(d)) for d in documents]
-        except Exception as ex:  # noqa: BLE001
-            self._mongo.note_failure(ex)
-            logger.error("Could not query incomplete messages from MongoDB: %s", ex)
-            with self._lock:
-                return [m for m in self._messages if m.status in MessageStatus.INCOMPLETE]
-
-    def recently_originated(self, chat_id: str, text: str, within_seconds: float = 600.0) -> bool:
-        """Did THIS application send this text to this chat a moment ago?
-
-        Everything we send is read back out of WhatsApp by a later poll, as an
-        outgoing bubble indistinguishable from one the user typed. Without this
-        check each sent message is stored twice — once when sent, once when
-        seen — inflating `messages_stored` and putting doubles in the mirror.
-
-        Matched on normalized text within a window rather than on a key,
-        because the read-back carries the bubble's clock label and the send
-        did not. The trade: a message the user types by hand that happens to
-        repeat an automated one within the window is not separately recorded."""
-        wanted = " ".join((text or "").split())
-        if not wanted:
-            return False
-        cutoff = utcnow().timestamp() - within_seconds
-        with self._lock:
-            for message in reversed(self._messages):
-                if message.chat_id != chat_id or message.direction != "out":
-                    continue
-                if not message.origin:
-                    continue  # read back from WhatsApp, not one of ours
-                if message.detected_at and message.detected_at.timestamp() < cutoff:
-                    break  # the deque is oldest-first, so nothing older matches
-                if " ".join((message.text or "").split()) == wanted:
-                    return True
-        return False
-
-    def has_relay_id(self, chat_id: str, external_id: str) -> bool:
-        """Has this chat already been sent the relay message with this id?
-
-        Checked against MongoDB rather than the in-memory buffer, because an id
-        the endpoint keeps offering may be older than the buffer's window — and
-        answering "no" from a short memory would re-send it."""
-        if not external_id:
-            return False
-        try:
-            found = self._mongo.messages.find_one(
-                {"chat_id": chat_id, "origin": "relay", "external_ref": external_id}
-            )
-            self._mongo.note_success()
-            if found is not None:
-                return True
-        except Exception as ex:  # noqa: BLE001
-            self._mongo.note_failure(ex)
-            logger.error("Relay dedup lookup failed: %s", ex)
-        with self._lock:
-            return any(m.chat_id == chat_id and m.origin == "relay"
-                       and m.external_ref == external_id for m in self._messages)
-
     def messages_for(self, chat_id: str, limit: int = 200) -> list[StoredMessage]:
         with self._lock:
             rows = [m for m in self._messages if m.chat_id == chat_id]
@@ -654,174 +507,13 @@ class Repository:
             with self._lock:
                 return sum(1 for m in self._messages if m.chat_id == chat_id)
 
-    # -- outgoing queue ----------------------------------------------------
-
-    def enqueue_outgoing(self, message: OutgoingMessage) -> OutgoingMessage:
-        """Persist a message BEFORE anything is attempted.
-
-        This is what makes the queue survive a crash: by the time a worker
-        touches it, the intent to send is already on disk in both stores. The
-        per-chat sequence is assigned here so ordering is decided at enqueue
-        time, not by whatever order workers happen to pick things up."""
-        with self._lock:
-            message.sequence = self._next_sequence(message.chat_id)
-            self._outgoing[message.outgoing_id] = message
-        try:
-            self._mongo.outgoing.insert_one(message.to_document())
-            self._mongo.note_success()
-        except Exception as ex:  # noqa: BLE001
-            self._mongo.note_failure(ex)
-            logger.error("Could not persist an outgoing message: %s", ex)
-        self._mark_outgoing_dirty()
-        return message
-
-    def _next_sequence(self, chat_id: str) -> int:
-        existing = [m.sequence for m in self._outgoing.values() if m.chat_id == chat_id]
-        return (max(existing) + 1) if existing else 1
-
-    def update_outgoing(self, message: OutgoingMessage) -> None:
-        message.updated_at = utcnow()
-        with self._lock:
-            self._outgoing[message.outgoing_id] = message
-        try:
-            self._mongo.outgoing.update_one(
-                {"outgoing_id": message.outgoing_id}, {"$set": message.to_document()}, upsert=True)
-            self._mongo.note_success()
-        except Exception as ex:  # noqa: BLE001
-            self._mongo.note_failure(ex)
-        self._mark_outgoing_dirty()
-
-    def pending_outgoing(self) -> list[OutgoingMessage]:
-        """Everything still owed, oldest first within each chat.
-
-        Sorted by (chat sequence, creation) so a chat's messages keep their
-        order even though several chats are drained from one queue."""
-        with self._lock:
-            pending = [m for m in self._outgoing.values()
-                       if m.status not in OutgoingStatus.FINAL]
-        return sorted(pending, key=lambda m: (m.created_at or utcnow(), m.sequence))
-
-    def backfill_phone_number(self, chat_id: str, phone_number: str) -> int:
-        """Stamp a newly-known number onto everything already stored for a chat.
-
-        WhatsApp does not expose a saved contact's number, so a chat can run for
-        days before anyone types one in. Without this, its history would be
-        split into messages that carry the number and messages that do not —
-        the kind of gap that is invisible until someone queries the collection
-        and quietly gets half the rows.
-
-        Returns how many stored messages were updated."""
-        if not chat_id:
-            return 0
-        number = (phone_number or "").strip()
-        updated = 0
-        with self._lock:
-            for message in self._messages:
-                if message.chat_id == chat_id and message.phone_number != number:
-                    message.phone_number = number
-                    updated += 1
-        if updated:
-            try:
-                self._mongo.messages.update_many(
-                    {"chat_id": chat_id},
-                    {"$set": {"phone_number": number}},
-                )
-                self._mongo.note_success()
-            except Exception as ex:  # noqa: BLE001 - the mirror still has it
-                self._mongo.note_failure(ex)
-                logger.error("Could not backfill phone numbers in MongoDB: %s", ex)
-            self._mark_messages_dirty()
-        return updated
-
-    def pending_counts(self) -> dict:
-        """Per chat, how many messages are still mid-flight.
-
-        Counts an incoming message from the moment it is stored until its
-        automation round trip finishes, plus anything still owed from the
-        outgoing queue. This is the only number the simplified UI shows, so it
-        has to mean something a user can act on: if it is not falling, the
-        automation is stuck."""
-        counts: dict = {}
-        with self._lock:
-            for message in self._messages:
-                if message.status in MessageStatus.INCOMPLETE:
-                    counts[message.chat_id] = counts.get(message.chat_id, 0) + 1
-            for outgoing in self._outgoing.values():
-                if outgoing.status not in OutgoingStatus.FINAL:
-                    counts[outgoing.chat_id] = counts.get(outgoing.chat_id, 0) + 1
-        return counts
-
-    def all_outgoing(self) -> list[OutgoingMessage]:
-        """Every queued message, finished or not — what a status lookup needs,
-        since the interesting answers (delivered, failed, unverified) are all
-        terminal states that `pending_outgoing` deliberately excludes."""
-        with self._lock:
-            return list(self._outgoing.values())
-
-    def outgoing_in_state(self, states) -> list[OutgoingMessage]:
-        with self._lock:
-            return [m for m in self._outgoing.values() if m.status in states]
-
-    def needs_review(self) -> list:
-        """Messages that left the compose box but were never found in the chat.
-
-        A first-class state, not an error bucket. The system deliberately does
-        not guess about these — retrying risks a duplicate — so they are
-        surfaced for a person to resolve. An operator who never looks at this
-        number is the one failure mode the design cannot cover."""
-        return self.outgoing_in_state((OutgoingStatus.UNVERIFIED,))
-
-    def queue_depth(self) -> int:
-        with self._lock:
-            return sum(1 for m in self._outgoing.values()
-                       if m.status not in OutgoingStatus.FINAL)
-
-    def cancel_outgoing_for_chat(self, chat_id: str) -> int:
-        """A deleted chat cannot be sent to. Cancelled, not silently dropped."""
-        cancelled = 0
-        for message in self.outgoing_in_state(
-                OutgoingStatus.RESUMABLE + OutgoingStatus.AMBIGUOUS):
-            if message.chat_id == chat_id:
-                message.status = OutgoingStatus.CANCELLED
-                message.error = "the chat was deleted while this was queued"
-                self.update_outgoing(message)
-                cancelled += 1
-        return cancelled
-
-    def _mark_outgoing_dirty(self) -> None:
-        with self._lock:
-            payload = [m.to_document() for m in self._outgoing.values()]
-        self._backup.set_section(constants.JSON_OUTGOING, payload)
-
-    # -- webhooks ----------------------------------------------------------
-
-    def save_webhook(self, record: WebhookRecord) -> None:
-        with self._lock:
-            self._webhooks.append(record)
-        try:
-            self._mongo.webhooks.insert_one(record.to_document())
-            self._mongo.note_success()
-        except Exception as ex:  # noqa: BLE001
-            self._mongo.note_failure(ex)
-            logger.error("Saving webhook record to MongoDB failed: %s", ex)
-        self._mark_webhooks_dirty()
-
-    def webhooks_for(self, chat_id: str, limit: int = 50) -> list[WebhookRecord]:
-        with self._lock:
-            rows = [w for w in self._webhooks if w.chat_id == chat_id]
-        return rows[-limit:]
-
-    # -- logs --------------------------------------------------------------
+    # -- activity log ------------------------------------------------------
 
     def log(self, level: str, event: str, chat_id: str = "", chat_name: str = "",
-            message: str = "", direction: str = "", webhook_url: str = "",
-            response: str = "", retry_count: int = 0, error: str = "",
-            correlation_id: str = "") -> AutomationLog:
+            message: str = "", correlation_id: str = "") -> AutomationLog:
         entry = AutomationLog(
             level=level.upper(), event=event, chat_id=chat_id, chat_name=chat_name,
-            message=message, direction=direction, correlation_id=correlation_id,
-            webhook_url=webhook_url,
-            response=(response or "")[:500], retry_count=retry_count, error=(error or "")[:500],
+            message=message, correlation_id=correlation_id,
         )
         with self._lock:
             self._logs.append(entry)
@@ -831,7 +523,6 @@ class Repository:
         # buffer above feeds logs.json, and the line before this one writes
         # wadam.log. A diagnostic trail is worth keeping and is not worth
         # paying a cloud provider to keep for you.
-        self._mark_logs_dirty()
         self._mark_logs_dirty()
         return entry
 
@@ -857,10 +548,6 @@ class Repository:
     def app_state(self) -> ApplicationState:
         return self._app_state
 
-    @property
-    def poll_state(self) -> PollState:
-        return self._poll_state
-
     def save_app_state(self, state: ApplicationState) -> None:
         state.updated_at = utcnow()
         self._app_state = state
@@ -873,18 +560,6 @@ class Repository:
             self._mongo.note_failure(ex)
         self._mark_state_dirty()
 
-    def save_poll_state(self, state: PollState) -> None:
-        """Cycle counters and timings. LOCAL ONLY.
-
-        Written on a timer, read by nothing but the status bar, and meaningless
-        after a restart — a MongoDB write for it was ~86,000 billable
-        operations a month to remember how many times a loop had run."""
-        state.updated_at = utcnow()
-        self._poll_state = state
-        self._mark_state_dirty()
-
-    # -- JSON mirror -------------------------------------------------------
-
     def _mark_chats_dirty(self) -> None:
         with self._lock:
             chats = [c.to_document() for c in self._chats.values()]
@@ -896,36 +571,18 @@ class Repository:
                         "chat_id": c.chat_id,
                         "chat_name": c.chat_name,
                         "automation_enabled": c.automation_enabled,
-                        "webhook_url": c.webhook_url,
-                        "last_poll_utc": c.last_poll_utc,
-                        "webhook_retry_count": c.webhook_retry_count,
                         "messages_stored": c.messages_stored,
                     }
                     for c in self._chats.values()
                 ],
             }
-            webhook_config = [
-                {"chat_id": c.chat_id, "chat_name": c.chat_name, "webhook_url": c.webhook_url,
-                 "enabled": c.automation_enabled}
-                for c in self._chats.values()
-            ]
         self._backup.set_section(constants.JSON_CHATS, chats)
         self._backup.set_section(constants.JSON_AUTOMATION, automation)
-        # webhooks.json carries BOTH halves of "webhooks": the per-chat
-        # configuration and the call history. Configuration first — it's the
-        # part a human opens the file to read.
-        self._backup.set_section(constants.JSON_WEBHOOKS, {
-            "configurations": webhook_config,
-            "calls": [w.to_document() for w in self._webhooks],
-        })
 
     def _mark_messages_dirty(self) -> None:
         with self._lock:
             payload = [m.to_document() for m in self._messages]
         self._backup.set_section(constants.JSON_MESSAGES, payload)
-
-    def _mark_webhooks_dirty(self) -> None:
-        self._mark_chats_dirty()
 
     def _mark_logs_dirty(self) -> None:
         with self._lock:
@@ -935,12 +592,10 @@ class Repository:
     def _mark_state_dirty(self) -> None:
         self._backup.set_section(constants.JSON_APP_STATE, {
             "application_state": self._app_state.to_document(),
-            "poll_state": self._poll_state.to_document(),
         })
 
     def _rebuild_all_sections(self) -> None:
         self._mark_chats_dirty()
-        self._mark_outgoing_dirty()
         self._mark_messages_dirty()
         self._mark_logs_dirty()
         self._mark_state_dirty()
