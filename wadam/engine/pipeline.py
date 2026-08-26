@@ -89,10 +89,16 @@ class MessagePipeline:
         if self._metrics:
             self._metrics.record_received()
 
+        # COLLECTED, not left PENDING. Both of these are decisions — the
+        # message was stored and deliberately not answered — and a status that
+        # never advances makes every such message look like one the process
+        # died halfway through.
         if not chat.automation_enabled:
+            self._finish(stored, MessageStatus.COLLECTED)
             return Outcome("skipped", "automation off for this chat", msg.chat_id)
 
         if msg.is_group and not self._answer_groups:
+            self._finish(stored, MessageStatus.COLLECTED)
             return Outcome("skipped", "group chat", msg.chat_id)
 
         try:

@@ -35,7 +35,7 @@ _TEXT_KEYS = ("body", "text", "message", "caption")
 _CHAT_KEYS = ("chatId", "chat_id", "from", "chat")
 _ID_KEYS = ("waMessageId", "messageId", "id", "message_id")
 _TYPE_KEYS = ("type", "messageType")
-_NAME_KEYS = ("chatName", "notifyName", "pushName", "senderName", "author")
+_NAME_KEYS = ("chatName", "notifyName", "pushName", "senderName")
 
 
 def verify_signature(body: bytes, header_value: Optional[str], secret: str) -> bool:
@@ -107,9 +107,17 @@ def parse_delivery(payload: Mapping[str, Any]) -> Optional[InboundMessage]:
     from_me = bool(source.get("fromMe", data.get("fromMe", False)))
     media_kind = _first(source, _TYPE_KEYS)
 
+    # OpenWA carries the sender's push name nested under `contact`, not at the
+    # top level (`message-mapper.ts` sets `incoming.contact = { pushName }`).
+    # Reading only the top level left every chat named after its raw
+    # identifier — `216298915164281@lid` in the list instead of a person.
+    contact = source.get("contact") if isinstance(source.get("contact"), Mapping) else {}
+    chat_name = (_first(source, _NAME_KEYS) or _first(data, _NAME_KEYS)
+                 or _first(contact, _NAME_KEYS) or "")
+
     return InboundMessage(
         chat_id=chat_id,
-        chat_name=_first(source, _NAME_KEYS) or _first(data, _NAME_KEYS) or chat_id,
+        chat_name=chat_name or chat_id,
         message_id=_first(source, _ID_KEYS) or _first(data, _ID_KEYS),
         text=_first(source, _TEXT_KEYS),
         sender=_first(source, ("from", "author", "sender")),

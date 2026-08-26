@@ -141,6 +141,28 @@ def test_a_reply_is_stored_alongside_the_message_it_answered(repo):
     assert client.sent == [(CHAT_ID, "pong")]
 
 
+def test_a_message_in_an_automation_off_chat_is_marked_collected(repo):
+    """Not left PENDING. It was stored and deliberately not answered, which is
+    a decision — a status that never advances makes every such message look
+    like one the process died halfway through."""
+    pipeline, _ = build(repo)
+
+    pipeline.process(message("hello"))
+
+    assert repo.messages_for(CHAT_ID)[0].status == MessageStatus.COLLECTED
+
+
+def test_a_skipped_group_message_is_marked_collected(repo):
+    pipeline, _ = build(repo)
+    pipeline.process(message(message_id="m0", group=True))
+    enable(repo)
+
+    pipeline.process(message("hi", message_id="m1", group=True))
+
+    statuses = {m.status for m in repo.messages_for(CHAT_ID)}
+    assert MessageStatus.PENDING not in statuses
+
+
 # ── rule: loop protection ─────────────────────────────────────────────
 
 

@@ -108,6 +108,35 @@ def test_field_names_are_read_from_whichever_key_is_present():
     assert msg.message_id == "m9"
 
 
+def test_the_push_name_is_read_from_the_nested_contact():
+    """OpenWA sets `incoming.contact = { pushName }` rather than putting it at
+    the top level. Reading only the top level named every chat after its raw
+    identifier — `216298915164281@lid` in the list instead of a person."""
+    payload = json.loads(body_for())
+    payload["data"]["contact"] = {"pushName": "Alice"}
+
+    assert inbound.parse_delivery(payload).chat_name == "Alice"
+
+
+def test_a_top_level_name_still_wins():
+    payload = json.loads(body_for())
+    payload["data"]["chatName"] = "From the top"
+    payload["data"]["contact"] = {"pushName": "Nested"}
+
+    assert inbound.parse_delivery(payload).chat_name == "From the top"
+
+
+def test_a_nameless_delivery_falls_back_to_the_chat_id():
+    assert inbound.parse_delivery(json.loads(body_for())).chat_name == "216298915164281@lid"
+
+
+def test_a_contact_that_is_not_an_object_is_survived():
+    payload = json.loads(body_for())
+    payload["data"]["contact"] = "not an object"
+
+    assert inbound.parse_delivery(payload).chat_name == "216298915164281@lid"
+
+
 def test_a_payload_with_no_chat_yields_nothing():
     assert inbound.parse_delivery({"event": "session.status", "data": {"status": "ready"}}) is None
 
