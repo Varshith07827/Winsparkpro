@@ -48,8 +48,11 @@ SEND_PATHS = {"/", "/send", "/wam", "/wam/", "/send/"}
 HEALTH_PATHS = {"/health", "/health/", "/status", "/status/"}
 
 # The message text is read from the first of these present, mirroring the
-# leniency of the outbound response parser.
-_TEXT_KEYS = ("message", "text", "reply", "body")
+# leniency of the outbound response parser. `msg` is in the list because it is
+# what people actually type: the first hand-written call against this API used
+# it and got "Missing message" back, which is a poor way to greet a caller who
+# did nothing wrong.
+_TEXT_KEYS = ("message", "msg", "text", "reply", "body")
 _ID_KEYS = ("id", "chat", "chat_id", "contact", "to")
 
 # How many sends may be in flight at once. Sends are serialized downstream by

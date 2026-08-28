@@ -6,6 +6,7 @@ matches more than one chat is refused, never delivered to a guess.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -170,6 +171,31 @@ def test_a_failed_send_reports_502(host, tmp_path: Path):
 
     assert response.status == 502
     assert response.payload["code"] == "send_failed"
+
+
+def test_the_body_may_say_msg_or_message(host):
+    """Both, because `msg` is what people actually type. The first hand-written
+    call against this API used it and was told "Missing message"."""
+    api, repo, client = host
+    add(repo, "x@lid", "Alice")
+
+    for key in ("msg", "message", "text"):
+        client.sent.clear()
+        response = api.server.handle_send(
+            json.dumps({"id": "Alice", key: f"via {key}"}).encode())
+        assert response.status == 200, key
+        assert client.sent[0][1] == f"via {key}"
+
+
+def test_the_id_may_be_named_several_ways(host):
+    api, repo, client = host
+    add(repo, "x@lid", "Alice")
+
+    for key in ("id", "chat", "to", "contact"):
+        client.sent.clear()
+        response = api.server.handle_send(
+            json.dumps({key: "Alice", "msg": "hi"}).encode())
+        assert response.status == 200, key
 
 
 def test_the_api_is_off_without_a_port(host):
