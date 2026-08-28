@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -220,6 +221,33 @@ def test_turning_automation_off_keeps_the_history(service):
 def test_toggling_an_unknown_chat_does_nothing(service):
     svc, _, _ = service
     svc.set_chat_automation("nobody@c.us", True)  # must not raise
+
+
+def test_starting_on_an_occupied_port_is_refused(service, tmp_path: Path):
+    """allow_reuse_address means a second instance binds the same port with no
+    error and the deliveries are split unpredictably. A stale window did
+    exactly that during testing and answered out of an old build."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class Quiet(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *_a):
+            pass
+
+    squatter = ThreadingHTTPServer(("127.0.0.1", 8791), Quiet)
+    threading.Thread(target=squatter.serve_forever, daemon=True).start()
+    try:
+        svc, _, _ = service
+        svc._settings = replace(svc._settings, webhook_host="127.0.0.1",  # noqa: SLF001
+                                webhook_port=8791)
+        with pytest.raises(OSError, match="already listening"):
+            svc.start()
+    finally:
+        squatter.shutdown()
 
 
 def test_the_snapshot_reports_the_stores(service):

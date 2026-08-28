@@ -80,6 +80,20 @@ it had already delivered — precisely the scenario that makes retrying wrong.
 
 ---
 
+## Two copies will share a port rather than conflict
+
+`http.server` sets `allow_reuse_address`, so a second instance binds the same
+port with no error and OpenWA's deliveries are split between the two
+unpredictably. A stale window left running from before a code change kept
+answering alongside a fresh service and replied out of the old build — every
+symptom pointed at the new code, and nothing logged a conflict.
+
+Startup now refuses to begin if something already answers on the port, which
+turns a silent split into a clear message. It is a connect probe rather than a
+bind, because a bind would succeed and prove nothing.
+
+---
+
 ## The window is single-user and local
 
 No authentication, no multi-user access, no remote view. It reads and writes a

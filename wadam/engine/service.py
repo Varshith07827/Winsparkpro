@@ -19,6 +19,7 @@ the per-chat cooldown, which takes a lock.
 from __future__ import annotations
 
 import logging
+import socket
 import threading
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -95,6 +96,9 @@ class AutomationService:
     def start(self) -> None:
         if self._server is not None:
             return
+
+        _refuse_if_port_is_taken(self._settings.webhook_host, self._settings.webhook_port)
+
         handler = _make_handler(self)
         self._server = ThreadingHTTPServer(
             (self._settings.webhook_host, self._settings.webhook_port), handler)
@@ -229,6 +233,32 @@ class AutomationService:
         outcome: Outcome = self._pipeline.process(msg)
         self.publish()
         return 200, outcome.as_response()
+
+
+def _refuse_if_port_is_taken(host: str, port: int) -> None:
+    """Raise if something already answers on this port.
+
+    `http.server` sets `allow_reuse_address = 1`, so on Windows a second
+    instance binds the SAME port without any error and WhatsApp's deliveries
+    are split between the two unpredictably. That is not theoretical: a window
+    left running from before a code change kept answering alongside a freshly
+    started service, replied out of the old build, and every symptom pointed at
+    the new code being broken. Nothing logged a conflict, because as far as
+    either process was concerned there wasn't one.
+
+    So the check is a *connection*, not a bind — a bind would succeed and prove
+    nothing.
+    """
+    probe_host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(0.4)
+        if probe.connect_ex((probe_host, port)) == 0:
+            raise OSError(
+                f"something is already listening on {probe_host}:{port}. "
+                f"Another copy of this application is probably still running — "
+                f"stop it first. Two listeners on one port do not conflict here, "
+                f"they silently share the traffic."
+            )
 
 
 def _make_handler(service: AutomationService):
