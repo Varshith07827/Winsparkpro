@@ -52,6 +52,9 @@ class FakeCollection:
     def insert_one(self, document):
         self.documents.append(dict(document))
 
+    def insert_many(self, documents, ordered=True):
+        self.documents.extend(dict(d) for d in documents)
+
     def update_one(self, query, update, upsert=False):
         key, value = next(iter(query.items()))
         for existing in self.documents:
@@ -113,6 +116,7 @@ class FakeMongo:
     def __init__(self) -> None:
         self.chat_configs = FakeCollection()
         self.messages = FakeCollection()
+        self.contacts = FakeCollection()
         self.automation_logs = FakeCollection()
         self.application_state = FakeCollection()
         self.poll_state = FakeCollection()

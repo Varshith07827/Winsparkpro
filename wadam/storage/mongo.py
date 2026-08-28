@@ -207,6 +207,10 @@ class MongoStore:
         return self._collection(constants.COLLECTION_MESSAGES)
 
     @property
+    def contacts(self):
+        return self._collection(constants.COLLECTION_CONTACTS)
+
+    @property
     def application_state(self):
         return self._collection(constants.COLLECTION_APPLICATION_STATE)
 
@@ -220,6 +224,11 @@ class MongoStore:
             self.chat_configs.create_index("chat_name")
             self.messages.create_index("message_key", unique=True)
             self.messages.create_index([("chat_id", 1), ("detected_at", -1)])
+            self.contacts.create_index("contact_id", unique=True)
+            # Not unique: two contacts can share a name (measured: 4 of 494),
+            # and that ambiguity is refused at resolution rather than at write.
+            self.contacts.create_index("name")
+            self.contacts.create_index("phone_number")
             # Sparse: only relayed messages carry an external_ref, and the
             # relay dedup lookup is the only thing that reads it.
             self.messages.create_index(

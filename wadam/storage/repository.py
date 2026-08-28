@@ -38,6 +38,7 @@ from wadam.domain.models import (
     ApplicationState,
     AutomationLog,
     ChatConfig,
+    Contact,
     MessageStatus,
     StoredMessage,
     utcnow,
@@ -59,6 +60,7 @@ class Repository:
         self._config_baseline: dict[str, dict] = {}
         self._messages: deque[StoredMessage] = deque(maxlen=constants.JSON_MESSAGE_LIMIT)
         self._message_keys: set[str] = set()
+        self._contacts: dict[str, Contact] = {}
         self._logs: deque[AutomationLog] = deque(maxlen=constants.JSON_LOG_LIMIT)
         self._app_state = ApplicationState(version=constants.APP_VERSION)
         self._autosave = AutosaveTimer(self.flush_json, settings.json_autosave_interval or 15.0)
@@ -115,6 +117,10 @@ class Repository:
                 message = StoredMessage.from_document(strip_object_id(document))
                 self._messages.appendleft(message)
                 self._message_keys.add(message.message_key)
+            for document in self._mongo.contacts.find({}):
+                contact = Contact.from_document(strip_object_id(document))
+                if contact.contact_id:
+                    self._contacts[contact.contact_id] = contact
             state = self._mongo.application_state.find_one({"_id": constants.SINGLETON_ID})
             if state:
                 self._app_state = ApplicationState.from_document(strip_object_id(state))
@@ -462,6 +468,72 @@ class Repository:
             with self._lock:
                 return sum(1 for m in self._messages if m.chat_id == chat_id)
 
+    # -- the address book --------------------------------------------------
+
+    def save_contacts(self, contacts: list[Contact]) -> int:
+        """Replace the address book with `contacts`. Returns how many were kept.
+
+        A wholesale replace rather than a merge, because a contact deleted on
+        the phone should stop being resolvable here — a name that still
+        resolves after you removed it is how a message goes to the wrong
+        person. Written in one bulk operation: ~900 individual upserts against
+        Atlas is slow enough to notice on every sync.
+        """
+        rows = [c for c in contacts if c.contact_id]
+        with self._lock:
+            self._contacts = {c.contact_id: c for c in rows}
+        try:
+            self._mongo.contacts.delete_many({})
+            if rows:
+                for chunk in range(0, len(rows), 500):
+                    self._mongo.contacts.insert_many(
+                        [c.to_document() for c in rows[chunk:chunk + 500]])
+            self._mongo.note_success()
+        except Exception as ex:  # noqa: BLE001
+            self._mongo.note_failure(ex)
+            logger.error("Saving contacts to MongoDB failed: %s", ex)
+        self._mark_contacts_dirty()
+        return len(rows)
+
+    def list_contacts(self) -> list[Contact]:
+        with self._lock:
+            return list(self._contacts.values())
+
+    def contact_count(self) -> int:
+        with self._lock:
+            return len(self._contacts)
+
+    def contacts_named(self, name: str) -> list[Contact]:
+        """Every contact whose name matches, case-insensitively.
+
+        A list, not one contact: names are not unique (measured on a live
+        address book, 4 of 494 were shared), and the caller decides what to do
+        about that. Silently returning the first would send to whichever of two
+        people happened to sort earlier.
+        """
+        wanted = (name or "").strip().casefold()
+        if not wanted:
+            return []
+        with self._lock:
+            return [c for c in self._contacts.values()
+                    if c.name.strip().casefold() == wanted
+                    or c.push_name.strip().casefold() == wanted]
+
+    def contact_by_phone(self, phone: str) -> Optional[Contact]:
+        digits = "".join(d for d in (phone or "") if d.isdigit())
+        if not digits:
+            return None
+        with self._lock:
+            for contact in self._contacts.values():
+                if contact.phone_number == digits:
+                    return contact
+        return None
+
+    def _mark_contacts_dirty(self) -> None:
+        with self._lock:
+            payload = [c.to_document() for c in self._contacts.values()]
+        self._backup.set_section(constants.JSON_CONTACTS, payload)
+
     # -- activity log ------------------------------------------------------
 
     def log(self, level: str, event: str, chat_id: str = "", chat_name: str = "",
@@ -551,6 +623,7 @@ class Repository:
 
     def _rebuild_all_sections(self) -> None:
         self._mark_chats_dirty()
+        self._mark_contacts_dirty()
         self._mark_messages_dirty()
         self._mark_logs_dirty()
         self._mark_state_dirty()

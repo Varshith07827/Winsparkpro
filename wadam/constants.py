@@ -48,6 +48,7 @@ MESSAGE_READ_LIMIT = 25
 # MongoDB collections.
 COLLECTION_CHAT_CONFIGS = "chat_configs"
 COLLECTION_MESSAGES = "messages"
+COLLECTION_CONTACTS = "contacts"
 COLLECTION_APPLICATION_STATE = "application_state"
 
 #: Retired from MongoDB and kept locally instead — named here only so an
@@ -65,6 +66,7 @@ SINGLETON_ID = "singleton"
 # JSON mirror filenames, written into JSON_BACKUP_FOLDER.
 JSON_CHATS = "chats.json"
 JSON_MESSAGES = "messages.json"
+JSON_CONTACTS = "contacts.json"
 JSON_AUTOMATION = "automation.json"
 JSON_APP_STATE = "app_state.json"
 JSON_LOGS = "logs.json"

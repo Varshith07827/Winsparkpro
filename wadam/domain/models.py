@@ -118,9 +118,23 @@ class ChatConfig:
     """OpenWA's identifier, verbatim. Durable across renames."""
 
     chat_name: str = ""
+    """What OpenWA's chat list calls this chat. For an unsaved number that is
+    the number itself; for a saved contact it is whatever WhatsApp displays,
+    which may be stylised unicode rather than anything you would type."""
+
+    contact_name: str = ""
+    """The address-book name, joined from `contacts` through the phone number.
+    Preferred for display and for addressing a chat by name, because it is what
+    a person would actually type."""
+
     phone_number: str = ""
-    """Derived from the chat id when it is phone-shaped; empty for LIDs.
-    Never guessed at."""
+    """Resolved once via OpenWA and cached. A chat id is a `@lid` and carries
+    no number, so this is the only join to the address book — and the only way
+    `{"id": "919100251854"}` can find this chat."""
+
+    webhook_url: str = ""
+    """Where this chat's incoming messages are POSTed. Empty means the global
+    default; empty with no default means nothing is dispatched."""
 
     automation_enabled: bool = False
     is_group: bool = False
@@ -143,6 +157,38 @@ class ChatConfig:
 
     @classmethod
     def from_document(cls, document: dict[str, Any]) -> "ChatConfig":
+        return _build(cls, document)
+
+
+@dataclass
+class Contact:
+    """One entry from WhatsApp's address book.
+
+    Stored so a name can be resolved to a chat even when no chat exists yet —
+    an address book of ~900 people is not something to re-fetch per lookup, and
+    OpenWA pages it 1000 rows at a time.
+    """
+
+    contact_id: str = ""
+    """`<number>@c.us`. NOT a chat id: the same person's chat is a `@lid`."""
+
+    name: str = ""
+    push_name: str = ""
+    phone_number: str = ""
+    """Digits only. The join to a chat."""
+
+    is_my_contact: bool = False
+    updated_at: datetime = field(default_factory=utcnow)
+
+    @property
+    def display_name(self) -> str:
+        return self.name or self.push_name or self.phone_number or self.contact_id
+
+    def to_document(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_document(cls, document: dict[str, Any]) -> "Contact":
         return _build(cls, document)
 
 

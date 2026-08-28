@@ -65,6 +65,88 @@ class OpenWAClient:
 
         return self._post(self.send_url, {"chatId": chat_id, "text": text})
 
+    # ── the directory ─────────────────────────────────────────────────
+
+    def list_chats(self) -> list[dict]:
+        """Every chat OpenWA can see, newest first.
+
+        These carry `@lid` ids. Contacts carry `@c.us` ids for the same people,
+        which is why `resolve_phone` exists — the two id spaces only join
+        through a phone number.
+        """
+        return _rows(self._get(f"/api/sessions/{self._session_id}/chats"), "chats")
+
+    def list_contacts(self, page_size: int = 1000) -> list[dict]:
+        """The whole address book, paginated and deduplicated.
+
+        Both are necessary and neither is optional:
+
+        * **Paginated.** The endpoint caps at 1000 rows and says nothing about
+          it. Measured on a live account: 1000 rows on the first page, 815 on
+          the second. Reading one page silently loses nearly half the address
+          book, and the failure looks like "that contact does not exist".
+        * **Deduplicated by id.** Every contact comes back twice — once with
+          the phone in `number`, once with a LID-shaped value. 1815 rows were
+          501 people. The row carrying the phone is preferred, since that is
+          the one that can be matched against a number.
+        """
+        rows: list[dict] = []
+        offset = 0
+        while True:
+            page = _rows(
+                self._get(f"/api/sessions/{self._session_id}/contacts"
+                          f"?limit={page_size}&offset={offset}"),
+                "contacts",
+            )
+            if not page:
+                break
+            rows.extend(page)
+            if len(page) < page_size:
+                break
+            offset += page_size
+
+        best: dict[str, dict] = {}
+        for row in rows:
+            contact_id = row.get("id")
+            if not contact_id:
+                continue
+            current = best.get(contact_id)
+            if current is None or _looks_like_phone(row.get("number"), contact_id):
+                best[contact_id] = row
+        return list(best.values())
+
+    def resolve_phone(self, contact_id: str) -> str:
+        """The phone number behind a chat id, or "" if OpenWA cannot say.
+
+        Best-effort by OpenWA's own description, and about a second per call —
+        so callers cache the answer. A LID's phone number does not change.
+        """
+        try:
+            answer = self._get(
+                f"/api/sessions/{self._session_id}/contacts/{contact_id}/phone")
+        except SendError as error:
+            logger.debug("could not resolve %s to a phone: %s", contact_id, error)
+            return ""
+        return str(answer.get("phone") or "") if isinstance(answer, dict) else ""
+
+    def check_number(self, number: str) -> str:
+        """The chat id for a phone number, or "" if it is not on WhatsApp.
+
+        This is what makes a number reachable when no chat exists for it yet.
+        """
+        digits = "".join(c for c in (number or "") if c.isdigit())
+        if not digits:
+            return ""
+        try:
+            answer = self._get(
+                f"/api/sessions/{self._session_id}/contacts/check/{digits}")
+        except SendError as error:
+            logger.debug("could not check %s: %s", digits, error)
+            return ""
+        if not isinstance(answer, dict) or not answer.get("exists"):
+            return ""
+        return str(answer.get("whatsappId") or "")
+
     # ── session state, for the status bar ─────────────────────────────
 
     def session_status(self) -> dict:
@@ -110,7 +192,39 @@ class OpenWAClient:
             raise SendError(f"unreadable response from OpenWA: {error}") from error
 
     def _get(self, path: str):
+        """GET a path relative to the base URL."""
         return self._request("GET", f"{self._base_url}{path}")
 
     def _post(self, url: str, body: dict):
         return self._request("POST", url, body)
+
+
+def _rows(payload, key: str) -> list[dict]:
+    """The list inside a response, whatever shape it arrived in.
+
+    OpenWA returns a bare array on some endpoints and `{key: [...]}` or
+    `{data: [...]}` on others, and which is which has changed between
+    releases.
+    """
+    if isinstance(payload, list):
+        return [r for r in payload if isinstance(r, dict)]
+    if isinstance(payload, dict):
+        for candidate in (key, "data", "items"):
+            value = payload.get(candidate)
+            if isinstance(value, list):
+                return [r for r in value if isinstance(r, dict)]
+    return []
+
+
+def _looks_like_phone(number, contact_id: str) -> bool:
+    """Is this the duplicate row carrying the real phone number?
+
+    A contact's two rows differ only in `number`: one holds the phone, the
+    other a LID-shaped value that matches nothing. When the id is `<digits>@c.us`
+    the phone is in the id, so the row agreeing with it is the useful one.
+    """
+    digits = "".join(c for c in str(number or "") if c.isdigit())
+    if not digits:
+        return False
+    local = contact_id.split("@", 1)[0]
+    return digits == local
