@@ -18,8 +18,8 @@ message to your code and carries the answer back.
                         │               │
                         │  verify sig   │
                         │  store        │──▶ MongoDB + JSON mirror
-                        │  reply_for()  │
-                        │  send         │
+                        │  POST ────────┼──▶ your endpoint
+                        │  send  ◀──────┼─── its reply
                         └───────────────┘
 ```
 
@@ -58,9 +58,10 @@ whether it worked.
 
 | Thread | What runs on it |
 |---|---|
-| Qt main thread | The window. Reads snapshots, writes one thing: a chat's automation flag. |
+| Qt main thread | The window. Reads snapshots; writes two things — a chat's automation flag and its webhook URL. |
 | HTTP server threads | One per delivery. Verify, store, decide, send. |
-| Qt timer | Asks OpenWA for session status every 10s, so the status light is a light and not a heartbeat. |
+| Qt timers | Session status every 10s; the directory every 5 minutes. |
+| Sync thread | The directory sync, off the GUI thread — a first pass takes ~13s against a real account, and a window frozen that long looks like a crash. |
 
 **Why concurrent deliveries are safe.** The old engine serialized everything
 behind an automation lock, because two concurrent UI-Automation sends would
@@ -86,6 +87,8 @@ wadam/
   engine/
     service.py    the HTTP listener, and the snapshot the window renders
     pipeline.py   what happens to one message
+    webhook.py    calling your endpoint, and understanding the answer
+    directory.py  syncing chats and contacts; resolving a name to a chat
     guards.py     the per-chat cooldown
     metrics.py    counters
   storage/
@@ -96,7 +99,6 @@ wadam/
     models.py     one dataclass per collection
   api/            the inbound send API (optional)
   ui/             the window
-  reply.py        ← the file you edit
 ```
 
 ---
@@ -110,11 +112,14 @@ wadam/
 2. **Parse.** Each field is read from the first of several plausible keys.
    OpenWA has moved field names between releases, and being strict about a
    shape you do not control turns someone else's rename into your outage.
-3. **Register or find the chat.** Discovery is a side effect of a message
-   arriving. New chats get automation **off**.
+3. **Find the chat.** Chats come from OpenWA's own list, synced every few
+   minutes; one that arrives mid-cycle is registered on the spot. Either way
+   automation starts **off** — a sync that switched chats on would begin
+   answering every conversation in the account at once.
 4. **Store.** Before anything is decided, so a crash leaves a record of how far
    the message got.
-5. **Decide.** `reply_for(msg, chat)` returns text or `None`.
+5. **Dispatch.** POST the message to the chat's webhook (or `DEFAULT_WEBHOOK`)
+   and read the reply. An empty answer means "seen, don't answer".
 6. **Cooldown**, asked last and only for a message actually about to be
    answered.
 7. **Send**, and store the outgoing message against the chat.
@@ -126,13 +131,14 @@ wadam/
 A 4xx or 5xx tells OpenWA the delivery failed and earns a retry. There is
 nothing to retry about a message that was correctly ignored — it would be
 ignored again, three more times. So "automation is off", "that is a group",
-"already handled", "still in cooldown" and "no reply wanted" are all `200`.
+"already handled", "still in cooldown", "no webhook configured" and "the
+endpoint sent no reply" are all `200`.
 
 The exception is a bad signature, which is the one case where repeating the
 request verbatim really is wrong.
 
 **A failed send also answers 200**, and this one is worth stating plainly: a
-retry would re-run `reply_for` and could deliver twice. It is not theoretical.
+retry would call your endpoint again and could deliver twice. It is not theoretical.
 On the first live message through this architecture, OpenWA 0.7.2 returned HTTP
 500 for a message it had *already* delivered — a retrying client would have
 sent four copies. A duplicate is worse than a miss, which is the same judgment

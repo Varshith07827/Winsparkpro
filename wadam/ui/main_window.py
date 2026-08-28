@@ -96,6 +96,7 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self._chat_list)
 
         self._config = ChatDetailsPanel()
+        self._config.webhook_saved.connect(self._on_webhook_saved)
         splitter.addWidget(self._config)
 
         splitter.setStretchFactor(0, 0)
@@ -156,7 +157,10 @@ class MainWindow(QMainWindow):
         # session light says the opposite.
         metrics = snapshot.metrics
         if snapshot.listening:
-            summary = f"{metrics.deliveries} delivered · {metrics.replies_sent} replied"
+            summary = (f"{snapshot.contact_count} contacts · "
+                       f"{metrics.deliveries} delivered · {metrics.replies_sent} replied")
+            if metrics.webhook_failures:
+                summary += f" · {metrics.webhook_failures} hook failed"
             if metrics.send_failures:
                 summary += f" · {metrics.send_failures} failed"
             if metrics.rejected:
@@ -210,6 +214,9 @@ class MainWindow(QMainWindow):
         chat = self._repository.get_chat(chat_id)
         messages = self._repository.messages_for(chat_id) if chat else []
         self._config.set_chat(chat, messages)
+
+    def _on_webhook_saved(self, chat_id: str, url: str) -> None:
+        self._host.service.set_chat_webhook(chat_id, url)
 
     def _on_automation_toggled(self, chat_id: str, enabled: bool) -> None:
         """The one control in the window. Immediate and silent, both ways.

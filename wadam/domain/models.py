@@ -163,6 +163,19 @@ class ChatConfig:
     created_at: datetime = field(default_factory=utcnow)
     updated_at: datetime = field(default_factory=utcnow)
 
+    @property
+    def display_name(self) -> str:
+        """What to call this chat, in descending order of usefulness.
+
+        The address-book name first, because it is what a person would type.
+        WhatsApp's own chat name second — for an unsaved contact that is the
+        number, and for a saved one it may be stylised unicode that looks
+        nothing like anything typeable. Then the resolved number, then the raw
+        id, so there is always something to render.
+        """
+        return (self.contact_name or self.chat_name
+                or self.phone_number or self.chat_id)
+
     def to_document(self) -> dict[str, Any]:
         return asdict(self)
 

@@ -89,8 +89,10 @@ Work down this list; each step rules out the one above it.
 2. **Deliveries climb, `replies` stays 0, log says `invalid signature`** →
    `WEBHOOK_SECRET` and the webhook's `secret` in OpenWA differ.
 3. **Log says `automation off for this chat`** → tick the box.
-4. **Log says `no reply wanted`** → `reply_for` returned `None`. Working as
-   configured.
+4. **Log says `endpoint sent no reply`** → your webhook answered empty. Working
+   as configured.
+4b. **Log says `no webhook configured for this chat`** → set one, or
+   `DEFAULT_WEBHOOK`.
 5. **Log says `cooldown`** → within `COOLDOWN_SECONDS` of the last reply to
    that chat.
 6. **Log says `duplicate delivery`** → OpenWA retried something already

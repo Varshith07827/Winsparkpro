@@ -153,6 +153,21 @@ class AutomationService:
                        message=f"Automation turned {'on' if enabled else 'off'}.")
         self.publish()
 
+    def set_chat_webhook(self, chat_id: str, url: str) -> None:
+        """Point a chat at its own endpoint. Empty means "use the default".
+
+        No validation beyond the scheme: an endpoint that is not up yet is a
+        normal state while someone is setting one up, and refusing to store the
+        URL until it answers would make it impossible to configure ahead of
+        time. A URL that never answers shows as a failure on the chat instead.
+        """
+        chat = self._repo.get_chat(chat_id)
+        if chat is None or chat.webhook_url == url:
+            return
+        chat.webhook_url = url
+        self._repo.save_chat(chat)
+        self.publish()
+
     # ── snapshots ─────────────────────────────────────────────────────
 
     def refresh_session(self) -> None:

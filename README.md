@@ -74,24 +74,36 @@ off.
 
 ## Deciding what to say
 
-Edit [`wadam/reply.py`](wadam/reply.py). One function, message in, text or
-`None` out:
+You don't — your endpoint does. An incoming message in a switched-on chat is
+POSTed to that chat's webhook, and whatever comes back is sent to the chat.
+What sits behind that URL — a rules engine, a language model, a person with a
+keyboard — is your business and completely invisible here.
 
-```python
-def reply_for(msg: InboundMessage, chat: ChatConfig) -> Optional[str]:
-    if msg.text.strip().lower() == "ping":
-        return "pong"
-    return None
+```json
+{ "event": "message.received",
+  "app":  { "name": "…", "version": "1.0.0" },
+  "chat": { "id": "216298915164281@lid", "name": "Prasanthi Gvpt",
+            "phone": "919100251854", "is_group": false },
+  "message": { "key": "…", "sender": "…", "text": "are you there?",
+               "direction": "in", "media_kind": "", "detected_at": "…" } }
 ```
 
-**Returning `None` is a success, not an error.** It is recorded and never
-retried. Most messages in a live chat do not want an answer, and an endpoint
-forced to invent one for every message will eventually say something stupid.
+Answer with any of these — the endpoint should be as simple as you like:
 
-Everything else — signatures, deduplication, cooldown, loop protection,
-persistence, the send — happens before this is called.
+```
+{"reply": "Confirmed"}   {"message": …}   {"text": …}
+{"data": {"reply": …}}   "Confirmed"      Confirmed
+```
 
----
+**An empty answer is a success, not an error.** `{}`, `204`, or an empty body
+all mean "seen, don't answer" — recorded, never retried. Most messages in a
+live chat do not want an answer.
+
+Retries cover transport failures, 5xx and 429 with backoff. A 4xx is the
+endpoint saying the request itself is wrong, so repeating it verbatim would be
+noise and it fails immediately.
+
+Set `DEFAULT_WEBHOOK` for every chat, or a per-chat URL in the window.
 
 ## The rules a message passes
 
@@ -103,7 +115,9 @@ persistence, the send — happens before this is called.
 3. **Not already handled.** OpenWA retries deliveries it cannot confirm. The
    key is WhatsApp's message id with a unique index, so this survives a restart.
 4. **Automation on for that chat.** The tick box in the window.
-5. **Not in cooldown.** Nothing stops two automated endpoints from answering
+5. **A webhook to call** — the chat's own URL, or `DEFAULT_WEBHOOK`.
+6. **The endpoint answered with something.**
+7. **Not in cooldown.** Nothing stops two automated endpoints from answering
    each other forever, so the loop is bounded.
 
 Everything that fails a rule still answers **200**. A 4xx/5xx tells OpenWA the
@@ -149,13 +163,17 @@ curl -X POST http://127.0.0.1:8766/wam/ -H "Content-Type: application/json" -d "
 
 Off unless `API_PORT` is set, loopback-bound by default (where a token is
 optional; bind it anywhere else and `API_TOKEN` is mandatory — configuration
-refuses to start otherwise). `id` is a chat id, a name, or a phone number.
+refuses to start otherwise). `id` is a chat id, a contact name, or a phone number **with its country
+code**.
 **An identifier matching more than one chat is refused with 409**, never
 delivered to a guess.
 
 Addressing by name is the point: WhatsApp's LID means a chat is
 `216298915164281@lid`, which nobody can remember and which cannot be derived
-from a phone number. wadam keeps the mapping.
+from a phone number. wadam syncs OpenWA's chat list and address book and keeps
+the mapping — so a name reaches anyone in your contacts, not only chats that
+have already spoken. A bare ten-digit number is refused rather than guessed at:
+India and the US both use ten national digits.
 
 To run this on a remote machine and send to it from your own, see
 [DEPLOYMENT.md](docs/DEPLOYMENT.md).
@@ -182,7 +200,7 @@ To run this on a remote machine and send to it from your own, see
 python -m pytest -q
 ```
 
-100 tests, ~4 seconds. Storage tests run twice — against a dict-backed fake and,
+165 tests, ~5 seconds. Storage tests run twice — against a dict-backed fake and,
 when one is reachable, a real `mongod`. Doubles here have been caught lying
 before.
 

@@ -1,30 +1,30 @@
-"""The right-hand panel: a chat, and what has actually been said in it.
+"""The right-hand panel: a chat, where its messages go, and what was said.
 
-Nothing here can be typed into, and that is a change worth stating. The panel
-used to carry one editable field — the contact's phone number — because
-WhatsApp Desktop would not give it up: it shows a saved contact by name and
-exposes the number nowhere readable (measured — zero phone-shaped strings
-across every accessible name in the window). Without a number there was no
-webhook URL, so the choice was one small field or a chat that could never
-forward anything.
+One field can be typed into — the webhook URL — because a per-chat destination
+has to be settable somewhere and this is the only place a chat is looked at on
+its own. Everything else is a read.
 
-OpenWA supplies the identity, so the field has nothing left to do. The webhook
-went the same way: there is one webhook now, registered against the session in
-OpenWA, not a URL derived per chat from a template.
+The phone-number field that used to live here is gone. It existed because
+WhatsApp Desktop would not give a number up: it shows a saved contact by name
+and exposes the number nowhere readable (measured — zero phone-shaped strings
+across every accessible name in the window), and without a number there was no
+webhook URL to build. OpenWA resolves the number itself, so the field has
+nothing left to do.
 
-What replaces them is the thing an operator actually wants when they click a
-chat — the messages, in order, with which ones this application answered.
+The URL is saved as you type, with no button. A save button on a single field
+is a button whose only purpose is to be forgotten.
 """
 
 from __future__ import annotations
 
 from typing import List, Optional
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QScrollArea,
     QVBoxLayout,
     QWidget,
@@ -39,7 +39,11 @@ TRANSCRIPT_LIMIT = 200
 
 
 class ChatDetailsPanel(QWidget):
-    """A chat's name, its identity, and its recent messages. Read-only."""
+    """A chat's name, its identity, its webhook, and its recent messages."""
+
+    #: (chat_id, url) — emitted as it is typed. An empty url means "use the
+    #: global default".
+    webhook_saved = Signal(str, str)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -63,6 +67,20 @@ class ChatDetailsPanel(QWidget):
         self._state = QLabel("")
         self._state.setStyleSheet(f"color: {theme.TEXT_MUTED};")
         layout.addWidget(self._state)
+
+        self._webhook_label = QLabel("Webhook")
+        self._webhook_label.setStyleSheet("font-weight: 600;")
+        layout.addWidget(self._webhook_label)
+
+        self._webhook = QLineEdit()
+        self._webhook.setPlaceholderText("leave empty to use the default webhook")
+        self._webhook.textEdited.connect(self._on_webhook_typed)
+        layout.addWidget(self._webhook)
+
+        self._webhook_state = QLabel("")
+        self._webhook_state.setWordWrap(True)
+        self._webhook_state.setStyleSheet(f"color: {theme.TEXT_MUTED};")
+        layout.addWidget(self._webhook_state)
 
         line = QFrame()
         line.setFrameShape(QFrame.HLine)
@@ -100,10 +118,19 @@ class ChatDetailsPanel(QWidget):
             self._empty.setText("Select a chat to see its messages.")
             self._empty.setVisible(True)
             self._scroll.setVisible(False)
+            self._set_webhook_visible(False)
             return
 
         self._chat_id = chat.chat_id
-        self._name.setText(chat.chat_name or chat.chat_id)
+        self._name.setText(chat.display_name)
+        self._set_webhook_visible(True)
+
+        # Only when the chat changes. Rewriting the field on every snapshot
+        # would overwrite a half-typed URL under the user's cursor — the exact
+        # bug that made the old panel drop a repaint timer.
+        if self._webhook.text() != chat.webhook_url:
+            self._webhook.setText(chat.webhook_url)
+        self._webhook_state.setText(self._webhook_summary(chat))
 
         # The chat id is shown rather than hidden. It is what the send API
         # addresses, what a support question needs, and — for a LID — the only
@@ -135,6 +162,28 @@ class ChatDetailsPanel(QWidget):
 
     def current_chat_id(self) -> str:
         return self._chat_id
+
+    def _set_webhook_visible(self, visible: bool) -> None:
+        for widget in (self._webhook_label, self._webhook, self._webhook_state):
+            widget.setVisible(visible)
+
+    def _on_webhook_typed(self, text: str) -> None:
+        if self._chat_id:
+            self.webhook_saved.emit(self._chat_id, text.strip())
+
+    @staticmethod
+    def _webhook_summary(chat: ChatConfig) -> str:
+        """What the endpoint last said. Shown for failures too — "answered 502
+        three times" is what someone debugging a silent chat needs, and it is
+        invisible if only successes are reported."""
+        if not chat.last_webhook_status:
+            return "not called yet" if chat.automation_enabled else ""
+        parts = [f"last: {chat.last_webhook_status}"]
+        if chat.webhook_retry_count:
+            parts.append(f"after {chat.webhook_retry_count} retries")
+        if chat.last_webhook_response:
+            parts.append(f"— {chat.last_webhook_response[:80]}")
+        return "  ".join(parts)
 
     def _clear_transcript(self) -> None:
         while self._transcript_layout.count() > 1:

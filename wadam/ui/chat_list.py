@@ -52,7 +52,7 @@ def _sort_key(chat: ChatConfig):
     """
     return (
         -(chat.updated_at.timestamp() if chat.updated_at else 0),
-        chat.chat_name.lower(),
+        chat.display_name.lower(),
     )
 
 
@@ -174,8 +174,8 @@ class ChatListPanel(QWidget):
         # Rebuilding an unchanged list would reset the scroll position and
         # flicker the selection every poll, which is worse than useless.
         signature = tuple(
-            (c.chat_id, c.chat_name, c.last_message_preview,
-             c.automation_enabled, bool(c.last_error))
+            (c.chat_id, c.display_name, c.last_message_preview,
+             c.automation_enabled, bool(c.webhook_url), bool(c.last_error))
             for c in visible
         )
         if not force and signature == self._render_signature:
@@ -211,14 +211,22 @@ class ChatListPanel(QWidget):
             return chats
         return [
             c for c in chats
-            if query in c.chat_name.lower() or query in (c.last_message_preview or "").lower()
+            # Searching the number as well as the name: a chat whose WhatsApp
+            # name is stylised unicode cannot be found by typing it, and the
+            # number is the only other thing a person knows about it.
+            if (query in c.display_name.lower()
+                or query in (c.phone_number or "")
+                or query in (c.last_message_preview or "").lower())
         ]
 
     @staticmethod
     def _tooltip_for(chat: ChatConfig) -> str:
-        lines = [chat.chat_name]
+        lines = [chat.display_name]
         lines.append("Automation: " + ("ON" if chat.automation_enabled else "OFF"))
+        if chat.phone_number:
+            lines.append(chat.phone_number)
         lines.append(chat.chat_id)
+        lines.append("Webhook: " + (chat.webhook_url or "the default"))
         if chat.last_error:
             lines.append("Last error: " + chat.last_error)
         lines.append("Messages stored: " + str(chat.messages_stored))

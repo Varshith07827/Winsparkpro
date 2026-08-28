@@ -96,7 +96,7 @@ class ChatItemDelegate(QStyledItemDelegate):
         top = rect.top() + (ROW_HEIGHT - AVATAR_SIZE) // 2
         circle = QRect(rect.left() + PADDING_LEFT, top, AVATAR_SIZE, AVATAR_SIZE)
         painter.setPen(Qt.NoPen)
-        painter.setBrush(QBrush(QColor(theme.avatar_color(chat.chat_name))))
+        painter.setBrush(QBrush(QColor(theme.avatar_color(chat.display_name))))
         painter.drawEllipse(circle)
 
         font = QFont(painter.font())
@@ -104,7 +104,7 @@ class ChatItemDelegate(QStyledItemDelegate):
         font.setWeight(QFont.DemiBold)
         painter.setFont(font)
         painter.setPen(QPen(QColor("#e9edef")))
-        painter.drawText(circle, Qt.AlignCenter, theme.initials(chat.chat_name))
+        painter.drawText(circle, Qt.AlignCenter, theme.initials(chat.display_name))
 
     def _paint_timestamp(self, painter: QPainter, rect: QRect, chat, right_edge: int) -> int:
         """The chat's last activity, as a clock label.
@@ -174,7 +174,7 @@ class ChatItemDelegate(QStyledItemDelegate):
         left = rect.left() + TEXT_LEFT
         width = max(20, right_edge - left)
         painter.setPen(QPen(QColor(theme.TEXT)))
-        elided = metrics.elidedText(chat.chat_name or "(unnamed)", Qt.ElideRight, width)
+        elided = metrics.elidedText(chat.display_name or "(unnamed)", Qt.ElideRight, width)
         painter.drawText(QRect(left, rect.top() + 12, width, metrics.height()),
                          Qt.AlignLeft | Qt.AlignVCenter, elided)
 

@@ -7,7 +7,7 @@ desktop window; those are gone. These are what remain.
 
 ## Text only
 
-`reply_for` returns a string, and `OpenWAClient` sends text. Inbound media
+The webhook's reply is sent as text, and `OpenWAClient` sends text. Inbound media
 arrives with a `media_kind` (`image`, `audio`, `document`, …) and an empty
 `text`, so a rule can *notice* a photo but not read it or answer with one.
 
@@ -31,11 +31,19 @@ databases.
 
 ---
 
+## A ten-digit number is refused
+
+Callers must include the country code. India and the US both use ten national
+digits, so `9100251854` is a real person in either country and expanding it
+would send to whichever the guess landed on. The refusal says so.
+
+---
+
 ## Replies are stateless
 
-`reply_for(msg, chat)` sees one message and its chat. It has no conversation
-history unless it reads it — the repository is not passed in. Anything
-multi-turn has to fetch its own state from MongoDB.
+The payload carries one message and its chat. Your endpoint gets no
+conversation history, so anything multi-turn has to keep its own state — which
+is the right place for it, since only the endpoint knows what state means.
 
 ---
 
@@ -63,7 +71,7 @@ answered.
 
 ## A failed send is not retried
 
-Deliberate. A retry would re-run `reply_for` and could deliver twice, and a
+Deliberate. A retry would call your endpoint again and could deliver twice, and a
 duplicate is worse than a miss. The message is stored as `failed` with the
 reason, and surfaced in the transcript for a person to deal with.
 
@@ -91,7 +99,8 @@ would rate-limit long before this became the bottleneck.
 
 ## No test coverage of the GUI
 
-The pipeline, transport, storage, config and send API are covered — 100 tests.
+The pipeline, transport, storage, config, directory, webhook client and send
+API are covered — 165 tests.
 The PySide6 widgets are not. The previous version's widget tests went with the
 widgets they tested, and their replacements have not been written. Launching
 the window is currently a manual check.
