@@ -16,6 +16,7 @@ import pytest
 
 from wadam.config import Settings
 from wadam.engine.service import AutomationService
+from wadam.engine.webhook import WebhookOutcome
 from wadam.openwa import SendError
 from wadam.storage.json_backup import JsonBackupStore
 from wadam.storage.repository import Repository
@@ -49,22 +50,38 @@ def sign(payload: bytes, secret: str = SECRET) -> str:
     return "sha256=" + hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
 
 
+class FakeWebhook:
+    """The endpoint, stubbed. Answers with `reply`, or fails."""
+
+    def __init__(self, reply="pong", ok=True) -> None:
+        self._reply, self._ok = reply, ok
+        self.calls = []
+
+    def call(self, url, payload, sleep=None):
+        self.calls.append((url, payload))
+        if not self._ok:
+            return WebhookOutcome(False, "502", error="HTTP 502", attempts=1)
+        return WebhookOutcome(True, "200 OK", reply_text=self._reply or "")
+
+
 def build(tmp_path: Path, secret: str = SECRET, reply="pong", client=None):
     settings = Settings(
         mongodb_uri="mongodb://localhost:27017", database_name="test",
         json_backup_folder=tmp_path, json_autosave_interval=0,
         openwa_url="http://localhost:2785", openwa_api_key="k",
         openwa_session_id="s", webhook_secret=secret, cooldown_seconds=0,
+        default_webhook="https://example.test/hook",
     )
     backup = JsonBackupStore(tmp_path, autosave_interval=0)
     backup.ensure_folder()
     repository = Repository(settings, FakeMongo(), backup)
     repository.start()
 
-    service = AutomationService(settings, repository, lambda m, c: reply)
+    service = AutomationService(settings, repository)
     client = client or FakeClient()
-    service._client = client            # noqa: SLF001
-    service._pipeline._client = client  # noqa: SLF001
+    service._client = client                             # noqa: SLF001
+    service._pipeline._client = client                   # noqa: SLF001
+    service._pipeline._webhook = FakeWebhook(reply)      # noqa: SLF001
     return service, repository, client
 
 

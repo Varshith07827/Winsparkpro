@@ -44,10 +44,13 @@ class MetricsSnapshot:
     messages_received: int = 0
     replies_sent: int = 0
     send_failures: int = 0
+    webhook_calls: int = 0
+    webhook_failures: int = 0
     rejected: int = 0
     """Deliveries refused for a bad or missing signature."""
 
     avg_send_ms: float = 0.0
+    avg_webhook_ms: float = 0.0
 
 
 class Metrics:
@@ -62,6 +65,9 @@ class Metrics:
         self._send_failures = 0
         self._rejected = 0
         self._send_ms: deque[float] = deque(maxlen=WINDOW)
+        self._webhook_calls = 0
+        self._webhook_failures = 0
+        self._webhook_ms: deque[float] = deque(maxlen=WINDOW)
 
     def record_delivery(self) -> None:
         with self._lock:
@@ -80,6 +86,14 @@ class Metrics:
             else:
                 self._send_failures += 1
 
+    def record_webhook(self, ok: bool, duration_ms: float = 0.0) -> None:
+        with self._lock:
+            self._webhook_calls += 1
+            if not ok:
+                self._webhook_failures += 1
+            if duration_ms:
+                self._webhook_ms.append(duration_ms)
+
     def record_rejected(self) -> None:
         with self._lock:
             self._rejected += 1
@@ -94,6 +108,9 @@ class Metrics:
                 messages_received=self._received,
                 replies_sent=self._replies,
                 send_failures=self._send_failures,
+                webhook_calls=self._webhook_calls,
+                webhook_failures=self._webhook_failures,
+                avg_webhook_ms=_mean(self._webhook_ms),
                 rejected=self._rejected,
                 avg_send_ms=_mean(self._send_ms),
             )

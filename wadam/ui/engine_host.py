@@ -24,6 +24,7 @@ snapshot and asks the service to change things.
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Optional
 
 from PySide6.QtCore import QObject, QTimer, Signal
@@ -38,20 +39,29 @@ logger = logging.getLogger(__name__)
 #: it is a status light, not a heartbeat, and each tick is an HTTP round trip.
 SESSION_POLL_MS = 10_000
 
+#: How often the chat list and address book are re-read from OpenWA. Slow
+#: because it is expensive — the first pass resolves a phone number per chat at
+#: about a second each — and because chats change on a human timescale.
+DIRECTORY_SYNC_MS = 5 * 60_000
+
 
 class EngineHost(QObject):
     snapshot_ready = Signal(object)
     engine_stopped = Signal(str)  # error text, empty on a clean stop
 
-    def __init__(self, settings: Settings, repository: Repository, reply_fn,
+    def __init__(self, settings: Settings, repository: Repository,
                  parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
         self._settings = settings
         self._repository = repository
-        self.service = AutomationService(settings, repository, reply_fn, self._on_snapshot)
+        self.service = AutomationService(settings, repository, self._on_snapshot)
         self._session_timer = QTimer(self)
         self._session_timer.setInterval(SESSION_POLL_MS)
         self._session_timer.timeout.connect(self._poll_session)
+        self._sync_timer = QTimer(self)
+        self._sync_timer.setInterval(DIRECTORY_SYNC_MS)
+        self._sync_timer.timeout.connect(self.sync_directory)
+        self._syncing = False
 
     def _on_snapshot(self, snapshot: EngineSnapshot) -> None:
         self.snapshot_ready.emit(snapshot)
@@ -70,11 +80,35 @@ class EngineHost(QObject):
             return
         self._poll_session()
         self._session_timer.start()
+        self.sync_directory()
+        self._sync_timer.start()
+
+    def sync_directory(self) -> None:
+        """Refresh chats and contacts on a worker thread.
+
+        Never on the GUI thread: a first sync takes about thirteen seconds
+        against a real account, and a frozen window for that long looks like a
+        crash. Only one runs at a time — the timer could otherwise stack syncs
+        on a slow link until they overlap.
+        """
+        if self._syncing:
+            logger.debug("directory sync already running; skipping this tick")
+            return
+        self._syncing = True
+
+        def run() -> None:
+            try:
+                self.service.sync_directory()
+            finally:
+                self._syncing = False
+
+        threading.Thread(target=run, name="wadam-directory", daemon=True).start()
 
     def _poll_session(self) -> None:
         self.service.refresh_session()
         self.service.publish()
 
     def stop(self, timeout: float = 5.0) -> None:
+        self._sync_timer.stop()
         self._session_timer.stop()
         self.service.stop(timeout=timeout)

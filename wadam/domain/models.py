@@ -26,8 +26,10 @@ timezone; JSON stores them as ISO-8601 strings.
   leave the compose box without ever reaching the conversation. A send is now
   an HTTP call whose response says whether it worked.
 
-`PollState` and `WebhookRecord` went with them: there is no polling loop, and
-no per-chat outbound webhook to keep a delivery record for.
+`PollState` went with them: there is no polling loop. The per-chat webhook did
+NOT go — it is what this application is for — but its call history now lives on
+the chat itself rather than in a separate `webhooks` collection, because the
+only question ever asked of it was "what did this endpoint last say".
 """
 
 from __future__ import annotations
@@ -148,6 +150,15 @@ class ChatConfig:
     last_outgoing_utc: Optional[datetime] = None
     messages_stored: int = 0
     last_error: str = ""
+
+    # --- what the endpoint last said --------------------------------------
+    #: Kept whether the call succeeded or not. "The endpoint answered 502 three
+    #: times" is exactly what someone debugging a silent chat needs, and it is
+    #: invisible if only successes are recorded.
+    last_webhook_status: str = ""
+    last_webhook_response: str = ""
+    last_webhook_utc: Optional[datetime] = None
+    webhook_retry_count: int = 0
 
     created_at: datetime = field(default_factory=utcnow)
     updated_at: datetime = field(default_factory=utcnow)

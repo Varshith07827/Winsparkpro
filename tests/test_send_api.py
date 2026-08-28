@@ -45,7 +45,7 @@ def host(tmp_path: Path):
     repository = Repository(settings, FakeMongo(), backup)
     repository.start()
 
-    service = AutomationService(settings, repository, lambda m, c: None)
+    service = AutomationService(settings, repository)
     client = FakeClient()
     service._client = client          # noqa: SLF001 - swapping the transport is the point
     service._pipeline._client = client  # noqa: SLF001
@@ -121,6 +121,18 @@ def test_an_unknown_name_is_refused(host):
 
     assert response.status == 404
     assert response.payload["code"] == "unknown_chat"
+    assert client.sent == []
+
+
+def test_a_number_without_a_country_code_is_refused_with_an_explanation(host):
+    """India and the US both use ten national digits. Guessing between +91 and
+    +1 would send to a real person who is not the intended one."""
+    api, _, client = host
+
+    response = api._send("9100251854", "hello")  # noqa: SLF001
+
+    assert response.status == 404
+    assert "country code" in response.payload["error"]
     assert client.sent == []
 
 

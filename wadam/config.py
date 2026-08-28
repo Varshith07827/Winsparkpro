@@ -127,6 +127,16 @@ class Settings:
     #: come from OpenWA. Required whenever `webhook_host` is not loopback.
     webhook_secret: str = ""
 
+    # --- the outbound webhook ---------------------------------------------
+    #: Given to a chat that has no URL of its own. Without it, and without a
+    #: per-chat URL, an incoming message is stored and nothing is dispatched.
+    default_webhook: str = ""
+    #: Sent as `Authorization: Bearer …` to the endpoint.
+    webhook_api_key: str = ""
+    webhook_timeout: float = 20.0
+    #: Retries cover transport failures, 5xx and 429. A 4xx fails immediately.
+    webhook_max_retries: int = 3
+
     #: Per-chat quiet period. Bounds an automation-answering-automation loop.
     cooldown_seconds: float = 60.0
     #: Answer group chats. Off by default: a bot in a group is louder than a
@@ -160,6 +170,10 @@ class Settings:
             "webhook_host": self.webhook_host,
             "webhook_port": self.webhook_port,
             "webhook_secret": "***" if self.webhook_secret else "",
+            "default_webhook": self.default_webhook,
+            "webhook_api_key": "***" if self.webhook_api_key else "",
+            "webhook_timeout": self.webhook_timeout,
+            "webhook_max_retries": self.webhook_max_retries,
             "cooldown_seconds": self.cooldown_seconds,
             "answer_groups": self.answer_groups,
             "log_level": self.log_level,
@@ -245,6 +259,7 @@ def load_settings(env_path: Optional[Path] = None) -> Settings:
         "MONGODB_URI", "DATABASE_NAME",
         "JSON_BACKUP_FOLDER", "JSON_AUTOSAVE_INTERVAL",
         "OPENWA_URL", "OPENWA_API_KEY", "OPENWA_SESSION_ID",
+        "DEFAULT_WEBHOOK", "WEBHOOK_API_KEY", "WEBHOOK_TIMEOUT", "WEBHOOK_MAX_RETRIES",
         "WEBHOOK_HOST", "WEBHOOK_PORT", "WEBHOOK_SECRET",
         "COOLDOWN_SECONDS", "ANSWER_GROUPS", "LOG_LEVEL",
         "API_HOST", "API_PORT", "API_TOKEN", "API_SEND_TIMEOUT",
@@ -346,6 +361,12 @@ def load_settings(env_path: Optional[Path] = None) -> Settings:
             f"it is the only proof a delivery really came from OpenWA."
         )
 
+    default_webhook = (values.get("DEFAULT_WEBHOOK") or "").strip()
+    if default_webhook and not default_webhook.startswith(("http://", "https://")):
+        problems.append("DEFAULT_WEBHOOK must be an http:// or https:// URL.")
+    webhook_timeout = _as_float(values, "WEBHOOK_TIMEOUT", 20.0, problems, minimum=1.0)
+    webhook_max_retries = _as_int(values, "WEBHOOK_MAX_RETRIES", 3, problems, minimum=0)
+
     cooldown_seconds = _as_float(values, "COOLDOWN_SECONDS", 60.0, problems, minimum=0.0)
     answer_groups = (values.get("ANSWER_GROUPS") or "").strip().lower() in _TRUE_VALUES
 
@@ -399,6 +420,10 @@ def load_settings(env_path: Optional[Path] = None) -> Settings:
         webhook_host=webhook_host,
         webhook_port=webhook_port,
         webhook_secret=webhook_secret,
+        default_webhook=default_webhook,
+        webhook_api_key=(values.get("WEBHOOK_API_KEY") or "").strip(),
+        webhook_timeout=webhook_timeout,
+        webhook_max_retries=webhook_max_retries,
         cooldown_seconds=cooldown_seconds,
         answer_groups=answer_groups,
         log_level=log_level,

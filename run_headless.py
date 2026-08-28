@@ -17,7 +17,6 @@ from wadam.api.host import SendApiHost
 from wadam.config import ConfigError, load_settings
 from wadam.engine.service import AutomationService
 from wadam.logging_setup import configure_logging
-from wadam.reply import reply_for
 from wadam.storage.json_backup import JsonBackupStore
 from wadam.storage.mongo import MongoStore
 from wadam.storage.repository import Repository
@@ -42,9 +41,11 @@ def main() -> int:
     repository = Repository(settings, mongo, backup)
     repository.start()
 
-    service = AutomationService(settings, repository, reply_for)
+    service = AutomationService(settings, repository)
     service.start()
     service.refresh_session()
+    log.info("syncing the directory from OpenWA…")
+    log.info("directory: %s", service.sync_directory())
     snapshot = service.snapshot()
     log.info("session %s · mongo %s · %d chat(s)",
              snapshot.session_status, snapshot.mongo_status, len(snapshot.chats))

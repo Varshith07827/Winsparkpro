@@ -26,9 +26,11 @@ from typing import Callable, List, Optional
 
 from wadam.config import Settings
 from wadam.domain.models import ChatConfig
+from wadam.engine.directory import Directory
 from wadam.engine.guards import Cooldown
 from wadam.engine.metrics import Metrics, MetricsSnapshot
 from wadam.engine.pipeline import MessagePipeline, Outcome
+from wadam.engine.webhook import WebhookClient
 from wadam.openwa import OpenWAClient, inbound
 from wadam.storage.repository import Repository
 
@@ -45,6 +47,7 @@ class EngineSnapshot:
     ask the repository a question mid-paint."""
 
     chats: List[ChatConfig] = field(default_factory=list)
+    contact_count: int = 0
     listening: bool = False
     listen_address: str = ""
     session_status: str = "unknown"
@@ -61,7 +64,7 @@ class AutomationService:
     """Owns the listener, the pipeline, and the snapshot the UI subscribes to."""
 
     def __init__(self, settings: Settings, repository: Repository,
-                 reply_fn, on_snapshot: Optional[Callable[[EngineSnapshot], None]] = None) -> None:
+                 on_snapshot: Optional[Callable[[EngineSnapshot], None]] = None) -> None:
         self._settings = settings
         self._repo = repository
         self._on_snapshot = on_snapshot
@@ -72,11 +75,17 @@ class AutomationService:
         self._pipeline = MessagePipeline(
             repository=repository,
             client=self._client,
-            reply_fn=reply_fn,
+            webhook=WebhookClient(
+                timeout=settings.webhook_timeout,
+                max_retries=settings.webhook_max_retries,
+                api_key=settings.webhook_api_key,
+            ),
             cooldown=Cooldown(settings.cooldown_seconds),
             metrics=self._metrics,
             answer_groups=settings.answer_groups,
+            default_webhook=settings.default_webhook,
         )
+        self.directory = Directory(repository, self._client)
         self._server: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
         self._session: dict = {}
@@ -150,11 +159,22 @@ class AutomationService:
         """Ask OpenWA how the session is. Called on a timer by the UI."""
         self._session = self._client.session_status()
 
+    def sync_directory(self) -> dict:
+        """Pull the chat list and address book from OpenWA.
+
+        Slow — a first run resolves a phone number per chat at roughly a second
+        each — so callers run it off the GUI thread.
+        """
+        summary = self.directory.sync()
+        self.publish()
+        return summary
+
     def snapshot(self) -> EngineSnapshot:
         status = self._repo.status()
         session_status = str(self._session.get("status") or "unknown")
         return EngineSnapshot(
             chats=self._repo.list_chats(),
+            contact_count=self._repo.contact_count(),
             listening=self.running,
             listen_address=self.listen_address,
             session_status=session_status,

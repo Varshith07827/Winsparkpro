@@ -32,7 +32,6 @@ from wadam.storage.json_backup import JsonBackupStore
 from wadam.storage.mongo import MongoStore, MongoUnavailableError
 from wadam.storage.repository import Repository
 from wadam.ui import theme
-from wadam.reply import reply_for
 from wadam.ui.engine_host import EngineHost
 from wadam.ui.main_window import MainWindow
 from wadam.ui.first_run import START, FirstRunDialog, needs_setup
@@ -146,7 +145,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     if startup.warnings:
         StartupWarningDialog(startup.warnings).exec()
 
-    host = EngineHost(settings, repository, reply_for)
+    host = EngineHost(settings, repository)
     api = SendApiHost(settings, repository, host.service)
     window = MainWindow(settings, repository, host, api)
 

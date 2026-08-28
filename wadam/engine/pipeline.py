@@ -27,20 +27,14 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Optional
 
 from wadam.domain.models import ChatConfig, MessageStatus, StoredMessage, utcnow
 from wadam.engine.guards import Cooldown
+from wadam.engine.webhook import WebhookClient, build_payload
 from wadam.openwa import InboundMessage, OpenWAClient, SendError
 
 logger = logging.getLogger(__name__)
-
-#: Decides the reply. Returns the text to send, or None to stay silent.
-#: Silence is a successful outcome, not an error — most messages in a live chat
-#: do not want an answer, and an endpoint forced to invent one for every message
-#: will eventually say something stupid.
-ReplyFn = Callable[[InboundMessage, ChatConfig], Optional[str]]
-
 
 @dataclass
 class Outcome:
@@ -66,14 +60,16 @@ class Outcome:
 class MessagePipeline:
     """Turns a delivered message into a stored record and, sometimes, a reply."""
 
-    def __init__(self, repository, client: OpenWAClient, reply_fn: ReplyFn,
-                 cooldown: Cooldown, metrics=None, answer_groups: bool = False) -> None:
+    def __init__(self, repository, client: OpenWAClient, webhook: WebhookClient,
+                 cooldown: Cooldown, metrics=None, answer_groups: bool = False,
+                 default_webhook: str = "") -> None:
         self._repo = repository
         self._client = client
-        self._reply_fn = reply_fn
+        self._webhook = webhook
         self._cooldown = cooldown
         self._metrics = metrics
         self._answer_groups = answer_groups
+        self._default_webhook = default_webhook
 
     def process(self, msg: InboundMessage) -> Outcome:
         """Handle one inbound message. Never raises."""
@@ -101,18 +97,26 @@ class MessagePipeline:
             self._finish(stored, MessageStatus.COLLECTED)
             return Outcome("skipped", "group chat", msg.chat_id)
 
-        try:
-            answer = self._reply_fn(msg, chat)
-        except Exception:
-            # A bug in the reply function must not take the service down, and
-            # must not be retried into a loop of the same exception.
-            logger.exception("reply function raised on message %s", msg.message_id)
-            self._finish(stored, MessageStatus.FAILED, error="reply function raised")
-            return Outcome("ignored", "reply function raised", msg.chat_id)
-
-        if not answer or not answer.strip():
+        url = chat.webhook_url or self._default_webhook
+        if not url:
             self._finish(stored, MessageStatus.COLLECTED)
-            return Outcome("skipped", "no reply wanted", msg.chat_id)
+            return Outcome("skipped", "no webhook configured for this chat", msg.chat_id)
+
+        outcome = self._webhook.call(url, build_payload(chat, stored))
+        self._record_call(chat, stored, outcome)
+
+        if not outcome.ok:
+            logger.warning("webhook for %s failed: %s", chat.chat_name, outcome.error)
+            self._finish(stored, MessageStatus.FAILED, error=outcome.error)
+            return Outcome("webhook_failed", outcome.error, msg.chat_id)
+
+        answer = outcome.reply_text
+        if not answer:
+            # "Seen, don't answer" is a successful outcome. Most messages in a
+            # live chat do not want an answer, and an endpoint forced to invent
+            # one for every message will eventually say something stupid.
+            self._finish(stored, MessageStatus.COLLECTED)
+            return Outcome("skipped", "endpoint sent no reply", msg.chat_id)
 
         # Asked last, and only for a message actually about to be answered: a
         # cooldown consumed by a message the reply function ignored would
@@ -211,6 +215,22 @@ class MessagePipeline:
         ))
         chat.last_message_preview = text
         self._repo.save_chat(chat)
+
+    def _record_call(self, chat: ChatConfig, stored: StoredMessage, outcome) -> None:
+        """Keep what the endpoint said, on the chat and on the message.
+
+        Written whether the call succeeded or not: "the endpoint answered 502
+        three times" is exactly what someone debugging a silent chat needs, and
+        it is invisible if only successes are kept.
+        """
+        chat.last_webhook_status = outcome.status_text
+        chat.last_webhook_response = (outcome.reply_text or outcome.body or outcome.error)[:1000]
+        chat.last_webhook_utc = utcnow()
+        chat.webhook_retry_count = max(0, outcome.attempts - 1)
+        chat.last_error = "" if outcome.ok else f"webhook: {outcome.error}"
+        self._repo.save_chat(chat)
+        if self._metrics:
+            self._metrics.record_webhook(outcome.ok, outcome.duration_ms)
 
     def _finish(self, stored: StoredMessage, status: str, error: str = "") -> None:
         stored.status = status

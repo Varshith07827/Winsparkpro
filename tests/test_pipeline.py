@@ -16,6 +16,7 @@ from wadam.config import Settings
 from wadam.domain.models import ChatConfig, MessageStatus
 from wadam.engine.guards import Cooldown
 from wadam.engine.pipeline import MessagePipeline
+from wadam.engine.webhook import WebhookOutcome
 from wadam.openwa import InboundMessage, SendError
 from wadam.storage.json_backup import JsonBackupStore
 from wadam.storage.repository import Repository
@@ -66,15 +67,35 @@ def repo(tmp_path: Path):
     repository.stop()
 
 
-def build(repo, reply="pong", cooldown=60.0, answer_groups=False, client=None):
+class FakeWebhook:
+    """Stands in for the endpoint. Records what it was asked, answers to order."""
+
+    def __init__(self, reply="pong", ok=True, error="") -> None:
+        self._reply = reply
+        self._ok = ok
+        self._error = error
+        self.calls: list[tuple[str, dict]] = []
+
+    def call(self, url, payload, sleep=None):
+        self.calls.append((url, payload))
+        if not self._ok:
+            return WebhookOutcome(False, "502", error=self._error or "HTTP 502", attempts=4)
+        return WebhookOutcome(True, "200 OK", reply_text=self._reply or "", attempts=1)
+
+
+def build(repo, reply="pong", cooldown=60.0, answer_groups=False, client=None,
+          webhook=None, default_webhook="https://example.test/hook"):
     client = client or FakeClient()
+    webhook = webhook or FakeWebhook(reply)
     pipeline = MessagePipeline(
         repository=repo,
         client=client,
-        reply_fn=(reply if callable(reply) else (lambda m, c: reply)),
+        webhook=webhook,
         cooldown=Cooldown(cooldown),
         answer_groups=answer_groups,
+        default_webhook=default_webhook,
     )
+    pipeline.webhook = webhook          # for assertions
     return pipeline, client
 
 
@@ -260,8 +281,13 @@ def test_a_zero_cooldown_disables_it(repo):
 def test_an_ignored_message_does_not_consume_the_cooldown(repo):
     """A message the reply function stayed silent on must not silence the next
     one that mattered."""
-    answers = {"speak": "here", "quiet": None}
-    pipeline, client = build(repo, reply=lambda m, c: answers.get(m.text))
+    class Selective(FakeWebhook):
+        def call(self, url, payload, sleep=None):
+            text = payload["message"]["text"]
+            return WebhookOutcome(True, "200 OK",
+                                  reply_text="here" if text == "speak" else "")
+
+    pipeline, client = build(repo, webhook=Selective())
     pipeline.process(message(message_id="m0"))
     enable(repo)
 
@@ -276,14 +302,14 @@ def test_an_ignored_message_does_not_consume_the_cooldown(repo):
 
 
 def test_no_reply_wanted_is_a_success(repo):
-    pipeline, client = build(repo, reply=None)
+    pipeline, client = build(repo, reply="")
     pipeline.process(message(message_id="m0"))
     enable(repo)
 
     outcome = pipeline.process(message("anything", message_id="m1"))
 
     assert outcome.ok is True
-    assert outcome.reason == "no reply wanted"
+    assert outcome.reason == "endpoint sent no reply"
     assert client.sent == []
     assert repo.messages_for(CHAT_ID)[-1].status == MessageStatus.COLLECTED
 
@@ -302,18 +328,63 @@ def test_a_failed_send_is_recorded_against_the_message(repo):
     assert failed and "engine not ready" in failed[0].error
 
 
-def test_a_raising_reply_function_does_not_escape(repo):
-    def boom(msg, chat):
-        raise ValueError("bad rule")
-
-    pipeline, client = build(repo, reply=boom)
+def test_a_failing_endpoint_is_recorded_and_nothing_is_sent(repo):
+    pipeline, client = build(repo, webhook=FakeWebhook(ok=False, error="HTTP 502"))
     pipeline.process(message(message_id="m0"))
     enable(repo)
 
     outcome = pipeline.process(message("ping", message_id="m1"))
 
-    assert outcome.action == "ignored"
+    assert outcome.action == "webhook_failed"
     assert client.sent == []
+    chat = repo.get_chat(CHAT_ID)
+    assert chat.last_webhook_status == "502"
+    assert "502" in chat.last_error
+
+
+def test_a_chat_with_no_webhook_and_no_default_is_skipped(repo):
+    pipeline, client = build(repo, default_webhook="")
+    pipeline.process(message(message_id="m0"))
+    enable(repo)
+
+    outcome = pipeline.process(message("ping", message_id="m1"))
+
+    assert outcome.reason == "no webhook configured for this chat"
+    assert client.sent == []
+
+
+def test_a_per_chat_url_wins_over_the_default(repo):
+    pipeline, _ = build(repo, default_webhook="https://default.test/hook")
+    pipeline.process(message(message_id="m0"))
+    chat = repo.get_chat(CHAT_ID)
+    chat.automation_enabled = True
+    chat.webhook_url = "https://this-chat.test/hook"
+    repo.save_chat(chat)
+
+    pipeline.process(message("ping", message_id="m1"))
+
+    assert pipeline.webhook.calls[0][0] == "https://this-chat.test/hook"
+
+
+def test_the_payload_carries_the_chat_and_the_message(repo):
+    """winSpark's envelope. An endpoint written against it still works."""
+    pipeline, _ = build(repo)
+    pipeline.process(message(message_id="m0"))
+    chat = repo.get_chat(CHAT_ID)
+    chat.automation_enabled = True
+    chat.contact_name = "Prasanthi Gvpt"
+    chat.phone_number = "919100251854"
+    repo.save_chat(chat)
+
+    pipeline.process(message("are you there?", message_id="m1"))
+
+    _, payload = pipeline.webhook.calls[0]
+    assert payload["event"] == "message.received"
+    assert payload["chat"]["id"] == CHAT_ID
+    assert payload["chat"]["name"] == "Prasanthi Gvpt"
+    assert payload["chat"]["phone"] == "919100251854"
+    assert payload["message"]["text"] == "are you there?"
+    assert payload["message"]["key"] == "m1"
 
 
 def test_media_arrives_with_its_kind_and_no_text(repo):
