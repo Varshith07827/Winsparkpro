@@ -64,22 +64,22 @@ def add(repo, chat_id: str, name: str, phone: str = ""):
 
 def test_an_exact_chat_id_is_used_as_is(host):
     api, repo, client = host
-    add(repo, "216298915164281@lid", "Alice")
+    add(repo, "111111111111111@lid", "Alice")
 
-    response = api._send("216298915164281@lid", "hello")  # noqa: SLF001
+    response = api._send("111111111111111@lid", "hello")  # noqa: SLF001
 
     assert response.status == 200
-    assert client.sent == [("216298915164281@lid", "hello")]
+    assert client.sent == [("111111111111111@lid", "hello")]
 
 
 def test_a_chat_name_resolves(host):
     api, repo, client = host
-    add(repo, "216298915164281@lid", "Alice")
+    add(repo, "111111111111111@lid", "Alice")
 
     response = api._send("Alice", "hello")  # noqa: SLF001
 
     assert response.status == 200
-    assert client.sent[0][0] == "216298915164281@lid"
+    assert client.sent[0][0] == "111111111111111@lid"
 
 
 def test_a_name_matches_regardless_of_case(host):
@@ -91,12 +91,12 @@ def test_a_name_matches_regardless_of_case(host):
 
 def test_a_phone_number_resolves(host):
     api, repo, client = host
-    add(repo, "918985370703@c.us", "Alice", phone="918985370703")
+    add(repo, "919876500000@c.us", "Alice", phone="919876500000")
 
-    response = api._send("918985370703", "hello")  # noqa: SLF001
+    response = api._send("919876500000", "hello")  # noqa: SLF001
 
     assert response.status == 200
-    assert client.sent[0][0] == "918985370703@c.us"
+    assert client.sent[0][0] == "919876500000@c.us"
 
 
 def test_an_ambiguous_identifier_is_refused_not_guessed(host):
@@ -141,10 +141,10 @@ def test_an_unseen_chat_id_is_still_deliverable(host):
     real chat; refusing would make the API useless for starting one."""
     api, repo, client = host
 
-    response = api._send("918985370703@c.us", "hello")  # noqa: SLF001
+    response = api._send("919876500000@c.us", "hello")  # noqa: SLF001
 
     assert response.status == 200
-    assert client.sent == [("918985370703@c.us", "hello")]
+    assert client.sent == [("919876500000@c.us", "hello")]
 
 
 # ── outcomes ──────────────────────────────────────────────────────────
@@ -152,11 +152,11 @@ def test_an_unseen_chat_id_is_still_deliverable(host):
 
 def test_a_sent_message_is_recorded_in_the_chats_history(host):
     api, repo, client = host
-    add(repo, "216298915164281@lid", "Alice")
+    add(repo, "111111111111111@lid", "Alice")
 
     api._send("Alice", "from the api")  # noqa: SLF001
 
-    stored = repo.messages_for("216298915164281@lid")
+    stored = repo.messages_for("111111111111111@lid")
     assert [(m.direction, m.origin, m.text) for m in stored] == [("out", "api", "from the api")]
 
 
@@ -164,7 +164,7 @@ def test_a_failed_send_reports_502(host, tmp_path: Path):
     api, repo, _ = host
     failing = FakeClient(fail_with="engine not ready")
     api._service._client = failing  # noqa: SLF001
-    add(repo, "216298915164281@lid", "Alice")
+    add(repo, "111111111111111@lid", "Alice")
 
     response = api._send("Alice", "hello")  # noqa: SLF001
 

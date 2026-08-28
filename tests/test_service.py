@@ -23,7 +23,7 @@ from wadam.storage.repository import Repository
 from tests.fakes import FakeMongo
 
 SECRET = "test-secret-at-least-16-chars"
-CHAT_ID = "216298915164281@lid"
+CHAT_ID = "111111111111111@lid"
 
 
 class FakeClient:

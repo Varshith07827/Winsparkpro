@@ -149,7 +149,7 @@ the old code made when it refused to retry an unverified send.
 ## Chat identity
 
 WhatsApp's LID addressing means a chat is identified as
-`216298915164281@lid`, and that is **not derivable from a phone number**.
+`111111111111111@lid`, and that is **not derivable from a phone number**.
 
 The chat id that arrived is the chat id a reply goes to, verbatim. Nothing in
 this codebase composes one from digits. `phone_from_chat_id` returns a number

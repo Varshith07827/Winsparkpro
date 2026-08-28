@@ -14,7 +14,7 @@ from wadam.openwa import OpenWAClient, SendError, inbound
 SECRET = "test-secret-at-least-16-chars"
 
 
-def body_for(text: str = "hi", chat_id: str = "216298915164281@lid",
+def body_for(text: str = "hi", chat_id: str = "111111111111111@lid",
              direction: str = "incoming", message_id: str = "m1") -> bytes:
     return json.dumps({
         "event": "message.received",
@@ -23,7 +23,7 @@ def body_for(text: str = "hi", chat_id: str = "216298915164281@lid",
         "data": {
             "waMessageId": message_id,
             "chatId": chat_id,
-            "from": "259094657142792@lid",
+            "from": "333333333333333@lid",
             "body": text,
             "type": "text",
             "direction": direction,
@@ -72,7 +72,7 @@ def test_a_message_is_read_out_of_a_delivery():
     msg = inbound.parse_delivery(json.loads(body_for("hello")))
 
     assert msg is not None
-    assert msg.chat_id == "216298915164281@lid"
+    assert msg.chat_id == "111111111111111@lid"
     assert msg.text == "hello"
     assert msg.message_id == "m1"
     assert msg.is_outgoing is False
@@ -111,7 +111,7 @@ def test_field_names_are_read_from_whichever_key_is_present():
 def test_the_push_name_is_read_from_the_nested_contact():
     """OpenWA sets `incoming.contact = { pushName }` rather than putting it at
     the top level. Reading only the top level named every chat after its raw
-    identifier — `216298915164281@lid` in the list instead of a person."""
+    identifier — `111111111111111@lid` in the list instead of a person."""
     payload = json.loads(body_for())
     payload["data"]["contact"] = {"pushName": "Alice"}
 
@@ -127,14 +127,14 @@ def test_a_top_level_name_still_wins():
 
 
 def test_a_nameless_delivery_falls_back_to_the_chat_id():
-    assert inbound.parse_delivery(json.loads(body_for())).chat_name == "216298915164281@lid"
+    assert inbound.parse_delivery(json.loads(body_for())).chat_name == "111111111111111@lid"
 
 
 def test_a_contact_that_is_not_an_object_is_survived():
     payload = json.loads(body_for())
     payload["data"]["contact"] = "not an object"
 
-    assert inbound.parse_delivery(payload).chat_name == "216298915164281@lid"
+    assert inbound.parse_delivery(payload).chat_name == "111111111111111@lid"
 
 
 def test_a_payload_with_no_chat_yields_nothing():
@@ -159,13 +159,13 @@ def test_a_text_type_is_not_reported_as_media():
 
 
 def test_a_phone_number_is_read_from_a_c_us_chat_id():
-    assert phone_from_chat_id("918985370703@c.us") == "918985370703"
+    assert phone_from_chat_id("919876500000@c.us") == "919876500000"
 
 
 def test_a_lid_yields_no_phone_number():
     """A LID is opaque. Reading it as a number would display a plausible-looking
     number belonging to nobody."""
-    assert phone_from_chat_id("216298915164281@lid") == ""
+    assert phone_from_chat_id("111111111111111@lid") == ""
 
 
 def test_a_group_id_yields_no_phone_number():

@@ -22,7 +22,7 @@ from wadam.storage.json_backup import JsonBackupStore
 from wadam.storage.repository import Repository
 from tests.fakes import FakeMongo
 
-CHAT_ID = "216298915164281@lid"
+CHAT_ID = "111111111111111@lid"
 
 
 class FakeClient:
@@ -47,7 +47,7 @@ def message(text: str = "hi", chat_id: str = CHAT_ID, message_id: str = "m1",
         chat_name="Alice",
         message_id=message_id,
         text=text,
-        sender="259094657142792@lid",
+        sender="333333333333333@lid",
         media_kind=media_kind,
         is_group=group,
         is_outgoing=outgoing,
@@ -372,8 +372,8 @@ def test_the_payload_carries_the_chat_and_the_message(repo):
     pipeline.process(message(message_id="m0"))
     chat = repo.get_chat(CHAT_ID)
     chat.automation_enabled = True
-    chat.contact_name = "Prasanthi Gvpt"
-    chat.phone_number = "919100251854"
+    chat.contact_name = "Priya Menon"
+    chat.phone_number = "919876543210"
     repo.save_chat(chat)
 
     pipeline.process(message("are you there?", message_id="m1"))
@@ -381,8 +381,8 @@ def test_the_payload_carries_the_chat_and_the_message(repo):
     _, payload = pipeline.webhook.calls[0]
     assert payload["event"] == "message.received"
     assert payload["chat"]["id"] == CHAT_ID
-    assert payload["chat"]["name"] == "Prasanthi Gvpt"
-    assert payload["chat"]["phone"] == "919100251854"
+    assert payload["chat"]["name"] == "Priya Menon"
+    assert payload["chat"]["phone"] == "919876543210"
     assert payload["message"]["text"] == "are you there?"
     assert payload["message"]["key"] == "m1"
 

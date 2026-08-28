@@ -82,8 +82,8 @@ keyboard — is your business and completely invisible here.
 ```json
 { "event": "message.received",
   "app":  { "name": "…", "version": "1.0.0" },
-  "chat": { "id": "216298915164281@lid", "name": "Prasanthi Gvpt",
-            "phone": "919100251854", "is_group": false },
+  "chat": { "id": "111111111111111@lid", "name": "Priya Menon",
+            "phone": "919876543210", "is_group": false },
   "message": { "key": "…", "sender": "…", "text": "are you there?",
                "direction": "in", "media_kind": "", "detected_at": "…" } }
 ```
@@ -134,7 +134,7 @@ it had *already* delivered, and a retrying client would have sent four copies.
 ## Chat ids are echoed, never rebuilt
 
 WhatsApp's newer LID addressing means a chat is identified as
-`216298915164281@lid`, and that is **not derivable from a phone number**.
+`111111111111111@lid`, and that is **not derivable from a phone number**.
 Composing one from digits is sending to a guess. The id that arrived is the id
 a reply goes to, verbatim — the same reason the send API refuses an ambiguous
 identifier with a 409 rather than picking a chat.
@@ -169,7 +169,7 @@ code**.
 delivered to a guess.
 
 Addressing by name is the point: WhatsApp's LID means a chat is
-`216298915164281@lid`, which nobody can remember and which cannot be derived
+`111111111111111@lid`, which nobody can remember and which cannot be derived
 from a phone number. wadam syncs OpenWA's chat list and address book and keeps
 the mapping — so a name reaches anyone in your contacts, not only chats that
 have already spoken. A bare ten-digit number is refused rather than guessed at:

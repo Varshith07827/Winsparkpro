@@ -53,8 +53,8 @@ def test_the_first_present_key_wins():
 
 
 def test_the_payload_is_winsparks_envelope():
-    chat = ChatConfig(chat_id="216298915164281@lid", contact_name="Prasanthi Gvpt",
-                      phone_number="919100251854", is_group=False)
+    chat = ChatConfig(chat_id="111111111111111@lid", contact_name="Priya Menon",
+                      phone_number="919876543210", is_group=False)
     message = StoredMessage(message_key="m1", sender="someone", text="hello",
                             direction="in", media_kind="")
 
@@ -63,17 +63,17 @@ def test_the_payload_is_winsparks_envelope():
     assert payload["event"] == "message.received"
     assert set(payload) == {"event", "app", "chat", "message"}
     assert payload["chat"] == {
-        "id": "216298915164281@lid", "name": "Prasanthi Gvpt",
-        "phone": "919100251854", "is_group": False,
+        "id": "111111111111111@lid", "name": "Priya Menon",
+        "phone": "919876543210", "is_group": False,
     }
     assert payload["message"]["text"] == "hello"
     assert payload["message"]["key"] == "m1"
 
 
 def test_the_chat_name_falls_back_when_there_is_no_contact():
-    chat = ChatConfig(chat_id="x@lid", chat_name="+91 89853 70703")
+    chat = ChatConfig(chat_id="x@lid", chat_name="+91 98765 00000")
     payload = build_payload(chat, StoredMessage())
-    assert payload["chat"]["name"] == "+91 89853 70703"
+    assert payload["chat"]["name"] == "+91 98765 00000"
 
 
 # ── retrying, and not ─────────────────────────────────────────────────

@@ -110,7 +110,7 @@ def parse_delivery(payload: Mapping[str, Any]) -> Optional[InboundMessage]:
     # OpenWA carries the sender's push name nested under `contact`, not at the
     # top level (`message-mapper.ts` sets `incoming.contact = { pushName }`).
     # Reading only the top level left every chat named after its raw
-    # identifier — `216298915164281@lid` in the list instead of a person.
+    # identifier — `111111111111111@lid` in the list instead of a person.
     contact = source.get("contact") if isinstance(source.get("contact"), Mapping) else {}
     chat_name = (_first(source, _NAME_KEYS) or _first(data, _NAME_KEYS)
                  or _first(contact, _NAME_KEYS) or "")

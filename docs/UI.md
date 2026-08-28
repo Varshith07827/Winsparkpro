@@ -4,26 +4,31 @@
 ┌───────────────────────────────┬──────────────────────────────────────┐
 │ search                        │ V                                    │
 │───────────────────────────────├──────────────────────────────────────┤
-│ ☑ V            pong        2  │ 216298915164281@lid                  │
+│ ☑ V            pong        2  │ 111111111111111@lid                  │
 │ ☐ Team chat    Are you…       │ automation on                        │
 │ ☑ Bob          Send the file  │──────────────────────────────────────│
 │                               │  ← ping                       9:21   │
 │                               │  → pong                       9:21   │
 ├───────────────────────────────┴──────────────────────────────────────┤
-│ session ready · 918985370703 · 12 delivered · 4 replied · MongoDB ·  │
+│ session ready · 919876500000 · 12 delivered · 4 replied · MongoDB ·  │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-**The tick box is the only control.** Everything else is a read of what
-happened.
+**Two things can be changed here** — a chat's tick box and its webhook URL.
+Everything else is a read of what happened.
 
 ---
 
 ## The chat list
 
-Chats appear on their own, the first time a message arrives from them. There is
-no "add chat" step and no manual refresh — the list repaints the moment a
-delivery lands.
+Every chat OpenWA can see appears here. The list is synced from OpenWA at
+startup and every five minutes, and repaints the moment a message arrives, so
+there is no "add chat" step and no refresh button.
+
+Rows are named the way you would type them: the address-book name first, then
+WhatsApp's own chat name, then the number, then the raw id. That order matters
+on real data — a chat whose WhatsApp name is stylised unicode renders fine and
+cannot be typed, so the contact name has to win.
 
 A new chat arrives with its box **unticked**. Tick it and the chat starts being
 answered; untick it and it stops. That is immediate and silent in both
@@ -36,7 +41,9 @@ nothing could restore. Turning automation off should stop replies, not destroy
 the history you turned it off in order to read, so both the deletion and the
 dialog guarding it are gone.
 
-Search filters by name.
+Search matches the name, the number and the last message. The number is
+included deliberately: for a chat named in unicode art, it is the only thing a
+person can actually type.
 
 ---
 
@@ -44,7 +51,7 @@ Search filters by name.
 
 Click a chat to see:
 
-- **Its name**, from the sender's push name.
+- **Its name**, from the address book where there is one.
 - **Its identity** — the chat id, and a phone number when there genuinely is
   one. A `@lid` chat has no derivable number, so only the id is shown. This is
   deliberate: a plausible-looking number that belongs to nobody is worse than
@@ -54,16 +61,18 @@ Click a chat to see:
 - **The transcript** — the last 200 messages, `←` in and `→` out. A failed send
   is the one thing coloured.
 
-Nothing on this panel can be typed into. It used to carry two editable fields:
+- **Its webhook** — where this chat's incoming messages are POSTed. Empty means
+  the global `DEFAULT_WEBHOOK`; with neither, nothing is dispatched. Saved as
+  you type, with no button: a save button on a single field is a button whose
+  only purpose is to be forgotten. Beneath it, what the endpoint last said —
+  **including failures**, because "answered 502 after 3 retries" is exactly
+  what someone debugging a silent chat needs.
 
-- **A phone number**, because WhatsApp Desktop would not give one up — it shows
-  a saved contact by name and exposes the number nowhere readable (measured:
-  zero phone-shaped strings across every accessible name in the window). The
-  per-chat webhook URL was built from that number, so without it a chat could
-  never forward anything. OpenWA supplies the identity, so the field has
-  nothing left to do.
-- **A webhook URL**, derived per chat from a global template. There is one
-  webhook now, registered against the session inside OpenWA.
+One field that used to be here is gone: **the contact's phone number**. It
+existed because WhatsApp Desktop would not give a number up — it shows a saved
+contact by name and exposes the number nowhere readable (measured: zero
+phone-shaped strings across every accessible name in the window) — and the
+webhook URL was built from it. OpenWA resolves the number itself now.
 
 ---
 
@@ -71,8 +80,8 @@ Nothing on this panel can be typed into. It used to carry two editable fields:
 
 | Reads | Means |
 |---|---|
-| `session ready · 918985370703` | OpenWA's session state and linked number. Red if anything but `ready`. |
-| `12 delivered · 4 replied` | What the listener has actually done. `· 2 failed` and `· 1 unsigned` appear only when non-zero. |
+| `session ready · 919876500000` | OpenWA's session state and linked number. Red if anything but `ready`. |
+| `908 contacts · 12 delivered · 4 replied` | The address book, and what the listener has done. `· 2 hook failed` appears only when non-zero. |
 | `not listening` | The webhook port could not be bound |
 | `MongoDB connected · wa_events` | |
 | `JSON ok · 09:21` | Last mirror write |

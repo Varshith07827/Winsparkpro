@@ -56,7 +56,7 @@ class OpenWAClient:
 
         `chat_id` is OpenWA's identifier, passed through exactly as it arrived,
         and is never composed from a phone number. WhatsApp's LID addressing
-        (`216298915164281@lid`) is not derivable from digits, so building one
+        (`111111111111111@lid`) is not derivable from digits, so building one
         would be sending to a guess. This is the same rule winSpark enforced by
         refusing an ambiguous id with a 409 rather than picking a chat.
         """

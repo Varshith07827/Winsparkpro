@@ -12,7 +12,7 @@ curl -X POST http://127.0.0.1:8766/wam/ \
 ```
 
 ```json
-{"ok": true, "chat": "Alice", "chatId": "216298915164281@lid"}
+{"ok": true, "chat": "Alice", "chatId": "111111111111111@lid"}
 ```
 
 The response is not sent until the message is: the request blocks on the HTTP
@@ -60,7 +60,7 @@ The chat from the first of `id`, `chat`, `chat_id`, `contact`, `to`.
 
 In order:
 
-1. **An exact chat id** (`216298915164281@lid`) is used as is.
+1. **An exact chat id** (`111111111111111@lid`) is used as is.
 2. **A chat name**, matched case-insensitively against chats this application
    has seen.
 3. **A phone number**, matched against a chat's stored `phone_number` — which

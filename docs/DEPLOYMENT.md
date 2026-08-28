@@ -160,12 +160,12 @@ curl -X POST http://127.0.0.1:8766/wam/ \
 ```
 
 ```json
-{"ok": true, "chat": "Alice", "chatId": "216298915164281@lid"}
+{"ok": true, "chat": "Alice", "chatId": "111111111111111@lid"}
 ```
 
 `id` is a chat name, a phone number, or a chat id. **The name is the useful
 part** — WhatsApp's LID addressing means a chat is identified as
-`216298915164281@lid`, which nobody can remember and which cannot be derived
+`111111111111111@lid`, which nobody can remember and which cannot be derived
 from a phone number. wadam keeps the mapping.
 
 A name matching more than one chat is refused with **409** and the candidates

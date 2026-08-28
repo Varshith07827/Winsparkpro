@@ -18,8 +18,8 @@ from wadam.storage.json_backup import JsonBackupStore
 from wadam.storage.repository import Repository
 from tests.fakes import FakeMongo
 
-LID = "132671606911101@lid"
-PHONE = "919100251854"
+LID = "222222222222222@lid"
+PHONE = "919876543210"
 
 
 class FakeClient:
@@ -69,15 +69,15 @@ def a_directory(repo, **client_kwargs):
 
 
 @pytest.mark.parametrize("given", [
-    "919100251854", "+919100251854", "+91 91002 51854", "91-9100-251854",
-    " 91 9100 251854 ",
+    "919876543210", "+919876543210", "+91 98765 43210", "91-9876-543210",
+    " 91 9876 543210 ",
 ])
 def test_the_same_number_written_five_ways(given):
-    assert normalize_phone(given) == "919100251854"
+    assert normalize_phone(given) == "919876543210"
 
 
 def test_a_name_is_not_a_number():
-    assert normalize_phone("Prasanthi Gvpt") == ""
+    assert normalize_phone("Priya Menon") == ""
     assert normalize_phone("CSE - C 2023-27") == ""
 
 
@@ -88,7 +88,7 @@ def test_chats_are_stored_with_automation_off(repo):
     """A sync that switched chats on would start answering every conversation
     in the account at once."""
     directory, _ = a_directory(repo, chats=[
-        {"id": LID, "name": "Prasanthi Gvpt", "isGroup": False},
+        {"id": LID, "name": "Priya Menon", "isGroup": False},
         {"id": "1203@g.us", "name": "Team", "isGroup": True},
     ])
 
@@ -103,7 +103,7 @@ def test_chats_are_stored_with_automation_off(repo):
 def test_a_chats_phone_is_resolved_once_and_then_cached(repo):
     """The call is about a second, and a LID's phone number cannot change."""
     directory, client = a_directory(
-        repo, chats=[{"id": LID, "name": "Prasanthi Gvpt"}], phones={LID: PHONE})
+        repo, chats=[{"id": LID, "name": "Priya Menon"}], phones={LID: PHONE})
 
     directory.sync()
     directory.sync()
@@ -119,14 +119,14 @@ def test_a_chat_is_named_from_the_address_book(repo):
     directory, _ = a_directory(
         repo,
         chats=[{"id": LID, "name": "\U0001d54a\U0001d552\U0001d55a"}],
-        contacts=[{"id": f"{PHONE}@c.us", "name": "Prasanthi Gvpt", "number": PHONE}],
+        contacts=[{"id": f"{PHONE}@c.us", "name": "Priya Menon", "number": PHONE}],
         phones={LID: PHONE},
     )
 
     directory.sync()
 
     chat = repo.get_chat(LID)
-    assert chat.contact_name == "Prasanthi Gvpt"
+    assert chat.contact_name == "Priya Menon"
     assert chat.chat_name == "\U0001d54a\U0001d552\U0001d55a"
 
 
@@ -181,9 +181,9 @@ def test_a_sync_failure_is_survived(repo):
 def resolved(repo):
     directory, client = a_directory(
         repo,
-        chats=[{"id": LID, "name": "Prasanthi Gvpt"}],
+        chats=[{"id": LID, "name": "Priya Menon"}],
         contacts=[
-            {"id": f"{PHONE}@c.us", "name": "Prasanthi Gvpt", "number": PHONE},
+            {"id": f"{PHONE}@c.us", "name": "Priya Menon", "number": PHONE},
             {"id": "919999999999@c.us", "name": "No Chat Yet", "number": "919999999999"},
         ],
         phones={LID: PHONE},
@@ -201,7 +201,7 @@ def test_an_exact_chat_id_resolves(resolved):
 def test_a_phone_number_resolves_to_its_chat(resolved):
     directory, client = resolved
 
-    answer = directory.resolve("+91 91002 51854")
+    answer = directory.resolve("+91 98765 43210")
 
     assert answer.chat_id == LID
     assert client.check_calls == []      # an existing chat is preferred
@@ -209,12 +209,12 @@ def test_a_phone_number_resolves_to_its_chat(resolved):
 
 def test_a_contact_name_resolves(resolved):
     directory, _ = resolved
-    assert directory.resolve("Prasanthi Gvpt").chat_id == LID
+    assert directory.resolve("Priya Menon").chat_id == LID
 
 
 def test_a_name_matches_regardless_of_case(resolved):
     directory, _ = resolved
-    assert directory.resolve("prasanthi gvpt").chat_id == LID
+    assert directory.resolve("priya menon").chat_id == LID
 
 
 def test_a_contact_with_no_chat_is_reached_through_openwa(resolved):
@@ -248,12 +248,12 @@ def test_two_contacts_sharing_a_name_are_refused(repo):
     """Measured on a live address book: 4 shared names in 494. Rare is not
     never, and the failure it prevents is messaging the wrong person."""
     directory, _ = a_directory(repo, contacts=[
-        {"id": "911111111111@c.us", "name": "Chakri", "number": "911111111111"},
-        {"id": "912222222222@c.us", "name": "Chakri", "number": "912222222222"},
+        {"id": "911111111111@c.us", "name": "Sam Taylor", "number": "911111111111"},
+        {"id": "912222222222@c.us", "name": "Sam Taylor", "number": "912222222222"},
     ])
     directory.sync()
 
-    answer = directory.resolve("Chakri")
+    answer = directory.resolve("Sam Taylor")
 
     assert not answer.ok
     assert answer.ambiguous

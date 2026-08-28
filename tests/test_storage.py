@@ -11,7 +11,7 @@ from pathlib import Path
 
 from wadam.domain.models import ChatConfig, MessageStatus, StoredMessage
 
-CHAT_ID = "216298915164281@lid"
+CHAT_ID = "111111111111111@lid"
 
 
 def read_json(folder: Path, name: str):

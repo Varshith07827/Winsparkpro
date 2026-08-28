@@ -10,8 +10,8 @@ id a message can be sent to.
 
 ## Why this is not a one-line lookup
 
-The two id spaces do not match. A chat is `216298915164281@lid`; the same
-person in the address book is `917981149423@c.us`. Nothing in either id says
+The two id spaces do not match. A chat is `111111111111111@lid`; the same
+person in the address book is `910000000001@c.us`. Nothing in either id says
 they are the same person, and a LID cannot be turned into a number by
 inspection.
 
@@ -21,9 +21,9 @@ cached forever — a LID's phone number does not change.
 
 That gives the chain a lookup actually walks:
 
-    "Prasanthi Gvpt"  ──▶ contacts  ──▶ 919100251854  ──▶ chat 132671606911101@lid
-    "919100251854"    ──▶ chat by cached phone ──▶ 132671606911101@lid
-    unknown number    ──▶ GET /contacts/check/{number} ──▶ 132671606911101@lid
+    "Priya Menon"  ──▶ contacts  ──▶ 919876543210  ──▶ chat 222222222222222@lid
+    "919876543210"    ──▶ chat by cached phone ──▶ 222222222222222@lid
+    unknown number    ──▶ GET /contacts/check/{number} ──▶ 222222222222222@lid
 
 ---
 
@@ -52,8 +52,8 @@ logger = logging.getLogger(__name__)
 def normalize_phone(value: str) -> str:
     """Digits only, or "" if this does not look like a phone number.
 
-    Callers are expected to include the country code — `919100251854`,
-    `+91 91002 51854` and `91-9100-251854` are the same number here. A bare
+    Callers are expected to include the country code — `919876543210`,
+    `+91 98765 43210` and `91-9876-543210` are the same number here. A bare
     ten-digit national number is deliberately NOT expanded: the account may
     message Indian and US numbers, and guessing between +91 and +1 would send
     to a real person who is not the intended one.
@@ -230,7 +230,7 @@ class Directory:
         # told what is actually wrong rather than "not on WhatsApp".
         if digits and len(digits) <= 10:
             return Resolution(reason=(f"{wanted!r} has no country code — send the full "
-                                      f"international number, e.g. 919100251854"))
+                                      f"international number, e.g. 919876543210"))
 
         # 4. A number with no chat yet. OpenWA answers with the chat id it
         #    would use, which is what makes a first message possible.

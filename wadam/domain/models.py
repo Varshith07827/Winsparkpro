@@ -16,7 +16,7 @@ timezone; JSON stores them as ISO-8601 strings.
   sidebar row was a flattened string of name + preview + timestamp, all of
   which change. The honest consequence was that renaming a contact produced a
   *new* chat with its own configuration. OpenWA supplies a real id
-  (`216298915164281@lid`), so the hash and its consequence are both gone.
+  (`111111111111111@lid`), so the hash and its consequence are both gone.
 * `message_key_for(...)` hashed a message's content, because re-reading the
   same visible bubble every three seconds would otherwise store it repeatedly.
   It could not tell two people genuinely sending "ok" a minute apart from one
@@ -79,7 +79,7 @@ def phone_digits(value: str) -> str:
 def phone_from_chat_id(chat_id: str) -> str:
     """The phone number in an OpenWA chat id, when there genuinely is one.
 
-    `918985370703@c.us` yields the number. `216298915164281@lid` yields ""
+    `919876500000@c.us` yields the number. `111111111111111@lid` yields ""
     — a LID is an opaque identifier, and reading it as a phone number would
     display a plausible-looking number belonging to nobody.
     """
@@ -132,7 +132,7 @@ class ChatConfig:
     phone_number: str = ""
     """Resolved once via OpenWA and cached. A chat id is a `@lid` and carries
     no number, so this is the only join to the address book — and the only way
-    `{"id": "919100251854"}` can find this chat."""
+    `{"id": "919876543210"}` can find this chat."""
 
     webhook_url: str = ""
     """Where this chat's incoming messages are POSTed. Empty means the global
