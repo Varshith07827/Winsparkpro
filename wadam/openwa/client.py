@@ -147,6 +147,44 @@ class OpenWAClient:
             return ""
         return str(answer.get("whatsappId") or "")
 
+    # ── provisioning ──────────────────────────────────────────────────
+
+    def list_sessions(self) -> list[dict]:
+        """Every session on this OpenWA instance."""
+        return _rows(self._get("/api/sessions"), "sessions")
+
+    def list_webhooks(self, session_id: str) -> list[dict]:
+        return _rows(self._get(f"/api/sessions/{session_id}/webhooks"), "webhooks")
+
+    def ensure_webhook(self, session_id: str, url: str, secret: str,
+                       events=("message.received",)) -> str:
+        """Make sure OpenWA will deliver to `url`, and return the webhook's id.
+
+        Idempotent, and deliberately narrow: it only ever touches a webhook
+        whose URL is exactly ours. Any other webhook on the session belongs to
+        something else and is left alone.
+
+        This exists because registering it by hand was a curl invocation with
+        four fields that had to agree with `.env` — and when the secret did not
+        match, every delivery was refused with a 401 that looked like a bug in
+        this application.
+        """
+        body = {"url": url, "events": list(events), "retryCount": 3}
+        if secret:
+            body["secret"] = secret
+
+        for row in self.list_webhooks(session_id):
+            if row.get("url") == url:
+                webhook_id = str(row.get("id"))
+                self._request("PUT",
+                              f"{self._base_url}/api/sessions/{session_id}/webhooks/{webhook_id}",
+                              body)
+                return webhook_id
+
+        created = self._post(
+            f"{self._base_url}/api/sessions/{session_id}/webhooks", body)
+        return str(created.get("id") or "") if isinstance(created, dict) else ""
+
     # ── session state, for the status bar ─────────────────────────────
 
     def session_status(self) -> dict:

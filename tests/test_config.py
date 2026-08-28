@@ -14,12 +14,10 @@ import pytest
 
 from wadam.config import ConfigError, load_settings
 
+#: The whole of a working configuration. Two keys, which is the point.
 GOOD = """
 MONGODB_URI=mongodb://localhost:27017
-OPENWA_URL=http://localhost:2785
 OPENWA_API_KEY=owa_k1_abcdef
-OPENWA_SESSION_ID=f51856f9-b22f-4bf6-b99a-f45ab86f1ac8
-WEBHOOK_SECRET=a-secret-that-is-long-enough
 """
 
 
@@ -48,31 +46,34 @@ def problems_for(tmp_path: Path, text: str) -> list[str]:
 # ── the happy path ────────────────────────────────────────────────────
 
 
-def test_a_complete_env_loads(tmp_path: Path):
+def test_two_keys_are_a_complete_configuration(tmp_path: Path):
+    """The session id and the webhook secret are discovered and generated at
+    startup, so neither belongs in the file."""
     settings = load_settings(write(tmp_path, GOOD))
 
     assert settings.openwa_url == "http://localhost:2785"
-    assert settings.openwa_session_id == "f51856f9-b22f-4bf6-b99a-f45ab86f1ac8"
+    assert settings.openwa_session_id == ""
+    assert settings.webhook_secret == ""
+    assert settings.register_webhook is True
     assert settings.webhook_port == 8765
     assert settings.cooldown_seconds == 60.0
-    assert settings.answer_groups is False
 
 
 def test_a_trailing_slash_is_stripped_from_the_openwa_url(tmp_path: Path):
-    settings = load_settings(write(tmp_path, GOOD.replace(
-        "OPENWA_URL=http://localhost:2785", "OPENWA_URL=http://localhost:2785/")))
+    settings = load_settings(write(tmp_path, GOOD + "OPENWA_URL=http://localhost:2785/\n"))
     assert settings.openwa_url == "http://localhost:2785"
 
 
 # ── every problem at once ─────────────────────────────────────────────
 
 
-def test_all_missing_requirements_are_reported_together(tmp_path: Path):
+def test_the_api_key_is_still_required(tmp_path: Path):
     problems = problems_for(tmp_path, "MONGODB_URI=mongodb://localhost:27017\n")
     joined = " ".join(problems)
 
     assert "OPENWA_API_KEY" in joined
-    assert "OPENWA_SESSION_ID" in joined
+    # Not this one — it is discovered when the instance has a single session.
+    assert "OPENWA_SESSION_ID" not in joined
 
 
 def test_a_missing_mongodb_uri_is_refused(tmp_path: Path):
@@ -86,7 +87,7 @@ def test_a_non_mongodb_uri_is_refused(tmp_path: Path):
 
 
 def test_a_non_http_openwa_url_is_refused(tmp_path: Path):
-    text = GOOD.replace("http://localhost:2785", "localhost:2785")
+    text = GOOD + "OPENWA_URL=localhost:2785" + chr(10)
     assert any("OPENWA_URL" in p for p in problems_for(tmp_path, text))
 
 
@@ -100,27 +101,29 @@ def test_mongodbs_own_databases_are_refused(tmp_path: Path):
 # ── the webhook secret ────────────────────────────────────────────────
 
 
-def test_a_non_loopback_bind_requires_a_secret(tmp_path: Path):
-    """The line is drawn at reachability. 0.0.0.0 is the default, because a
-    Dockerised OpenWA cannot reach a loopback listener."""
-    text = GOOD.replace("WEBHOOK_SECRET=a-secret-that-is-long-enough", "")
-    problems = problems_for(tmp_path, text)
-
-    assert any("WEBHOOK_SECRET is required" in p for p in problems)
-
-
-def test_loopback_may_go_without_a_secret(tmp_path: Path):
-    text = (GOOD.replace("WEBHOOK_SECRET=a-secret-that-is-long-enough", "")
-            + "WEBHOOK_HOST=127.0.0.1\n")
-    settings = load_settings(write(tmp_path, text))
+def test_no_secret_is_fine_because_one_is_generated(tmp_path: Path):
+    """It used to be required off loopback, which meant pasting the same value
+    into .env and into OpenWA's webhook registration. When they disagreed every
+    delivery was refused with a 401 that looked like a bug here."""
+    settings = load_settings(write(tmp_path, GOOD))
 
     assert settings.webhook_secret == ""
-    assert settings.webhook_host == "127.0.0.1"
+    assert settings.webhook_host == "0.0.0.0"
 
 
-def test_a_short_secret_is_refused(tmp_path: Path):
-    text = GOOD.replace("a-secret-that-is-long-enough", "short")
-    assert any("at least 16" in p for p in problems_for(tmp_path, text))
+def test_a_short_explicit_secret_is_still_refused(tmp_path: Path):
+    problems = problems_for(tmp_path, GOOD + "WEBHOOK_SECRET=short\n")
+    assert any("at least 16" in p for p in problems)
+
+
+def test_a_public_url_must_be_http(tmp_path: Path):
+    problems = problems_for(tmp_path, GOOD + "WEBHOOK_PUBLIC_URL=wadam.example/hook\n")
+    assert any("WEBHOOK_PUBLIC_URL" in p for p in problems)
+
+
+def test_registration_can_be_switched_off(tmp_path: Path):
+    settings = load_settings(write(tmp_path, GOOD + "REGISTER_WEBHOOK=false\n"))
+    assert settings.register_webhook is False
 
 
 # ── the send API ──────────────────────────────────────────────────────
@@ -151,5 +154,5 @@ def test_credentials_are_redacted_in_the_mirrored_settings(tmp_path: Path):
     redacted = load_settings(write(tmp_path, GOOD)).redacted()
 
     assert redacted["openwa_api_key"] == "***"
-    assert redacted["webhook_secret"] == "***"
+    assert redacted["webhook_secret"] == "(generated)"
     assert "abcdef" not in str(redacted)

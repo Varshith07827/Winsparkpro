@@ -15,6 +15,8 @@ from pathlib import Path
 
 from wadam.api.host import SendApiHost
 from wadam.config import ConfigError, load_settings
+from wadam.engine.bootstrap import prepare
+from wadam.openwa import OpenWAClient
 from wadam.engine.service import AutomationService
 from wadam.logging_setup import configure_logging
 from wadam.storage.json_backup import JsonBackupStore
@@ -40,6 +42,20 @@ def main() -> int:
     mongo.connect()
     repository = Repository(settings, mongo, backup)
     repository.start()
+
+    # Fills in the session id and webhook secret when they were left out, and
+    # makes OpenWA deliver here. Raises ConfigError with something actionable.
+    try:
+        settings, _ = prepare(
+            settings, repository,
+            lambda sid: OpenWAClient(settings.openwa_url, settings.openwa_api_key, sid),
+        )
+    except ConfigError as ex:
+        for problem in ex.problems:
+            log.error("%s", problem)
+        repository.stop()
+        mongo.close()
+        return 1
 
     service = AutomationService(settings, repository)
     service.start()

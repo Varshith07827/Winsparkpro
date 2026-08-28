@@ -115,6 +115,8 @@ class Settings:
     openwa_url: str = "http://localhost:2785"
     openwa_api_key: str = ""
     #: The session's UUID, not its name. `GET /api/sessions` lists them.
+    #: Optional. With one session on the instance it is discovered; with
+    #: several, startup asks which.
     openwa_session_id: str = ""
 
     # --- the webhook this process listens on ------------------------------
@@ -123,9 +125,17 @@ class Settings:
     #: `host.docker.internal` — a loopback bind is unreachable from there.
     webhook_host: str = "0.0.0.0"
     webhook_port: int = 8765
-    #: Shared with the webhook's `secret` so a delivery can be proven to have
-    #: come from OpenWA. Required whenever `webhook_host` is not loopback.
+    #: Optional. Generated once and stored when unset, then handed to OpenWA
+    #: directly, so the two ends cannot disagree about it.
     webhook_secret: str = ""
+
+    #: Register (and keep current) this application's webhook in OpenWA at
+    #: startup. Off only if something else owns that registration.
+    register_webhook: bool = True
+    #: The address OpenWA should deliver to. Defaults to
+    #: `host.docker.internal:<port>` — OpenWA resolves it from inside its
+    #: container, where `localhost` is the container itself.
+    webhook_public_url: str = ""
 
     # --- the outbound webhook ---------------------------------------------
     #: Given to a chat that has no URL of its own. Without it, and without a
@@ -169,7 +179,9 @@ class Settings:
             "openwa_session_id": self.openwa_session_id,
             "webhook_host": self.webhook_host,
             "webhook_port": self.webhook_port,
-            "webhook_secret": "***" if self.webhook_secret else "",
+            "webhook_secret": "***" if self.webhook_secret else "(generated)",
+            "register_webhook": self.register_webhook,
+            "webhook_public_url": self.webhook_public_url,
             "default_webhook": self.default_webhook,
             "webhook_api_key": "***" if self.webhook_api_key else "",
             "webhook_timeout": self.webhook_timeout,
@@ -261,6 +273,7 @@ def load_settings(env_path: Optional[Path] = None) -> Settings:
         "OPENWA_URL", "OPENWA_API_KEY", "OPENWA_SESSION_ID",
         "DEFAULT_WEBHOOK", "WEBHOOK_API_KEY", "WEBHOOK_TIMEOUT", "WEBHOOK_MAX_RETRIES",
         "WEBHOOK_HOST", "WEBHOOK_PORT", "WEBHOOK_SECRET",
+        "REGISTER_WEBHOOK", "WEBHOOK_PUBLIC_URL",
         "COOLDOWN_SECONDS", "ANSWER_GROUPS", "LOG_LEVEL",
         "API_HOST", "API_PORT", "API_TOKEN", "API_SEND_TIMEOUT",
     ):
@@ -315,12 +328,9 @@ def load_settings(env_path: Optional[Path] = None) -> Settings:
             "or on its dashboard's API keys page."
         )
 
+    # Not required: with exactly one session on the instance it is discovered
+    # at startup, and with several the startup error names them.
     openwa_session_id = (values.get("OPENWA_SESSION_ID") or "").strip()
-    if not openwa_session_id:
-        problems.append(
-            "OPENWA_SESSION_ID is required. It is the session's UUID, not its name — "
-            "GET /api/sessions lists them."
-        )
 
     folder_raw = (values.get("JSON_BACKUP_FOLDER") or "backup").strip() or "backup"
     folder = Path(folder_raw)
@@ -340,26 +350,22 @@ def load_settings(env_path: Optional[Path] = None) -> Settings:
         problems.append(f"WEBHOOK_PORT must be between 1 and 65535 (got {webhook_port}).")
         webhook_port = 8765
 
+    # Not required: generated once and stored when unset, then given to OpenWA
+    # directly. It used to be a value pasted into two places by hand, and when
+    # they disagreed every delivery was refused with a 401 that looked like a
+    # bug in this application.
     webhook_secret = (values.get("WEBHOOK_SECRET") or "").strip()
-    # The line is drawn at reachability, the same place the send API draws it.
-    # A loopback listener cannot be reached from another machine, so an
-    # unverified delivery there exposes this machine to itself. Bound anywhere
-    # else — and it must be, for a Dockerised OpenWA to reach it — the
-    # signature is the only thing stopping anyone who can reach the port from
-    # making this account send whatever they like.
-    if webhook_host not in _LOOPBACK_HOSTS and not webhook_secret:
+    if webhook_secret and len(webhook_secret) < 16:
         problems.append(
-            f"WEBHOOK_SECRET is required when WEBHOOK_HOST is not loopback (it is "
-            f"{webhook_host}). Anything that could reach port {webhook_port} would "
-            f"otherwise be able to make your WhatsApp account send messages. "
-            f"Generate one with:  "
-            f'python -c "import secrets; print(secrets.token_urlsafe(32))"'
+            f"WEBHOOK_SECRET is only {len(webhook_secret)} characters. Use at least 16, "
+            f"or leave it unset and one will be generated."
         )
-    elif webhook_secret and len(webhook_secret) < 16:
-        problems.append(
-            f"WEBHOOK_SECRET is only {len(webhook_secret)} characters. Use at least 16 — "
-            f"it is the only proof a delivery really came from OpenWA."
-        )
+
+    register_raw = (values.get("REGISTER_WEBHOOK") or "").strip().lower()
+    register_webhook = register_raw not in {"0", "false", "no", "off"}
+    webhook_public_url = (values.get("WEBHOOK_PUBLIC_URL") or "").strip()
+    if webhook_public_url and not webhook_public_url.startswith(("http://", "https://")):
+        problems.append("WEBHOOK_PUBLIC_URL must be an http:// or https:// URL.")
 
     default_webhook = (values.get("DEFAULT_WEBHOOK") or "").strip()
     if default_webhook and not default_webhook.startswith(("http://", "https://")):
@@ -420,6 +426,8 @@ def load_settings(env_path: Optional[Path] = None) -> Settings:
         webhook_host=webhook_host,
         webhook_port=webhook_port,
         webhook_secret=webhook_secret,
+        register_webhook=register_webhook,
+        webhook_public_url=webhook_public_url,
         default_webhook=default_webhook,
         webhook_api_key=(values.get("WEBHOOK_API_KEY") or "").strip(),
         webhook_timeout=webhook_timeout,

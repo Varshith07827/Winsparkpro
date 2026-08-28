@@ -44,17 +44,18 @@ python -m venv .venv
 .venv\Scripts\python.exe run.py
 ```
 
-First run asks for four things — your MongoDB URI, and OpenWA's address, API
-key and session id — tests both connections, and writes `.env`. It never asks
-again.
+First run asks for your MongoDB URI and OpenWA's API key, tests both
+connections, and writes `.env`. It never asks again.
 
-Then register the webhook in OpenWA, pointing at this application:
+That is it. On startup it finds the session, generates a webhook secret,
+and registers its own webhook with OpenWA, so incoming messages arrive without
+any further setup.
+
+If you would rather register it yourself, set `REGISTER_WEBHOOK=false` and
+point OpenWA at:
 
 ```
-POST /api/sessions/<session-id>/webhooks
-{ "url": "http://host.docker.internal:8765/hook",
-  "events": ["message.received"],
-  "secret": "<the WEBHOOK_SECRET from your .env>" }
+http://host.docker.internal:8765/hook     events: message.received
 ```
 
 ### Two things that will bite you

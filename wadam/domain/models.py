@@ -270,6 +270,11 @@ class ApplicationState:
     """The one document describing the application itself."""
 
     global_automation_enabled: bool = False
+    #: Generated on first run when WEBHOOK_SECRET is not set, and given to
+    #: OpenWA directly. Kept here rather than written back into `.env`: a
+    #: program that edits its own configuration file will one day clobber a
+    #: value somebody was mid-way through changing.
+    webhook_secret: str = ""
     version: str = ""
     started_at: Optional[datetime] = None
     last_shutdown_at: Optional[datetime] = None

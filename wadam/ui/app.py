@@ -27,6 +27,8 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 from wadam import constants
 from wadam.api.host import SendApiHost
 from wadam.config import ConfigError, Settings, default_env_path, load_settings
+from wadam.engine.bootstrap import prepare
+from wadam.openwa import OpenWAClient
 from wadam.logging_setup import configure_logging
 from wadam.storage.json_backup import JsonBackupStore
 from wadam.storage.mongo import MongoStore, MongoUnavailableError
@@ -97,6 +99,21 @@ class _Startup:
         repository = Repository(settings, mongo, backup)
         repository.start()
         self.repository = repository
+
+        # Discover what was left out of .env, and register the webhook. Any
+        # problem here is a configuration problem and belongs on the startup
+        # screen with everything else, not in a traceback.
+        try:
+            self.settings, _ = prepare(
+                settings, repository,
+                lambda sid: OpenWAClient(settings.openwa_url, settings.openwa_api_key, sid),
+            )
+        except ConfigError as ex:
+            return StartupErrorDialog(
+                "OpenWA is not usable yet", ex.problems,
+                env_path=settings.env_path,
+                hint="Fix this in OpenWA or .env, then press Retry.",
+            )
         if repository.recovered_from_json:
             self.warnings.append(
                 "MongoDB held no chats, so the configuration was restored from the JSON backup "
