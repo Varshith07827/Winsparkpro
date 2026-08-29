@@ -246,7 +246,55 @@ database.
 
 ---
 
-## Running on a remote machine
+## Running on a Linux server
+
+One script, run on the server:
+
+```bash
+git clone --branch wadam https://github.com/Varshith07827/Winsparkpro.git ~/wadam && bash ~/wadam/scripts/install-linux.sh
+```
+
+It checks Python, Docker and MongoDB, brings up OpenWA in a container, installs
+wadam without Qt, writes `.env` with the API key already filled in, and
+installs a systemd unit. Idempotent — it never overwrites an existing `.env`,
+never touches nginx, and uses its own MongoDB database, so anything already
+running on the box is left alone.
+
+Two things it cannot do for you:
+
+**Link a session.** From your own machine:
+
+```bash
+ssh -L 2785:localhost:2785 you@server
+```
+
+Then open `http://localhost:2785`, create a session, scan the QR. Only a phone
+can do that.
+
+**Start it**, once the session is ready:
+
+```bash
+sudo systemctl start wadam && journalctl -u wadam -f
+```
+
+### Nothing is exposed
+
+| | |
+|---|---|
+| OpenWA `:2785` | bound to `127.0.0.1` — its API key can do anything, so nothing outside reaches it |
+| send API `:8766` | bound to `127.0.0.1` — reach it with a tunnel |
+| wadam webhook `:8765` | bound to the **docker bridge**, not `0.0.0.0` |
+
+That last one is the Linux-specific bit. A container cannot reach a loopback
+listener on the host, so binding `127.0.0.1` would mean no message ever
+arrives; binding `0.0.0.0` would put it on the public interface. The bridge
+address is the one place that is reachable from the container and nowhere else,
+and the script detects it rather than assuming `172.17.0.1` — a compose project
+makes its own network with a different gateway.
+
+---
+
+## Running on a remote Windows machine
 
 OpenWA and this application on the same box you reach over RDP; you send to it
 from your own machine.
