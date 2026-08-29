@@ -30,7 +30,25 @@ python3 -c 'import venv' 2>/dev/null || die "python3-venv missing:  sudo apt ins
 ok "Python $PYV"
 
 command -v docker >/dev/null || die "docker not installed:  curl -fsSL https://get.docker.com | sudo sh"
-docker info >/dev/null 2>&1 || die "cannot talk to docker — add yourself to the group:  sudo usermod -aG docker \$USER  (then log out and back in)"
+
+# "Cannot connect to the daemon" and "permission denied on the socket" are
+# different problems with different fixes, and the fix for one does nothing
+# for the other. Told apart rather than guessed at.
+if ! docker info >/dev/null 2>&1; then
+  DOCKER_ERR=$(docker info 2>&1 || true)
+  if echo "$DOCKER_ERR" | grep -qi "permission denied"; then
+    die "no permission on the docker socket. Add yourself to the group and re-run
+        without logging out:
+
+          sudo usermod -aG docker \$USER
+          sg docker -c 'bash $0'"
+  elif ! systemctl is-active --quiet docker 2>/dev/null; then
+    die "the docker daemon is not running:  sudo systemctl enable --now docker"
+  else
+    die "cannot talk to docker: $(echo "$DOCKER_ERR" | head -2 | tr '
+' ' ')"
+  fi
+fi
 ok "Docker"
 
 if docker compose version >/dev/null 2>&1; then
