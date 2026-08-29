@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import signal
+import threading
 import sys
 from pathlib import Path
 
@@ -74,16 +75,30 @@ def main() -> int:
     else:
         log.info("send API off (set API_PORT to enable)")
 
-    stopping = False
+    # SIGTERM as well as SIGINT, and this is not a nicety. `systemctl stop` and
+    # `systemctl restart` both send SIGTERM, whose default action kills the
+    # process outright -- so the `finally` below never ran under systemd, and
+    # `repository.stop()`, which drains the JSON mirror, never ran with it.
+    #
+    # That is worst in exactly the situation where it matters most: with
+    # MongoDB unreachable the mirror is the ONLY store, and every restart was
+    # discarding whatever had not yet been flushed on its own timer.
+    stopping = threading.Event()
 
-    def shutdown(_signum, _frame):
-        nonlocal stopping
-        stopping = True
+    def shutdown(signum, _frame):
+        log.info("received %s, shutting down",
+                 signal.Signals(signum).name if hasattr(signal, "Signals") else signum)
+        stopping.set()
 
     signal.signal(signal.SIGINT, shutdown)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, shutdown)
+
     try:
-        while not stopping:
-            signal.pause() if hasattr(signal, "pause") else __import__("time").sleep(1)
+        # Event.wait rather than signal.pause: pause() does not exist on
+        # Windows, and a bare sleep loop delays shutdown by up to its interval.
+        while not stopping.wait(timeout=1.0):
+            pass
     except KeyboardInterrupt:
         pass
     finally:

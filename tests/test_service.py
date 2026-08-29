@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 from wadam.config import Settings
-from wadam.engine.service import AutomationService
+from wadam.engine.service import AutomationService, _refuse_if_port_is_taken
 from wadam.engine.webhook import WebhookOutcome
 from wadam.openwa import SendError
 from wadam.storage.json_backup import JsonBackupStore
@@ -244,10 +244,35 @@ def test_starting_on_an_occupied_port_is_refused(service, tmp_path: Path):
         svc, _, _ = service
         svc._settings = replace(svc._settings, webhook_host="127.0.0.1",  # noqa: SLF001
                                 webhook_port=8791)
-        with pytest.raises(OSError, match="already listening"):
-            svc.start()
+        with pytest.raises(OSError, match="still listening"):
+            # The wait is what makes a restart survivable; here it only has to
+            # elapse, so it is cut to keep the suite quick.
+            _refuse_if_port_is_taken("127.0.0.1", 8791, wait_seconds=0.2)
     finally:
         squatter.shutdown()
+
+
+def test_a_port_that_frees_up_during_the_wait_is_accepted(tmp_path: Path):
+    """`systemctl restart` starts the new process while the old one is still
+    letting go. Refusing instantly made every restart a coin toss — and turned
+    one into a service that came back deaf on both ports."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class Quiet(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *_a):
+            pass
+
+    squatter = ThreadingHTTPServer(("127.0.0.1", 8792), Quiet)
+    threading.Thread(target=squatter.serve_forever, daemon=True).start()
+    threading.Timer(0.5, squatter.shutdown).start()
+
+    # Returns rather than raising: the old process let go inside the window.
+    _refuse_if_port_is_taken("127.0.0.1", 8792, wait_seconds=10.0)
 
 
 def test_the_snapshot_reports_the_stores(service):

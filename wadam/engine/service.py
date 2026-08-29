@@ -21,6 +21,7 @@ from __future__ import annotations
 import logging
 import socket
 import threading
+import time
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, List, Optional
@@ -250,7 +251,7 @@ class AutomationService:
         return 200, outcome.as_response()
 
 
-def _refuse_if_port_is_taken(host: str, port: int) -> None:
+def _refuse_if_port_is_taken(host: str, port: int, wait_seconds: float = 20.0) -> None:
     """Raise if something already answers on this port.
 
     `http.server` sets `allow_reuse_address = 1`, so on Windows a second
@@ -263,17 +264,36 @@ def _refuse_if_port_is_taken(host: str, port: int) -> None:
 
     So the check is a *connection*, not a bind — a bind would succeed and prove
     nothing.
+
+    It waits rather than refusing immediately, because the commonest reason
+    the port is busy is entirely legitimate: `systemctl restart` starts the new
+    process while the old one is still letting go, and a guard that gives up
+    instantly turns every restart into a coin toss. A second instance running
+    indefinitely still fails, which is the case worth failing for.
     """
     probe_host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        probe.settimeout(0.4)
-        if probe.connect_ex((probe_host, port)) == 0:
+    deadline = time.monotonic() + wait_seconds
+    waited = False
+
+    while True:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.settimeout(0.4)
+            if probe.connect_ex((probe_host, port)) != 0:
+                if waited:
+                    logger.info("%s:%d came free", probe_host, port)
+                return
+        if time.monotonic() >= deadline:
             raise OSError(
-                f"something is already listening on {probe_host}:{port}. "
-                f"Another copy of this application is probably still running — "
-                f"stop it first. Two listeners on one port do not conflict here, "
-                f"they silently share the traffic."
+                f"something is still listening on {probe_host}:{port} after "
+                f"{wait_seconds:g}s. Another copy of this application is probably "
+                f"running — stop it first. Two listeners on one port do not "
+                f"conflict here, they silently share the traffic."
             )
+        if not waited:
+            logger.info("%s:%d is busy — waiting up to %gs for it to come free "
+                        "(a restart usually needs a moment)", probe_host, port, wait_seconds)
+            waited = True
+        time.sleep(0.5)
 
 
 def _make_handler(service: AutomationService):
