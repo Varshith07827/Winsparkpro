@@ -1,7 +1,11 @@
 """The first-run setup window.
 
-Four questions, one button. It appears when there is no usable configuration
-and never again — which is the entire configuration experience the product has.
+Two questions, one button. It appears when there is no usable configuration and
+never again — which is the entire configuration experience the product has.
+
+It asked for four until the session id and webhook secret became things the
+application works out for itself at startup. What is left is the pair it cannot
+guess: where to store data, and how to authenticate to OpenWA.
 
 Deliberately *not* a settings screen. There is no way back into it from the
 running application.
@@ -48,7 +52,6 @@ _OPENWA_PLACEHOLDER = "http://localhost:2785"
 
 
 def env_text(mongodb_uri: str, openwa_url: str, openwa_api_key: str,
-             openwa_session_id: str, webhook_secret: str,
              database_name: str = constants.DATABASE_NAME) -> str:
     """The `.env` this writes.
 
@@ -74,22 +77,24 @@ def env_text(mongodb_uri: str, openwa_url: str, openwa_api_key: str,
         "# The gateway this application sends through and receives from.\n"
         f"OPENWA_URL={openwa_url}\n"
         f"OPENWA_API_KEY={openwa_api_key}\n"
-        "# The session's UUID, not its name.\n"
-        f"OPENWA_SESSION_ID={openwa_session_id}\n"
+        "# Only needed when OpenWA has more than one session; otherwise the\n"
+        "# single one is discovered at startup.\n"
+        "# OPENWA_SESSION_ID=\n"
         "\n"
         "# --- the webhook this application listens on ---------------------------\n"
-        "# Register this address in OpenWA for the message.received event:\n"
-        "#   http://host.docker.internal:8765/hook\n"
-        "# `host.docker.internal`, not `localhost` — OpenWA resolves the URL from\n"
-        "# inside its container, where `localhost` is the container itself. That\n"
-        "# is also why the bind address below is 0.0.0.0 rather than 127.0.0.1.\n"
-        "# OpenWA's SSRF guard blocks private addresses by default; allow this one\n"
-        "# with SSRF_ALLOWED_HOSTS=host.docker.internal in OpenWA's own .env.\n"
-        "WEBHOOK_HOST=0.0.0.0\n"
-        "WEBHOOK_PORT=8765\n"
-        "# Use this same value as the webhook's `secret` in OpenWA, so a delivery\n"
-        "# can be proven to have come from it.\n"
-        f"WEBHOOK_SECRET={webhook_secret}\n"
+        "# Registered with OpenWA at startup, with a generated secret, pointing\n"
+        "# at http://host.docker.internal:8765/hook — that host and not\n"
+        "# `localhost`, because OpenWA resolves the URL from inside its\n"
+        "# container where `localhost` is the container itself.\n"
+        "#\n"
+        "# OpenWA's SSRF guard blocks private addresses, so ITS OWN .env needs\n"
+        "#   SSRF_ALLOWED_HOSTS=host.docker.internal\n"
+        "# or registration fails and no message ever arrives.\n"
+        "# WEBHOOK_HOST=0.0.0.0\n"
+        "# WEBHOOK_PORT=8765\n"
+        "\n"
+        "# Where incoming messages are POSTed, for chats with no URL of their own.\n"
+        "# DEFAULT_WEBHOOK=https://your.server/hook\n"
         "\n"
         "# Per-chat quiet period, in seconds. Bounds an automation answering an\n"
         "# automation. 0 disables it.\n"
@@ -157,7 +162,7 @@ def check_openwa(url: str, api_key: str, session_id: str, timeout: float = 6.0) 
     ids = [str(r.get("id")) for r in rows]
     if not ids:
         return "OpenWA has no sessions. Create and link one first."
-    if session_id not in ids:
+    if session_id and session_id not in ids:
         listed = ", ".join(
             "{} ({})".format(r.get("name") or "unnamed", r.get("id")) for r in rows[:3]
         )
@@ -181,8 +186,6 @@ def validate(mongodb_uri: str, openwa_url: str, api_key: str, session_id: str) -
 
     if not (api_key or "").strip():
         return "Enter the OpenWA API key — it is in OpenWA's data/.api-key file."
-    if not (session_id or "").strip():
-        return "Enter the OpenWA session id. It is the session's UUID, not its name."
     return ""
 
 
@@ -231,16 +234,10 @@ class FirstRunDialog(QDialog):
         self._key.textChanged.connect(self._clear_feedback)
         layout.addWidget(self._key)
 
-        layout.addWidget(self._label("OpenWA session id"))
-        self._session = QLineEdit()
-        self._session.setPlaceholderText("the session's UUID, not its name")
-        self._session.textChanged.connect(self._clear_feedback)
-        layout.addWidget(self._session)
-
         hint = QLabel(
-            "After this, register a webhook in OpenWA for message.received pointing at "
-            "http://host.docker.internal:8765/hook — the .env written here explains why "
-            "that host and not localhost."
+            "The session, the webhook and its secret are worked out at startup. "
+            "OpenWA needs SSRF_ALLOWED_HOSTS=host.docker.internal in its own .env "
+            "for deliveries to reach this application."
         )
         hint.setWordWrap(True)
         hint.setStyleSheet(f"color: {theme.TEXT_MUTED};")
@@ -280,7 +277,7 @@ class FirstRunDialog(QDialog):
         uri = self._mongo.text().strip()
         url = self._url.text().strip().rstrip("/")
         key = self._key.text().strip()
-        session = self._session.text().strip()
+        session = ""      # discovered at startup; asked for only if ambiguous
 
         problem = validate(uri, url, key, session)
         if problem:
@@ -300,22 +297,28 @@ class FirstRunDialog(QDialog):
 
         self.mongodb_uri = uri
         try:
-            write_env(self._env_path, uri, url, key, session)
-        except OSError as ex:
+            write_env(self._env_path, uri, url, key)
+        except (OSError, FileExistsError) as ex:
             self._set_feedback(f"Could not write {self._env_path}: {ex}")
             return
         self.done(START)
 
 
 def write_env(env_path: Path, mongodb_uri: str, openwa_url: str,
-              openwa_api_key: str, openwa_session_id: str) -> Path:
-    """Write `.env`, generating the webhook secret so nobody has to think of one."""
+              openwa_api_key: str) -> Path:
+    """Write `.env`. Refuses to clobber one that already exists.
+
+    The guard is not paranoia: this dialog once reappeared for a configuration
+    that was perfectly good, and pressing Start replaced a working file.
+    """
+    if env_path.exists():
+        raise FileExistsError(
+            f"{env_path} already exists. Delete or rename it if you really want "
+            f"to start over — this will not overwrite it."
+        )
     env_path.parent.mkdir(parents=True, exist_ok=True)
-    secret = secrets.token_urlsafe(32)
-    env_path.write_text(
-        env_text(mongodb_uri, openwa_url, openwa_api_key, openwa_session_id, secret),
-        encoding="utf-8",
-    )
+    env_path.write_text(env_text(mongodb_uri, openwa_url, openwa_api_key),
+                        encoding="utf-8")
     return env_path
 
 
@@ -332,4 +335,8 @@ def needs_setup(env_path: Path) -> bool:
         for line in text.splitlines()
         if "=" in line and not line.strip().startswith("#")
     }
-    return not {"MONGODB_URI", "OPENWA_API_KEY", "OPENWA_SESSION_ID"} <= keys
+    # Only what cannot be worked out. This listed OPENWA_SESSION_ID until that
+    # became discoverable, and the consequence was severe: a perfectly good
+    # .env without it looked unconfigured, so the setup dialog reappeared and
+    # OVERWROTE the file the moment somebody pressed Start.
+    return not {"MONGODB_URI", "OPENWA_API_KEY"} <= keys
