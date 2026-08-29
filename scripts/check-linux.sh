@@ -131,32 +131,51 @@ fi
 
 # --- data ---------------------------------------------------------------
 head_ "Data"
-if command -v mongosh >/dev/null; then MONGO=mongosh
-elif command -v mongo >/dev/null; then MONGO=mongo
-else MONGO=""; fi
-if [ -n "$MONGO" ]; then
-  # stderr is kept: "cannot query" covers a refused connection, a missing
-  # database and an unauthenticated one, and only the first is about mongod
-  # being down. Saying which saves an hour.
-  MONGO_ERR=$($MONGO --quiet "$DB_NAME" --eval 'print(db.chat_configs.countDocuments({}) + " chats, " + db.chat_configs.countDocuments({automation_enabled:true}) + " switched on, " + db.contacts.countDocuments({}) + " contacts, " + db.messages.countDocuments({}) + " messages")' 2>&1)
-  case "$MONGO_ERR" in
+# Queried through the application's own venv, not the mongosh on PATH. Two
+# reasons, and the first is why this changed: mongosh with no credentials kept
+# reporting "requires authentication" long after the app itself was connecting
+# perfectly well, because the app reads MONGODB_URI from .env and this did not.
+# Second, pymongo reads that file itself -- so a URI containing a password
+# never becomes a command-line argument, where `ps` shows it to everyone else
+# on the box.
+if [ -x "$APP_DIR/.venv/bin/python" ]; then
+  COUNTS=$(cd "$APP_DIR" && ./.venv/bin/python - <<'PYQUERY' 2>&1
+import sys
+sys.path.insert(0, ".")
+try:
+    from pathlib import Path
+    from pymongo import MongoClient
+    from wadam.config import load_settings
+    s = load_settings(Path(".env"))
+    db = MongoClient(s.mongodb_uri, serverSelectionTimeoutMS=4000)[s.database_name]
+    print("%d chats, %d switched on, %d contacts, %d messages, %d with media" % (
+        db.chat_configs.count_documents({}),
+        db.chat_configs.count_documents({"automation_enabled": True}),
+        db.contacts.count_documents({}),
+        db.messages.count_documents({}),
+        db.messages.count_documents({"media_path": {"$nin": ["", None]}})))
+except Exception as ex:
+    print("ERROR %s: %s" % (type(ex).__name__, ex))
+PYQUERY
+)
+  case "$COUNTS" in
     *chats*)
-      pass "$DB_NAME: $MONGO_ERR"
-      case "$MONGO_ERR" in
+      pass "$DB_NAME: $COUNTS"
+      case "$COUNTS" in
         "0 chats"*) note "empty — the first sync lands a few seconds after the service starts" ;;
       esac ;;
-    *"requires authentication"*|*Unauthorized*|*"not authorized"*)
-      fail "MongoDB requires authentication and the URI has no credentials"
-      note "MONGODB_URI in $APP_DIR/.env needs a user, then: sudo systemctl restart wadam" ;;
-    *"ECONNREFUSED"*|*"connect failed"*|*"Could not connect"*)
+    *"requires authentication"*|*Unauthorized*|*"not authorized"*|*AuthenticationFailed*)
+      fail "MongoDB refused the credentials in MONGODB_URI"
+      note "check the user and password in $APP_DIR/.env, then: sudo systemctl restart wadam" ;;
+    *ServerSelectionTimeout*|*"Connection refused"*)
       fail "MongoDB is not accepting connections — is mongod running?"
       note "sudo systemctl status mongod" ;;
     *)
-      fail "cannot query MongoDB database '$DB_NAME'"
-      note "$(printf '%s' "$MONGO_ERR" | head -1)" ;;
+      fail "could not query MongoDB"
+      note "$(printf '%s' "$COUNTS" | head -1)" ;;
   esac
 else
-  note "no mongosh on PATH — skipping the database check"
+  note "no venv at $APP_DIR/.venv — skipping the database check"
 fi
 
 MEDIA_DIR=$(get MEDIA_FOLDER); MEDIA_DIR="${MEDIA_DIR:-data/media}"
