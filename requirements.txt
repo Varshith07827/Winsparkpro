@@ -9,10 +9,15 @@
 # with the standard library, so none of them have anything to do — and with
 # them went the last reason this had to run on Windows.
 
-# Primary datastore. The [srv] extra pulls in dnspython, which pymongo REQUIRES
-# to resolve a mongodb+srv:// (Atlas) address — without it every Atlas
-# connection string fails no matter how correct it is.
-pymongo[srv]>=4.6
+# Primary datastore. dnspython — which pymongo needs to resolve a
+# mongodb+srv:// (Atlas) address, and without which every Atlas connection
+# string fails no matter how correct it is — used to be pulled in by a [srv]
+# extra. That extra no longer exists (pip warns "does not provide the extra
+# 'srv'" and installs nothing), because pymongo 4.7+ depends on dnspython
+# outright. Pinned here as well so the requirement is visible rather than
+# inherited, and so a downgrade cannot silently drop it.
+pymongo>=4.7
+dnspython>=2.6
 
 # Verifies the TLS certificate Atlas presents on images whose OS trust store is
 # incomplete. Used when present, skipped when not.

@@ -237,11 +237,11 @@ database.
 
 ## Running on a remote machine
 
-OpenWA and this application on the same remote box; you send to it from your
-own machine.
+OpenWA and this application on the same box you reach over RDP; you send to it
+from your own machine.
 
 ```
-   your machine                       remote machine
+   your machine                       the RDP box
                               ┌──────────────────────────┐
    POST /wam/  ──────────────▶│  wadam        :8766 ◀────┼── the only
    Bearer token               │    │              exposed│   open port
@@ -256,46 +256,103 @@ own machine.
 that instance never crosses the network; only the send API is exposed, and it
 does one thing.
 
-Three lines differ from a local install:
+### The thing that catches people
+
+**Docker Desktop runs as your logged-in user.** Disconnecting RDP is fine — the
+session stays logged in and containers keep running. **Logging off stops
+Docker, and OpenWA with it**, so WhatsApp goes offline until someone signs back
+in.
+
+Three ways out, in order of effort:
+
+1. **Disconnect, never log off.** Click the X on the RDP window rather than
+   Sign out. Works today; relies on nobody signing out.
+2. **Run the Docker *Engine* as a Windows service** instead of Docker Desktop.
+   No login session involved.
+3. **Put OpenWA on Linux.** No session concept at all.
+
+MongoDB and this application do not have the problem: Mongo runs as a Windows
+service, and the scheduled task below runs as SYSTEM.
+
+### Setup
+
+```bash
+git clone https://github.com/Varshith07827/Winsparkpro.git
+cd Winsparkpro
+powershell -ExecutionPolicy Bypass -File .\scripts\setup-remote.ps1 -InstallService
+```
+
+The script checks Python, MongoDB, Docker and OpenWA, creates the virtual
+environment, installs dependencies, writes a `.env` with a generated API token,
+and registers a scheduled task that starts at boot as SYSTEM. Safe to re-run —
+it never overwrites an existing `.env`.
+
+Add `-OpenFirewall` to open the send API port. Prefer a tunnel; see below.
+
+Then, in order:
+
+**1. OpenWA.** Its own `.env` needs two lines, then recreate its container:
 
 ```ini
-API_PORT=8766
-API_HOST=0.0.0.0
-API_TOKEN=<32+ random characters>
+SSRF_ALLOWED_HOSTS=host.docker.internal
+WWEBJS_WEB_VERSION=2.3000.1046012414-alpha
 ```
 
-Generate the token:
+The first lets it deliver webhooks to the host — its SSRF guard blocks private
+addresses, and without this registration fails silently and no message ever
+arrives. The second pins the WhatsApp Web build; without a pin, a rebuilt image
+can pick one your saved session cannot resume on, and OpenWA then clears the
+auth and asks for a new QR.
+
+**2. Link a session.** Open `http://localhost:2785` **in a browser on the RDP
+box** and scan the QR. Only a phone can do this, and it is the one step that
+cannot be automated or done remotely.
+
+**3. Add the API key.** `OPENWA_API_KEY` in `.env`, from OpenWA's
+`data/.api-key`.
+
+**4. Start it.**
 
 ```bash
-python -c "import secrets; print(secrets.token_urlsafe(32))"
+Start-ScheduledTask wadam
 ```
 
-Configuration **refuses to start** with `API_HOST` off loopback and a token
-that is missing or under 16 characters. Off loopback that token is the only
-thing between the network and your WhatsApp account.
-
-### Prefer a tunnel to an open port
+**5. Check it.**
 
 ```bash
-ssh -L 8766:localhost:8766 you@remote-machine
+Invoke-RestMethod http://localhost:8765/health
 ```
 
-Then POST to `127.0.0.1:8766` as though it were local, and leave
-`API_HOST=127.0.0.1` on the remote machine so the port is unreachable any other
-way. Plain HTTP on an open port sends your token in a header for anything on
-the path to read.
+### Reaching it from your machine
 
-### Keeping it running
+**A tunnel, preferably:**
 
 ```bash
-$action = New-ScheduledTaskAction -Execute "C:\path\to\.venv\Scripts\python.exe" -Argument "run_headless.py" -WorkingDirectory "C:\path\to\Winsparkpro"; Register-ScheduledTask -TaskName "wadam" -Action $action -Trigger (New-ScheduledTaskTrigger -AtStartup) -RunLevel Highest -User "SYSTEM"
+ssh -L 8766:localhost:8766 you@the-rdp-box
 ```
 
-It no longer needs a live desktop session. The old version drove WhatsApp
-Desktop through UI Automation and needed the RDP session logged in with the
-window visible — minimising it was enough to break a send.
+Then POST to `127.0.0.1:8766` as though it were local, and set
+`API_HOST=127.0.0.1` on the box so the port is unreachable any other way.
 
----
+**An open port, if you must.** Set `API_HOST=0.0.0.0`, keep `API_TOKEN`, and
+open the firewall. Configuration refuses to start with a non-loopback host and
+a missing or short token — off loopback that token is the only thing between
+the network and this WhatsApp account. Plain HTTP sends it in a header for
+anything on the path to read, so restrict the firewall rule to your own address
+if you can.
+
+### After a reboot
+
+| | Comes back on its own |
+|---|---|
+| MongoDB | Yes — Windows service, Automatic |
+| wadam | Yes — scheduled task at startup, as SYSTEM |
+| OpenWA | Only once someone logs in, if you use Docker Desktop |
+| The WhatsApp session | Yes, unless WhatsApp dropped the link while it was down |
+
+That last row is worth watching. A session that has gone to `qr_ready` needs a
+phone, so an unattended box can sit disconnected until someone notices — check
+`/health` for `"session": "ready"`.
 
 ## When something is wrong
 
