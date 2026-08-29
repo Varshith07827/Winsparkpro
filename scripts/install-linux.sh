@@ -50,21 +50,19 @@ if ! docker info >/dev/null 2>&1; then
 fi
 ok "Docker"
 
+# Compose is a convenience here, not a requirement: this installs exactly one
+# container, and `docker run` expresses the same thing. Ubuntu's own docker.io
+# package ships no compose plugin and `docker-compose-plugin` only exists in
+# Docker's repo, so insisting on it would send people adding apt sources for
+# a single container.
 if docker compose version >/dev/null 2>&1; then
   COMPOSE="docker compose"
 elif command -v docker-compose >/dev/null; then
   COMPOSE="docker-compose"
 else
-  die "docker compose is missing. Install it and re-run:
-
-          sudo apt update && sudo apt install -y docker-compose-plugin
-
-        If apt cannot find that, Docker came from the distro rather than
-        Docker's own repo — use  sudo apt install -y docker-compose  instead;
-        either is accepted. Re-run with  sg docker -c 'bash $0'  if this shell
-        does not have the docker group yet."
+  COMPOSE=""
 fi
-ok "$COMPOSE"
+ok "${COMPOSE:-docker run (no compose needed)}"
 
 if command -v mongod >/dev/null || systemctl is-active --quiet mongod 2>/dev/null; then
   ok "MongoDB present — this install will use its own database '$DB_NAME'"
@@ -81,15 +79,20 @@ ok "container reaches this host at $BRIDGE_IP"
 
 # ── 2. OpenWA ───────────────────────────────────────────────────────────
 say "OpenWA"
-mkdir -p "$OPENWA_DIR"
-cd "$OPENWA_DIR"
+mkdir -p "$OPENWA_DIR/data"
 
-if [ ! -f docker-compose.yml ]; then
-  cat > docker-compose.yml <<COMPOSEEOF
+# Every option below has to match between the two paths, so they are named once.
+OPENWA_IMAGE="${OPENWA_IMAGE:-rmyndharis/openwa:latest}"
+OPENWA_NAME="openwa-api"
+
+if [ -n "$COMPOSE" ]; then
+  cd "$OPENWA_DIR"
+  if [ ! -f docker-compose.yml ]; then
+    cat > docker-compose.yml <<COMPOSEEOF
 services:
   openwa:
-    image: rmyndharis/openwa:latest
-    container_name: openwa-api
+    image: $OPENWA_IMAGE
+    container_name: $OPENWA_NAME
     restart: unless-stopped
     # Loopback only. Nothing outside this machine has any business reaching
     # OpenWA — its API key can do anything on the instance.
@@ -106,12 +109,29 @@ services:
       # does not, so it is added explicitly.
       - "host.docker.internal:host-gateway"
 COMPOSEEOF
-  ok "wrote $OPENWA_DIR/docker-compose.yml"
+    ok "wrote $OPENWA_DIR/docker-compose.yml"
+  else
+    ok "docker-compose.yml already exists — left alone"
+  fi
+  $COMPOSE up -d
+elif docker ps -a --format '{{.Names}}' | grep -qx "$OPENWA_NAME"; then
+  docker start "$OPENWA_NAME" >/dev/null
+  ok "started the existing container"
 else
-  ok "docker-compose.yml already exists — left alone"
+  # An array rather than backslash continuations: those collapse silently if
+  # anything ever rewrites this file, and a 250-character docker run is not
+  # something anyone should have to read.
+  run=(docker run -d
+    --name "$OPENWA_NAME"
+    --restart unless-stopped
+    -p 127.0.0.1:2785:2785
+    -v "$OPENWA_DIR/data:/app/data"
+    -e "SSRF_ALLOWED_HOSTS=$BRIDGE_IP,host.docker.internal"
+    --add-host "host.docker.internal:host-gateway"
+    "$OPENWA_IMAGE")
+  "${run[@]}" >/dev/null
+  ok "created the container with docker run"
 fi
-
-$COMPOSE up -d
 ok "container up"
 
 printf '   waiting for OpenWA to answer'
@@ -120,7 +140,7 @@ for _ in $(seq 1 60); do
   printf '.'; sleep 2
 done
 printf '\n'
-curl -sf -m 5 http://127.0.0.1:2785/api/health >/dev/null || die "OpenWA did not come up — check: $COMPOSE -f $OPENWA_DIR/docker-compose.yml logs --tail 40"
+curl -sf -m 5 http://127.0.0.1:2785/api/health >/dev/null   || die "OpenWA did not come up — check:  docker logs --tail 40 $OPENWA_NAME"
 ok "OpenWA healthy"
 
 for _ in $(seq 1 30); do
