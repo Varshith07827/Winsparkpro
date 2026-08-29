@@ -95,12 +95,17 @@ done
 if [ -n "$HEALTH" ]; then
   pass "webhook listener on $WEBHOOK_HOST:$WEBHOOK_PORT"
   printf '       %s\n' "$HEALTH"
+  # Matched as a PREFIX, no closing quote: the value is "connected · wa_events",
+  # not "connected", so requiring the full value made this fire on a database
+  # that was working -- a false alarm from a status string I added myself.
+  # "disconnected" cannot match, because the pattern needs a quote immediately
+  # before the word.
   # The listener answering says nothing about the store behind it. The
   # repository catches MongoDB failures and keeps going on its in-memory
   # dicts and the JSON mirror, so a database that refuses every write still
   # looks perfectly healthy from out here. The payload is the only place it
   # shows, so it is checked rather than printed and left to the reader.
-  if ! printf '%s' "$HEALTH" | grep -q '"mongo": *"connected"'; then
+  if ! printf '%s' "$HEALTH" | grep -q '"mongo": *"connected'; then
     fail "the app cannot write to MongoDB — see the mongo field above"
     note "sending still works, and resolution is in memory, but nothing"
     note "is persisted except to the capped JSON mirror in data/"
