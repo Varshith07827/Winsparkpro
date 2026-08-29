@@ -37,11 +37,24 @@ command -v docker >/dev/null || die "docker not installed:  curl -fsSL https://g
 if ! docker info >/dev/null 2>&1; then
   DOCKER_ERR=$(docker info 2>&1 || true)
   if echo "$DOCKER_ERR" | grep -qi "permission denied"; then
-    die "no permission on the docker socket. Add yourself to the group and re-run
-        without logging out:
+    # Being in the group and having it in THIS shell are different things:
+    # usermod takes effect at the next login, so telling someone who has
+    # already run it to run it again is the least useful thing to say.
+    if id -nG | grep -qw docker; then
+      die "you are in the docker group, but this shell started before that
+        happened. Either re-run it with the group applied:
+
+          sg docker -c 'bash $0'
+
+        or open a new session (reconnect, if this is VS Code Remote) and run
+        it normally."
+    else
+      die "no permission on the docker socket. Add yourself to the group and
+        re-run without logging out:
 
           sudo usermod -aG docker \$USER
           sg docker -c 'bash $0'"
+    fi
   elif ! systemctl is-active --quiet docker 2>/dev/null; then
     die "the docker daemon is not running:  sudo systemctl enable --now docker"
   else
