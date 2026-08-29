@@ -80,6 +80,8 @@ or set `WEBHOOK_PUBLIC_URL` to an address the container can reach.
 | `ANSWER_GROUPS` | `false` |
 | `API_PORT` | unset — the send API is off |
 | `DATABASE_NAME` | `wa_events` |
+| `MEDIA_FOLDER` | `data/media` — received files, and the only directory a file may be sent *from* |
+| `MEDIA_MAX_MB` | `32` — largest file kept or sent |
 
 ---
 
@@ -137,6 +139,46 @@ cd "C:/Users/alone/OneDrive/Desktop/OpenWA/Winsparkpro" && curl -s -X POST http:
 `id` may also be `chat`, `chat_id`, `contact` or `to`. The text may be `msg`,
 `message`, `text`, `reply` or `body`.
 
+### Sending a photo or a document
+
+Add `media` — a URL, or a path to a file **inside `data/media/`**. Text becomes
+the caption and is optional; either alone is a complete request.
+
+**bash**
+
+```bash
+curl -s -X POST http://127.0.0.1:8766/wam/ -H "Content-Type: application/json" -d '{"id":"Priya Menon","msg":"the invoice","media":{"path":"outbox/invoice.pdf"}}'
+```
+
+**cmd**
+
+```bash
+curl -s -X POST http://127.0.0.1:8766/wam/ -H "Content-Type: application/json" -d "{\"id\":\"Priya Menon\",\"msg\":\"the invoice\",\"media\":{\"path\":\"outbox/invoice.pdf\"}}"
+```
+
+**PowerShell**
+
+```bash
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8766/wam/ -ContentType 'application/json' -Body '{"id":"Priya Menon","msg":"the invoice","media":{"path":"outbox/invoice.pdf"}}'
+```
+
+Shorthands work too: `{"image": "https://…/photo.jpg"}`, `{"document":
+"outbox/report.pdf"}`, or `{"media": "https://…"}`. The kind — image, video,
+audio, document, sticker — is taken from the key or the mimetype when you do
+not say; WhatsApp renders these genuinely differently, so an image sent as a
+document shows as a file card with no preview.
+
+**A path must be inside `data/media/`.** Put what you want to send in
+`data/media/outbox/`. Anything else is a **400** `bad_media`, and that is not
+tidiness: the same field is accepted from a webhook reply, and a webhook
+endpoint is code on somebody else's machine. Unconfined, `{"media": {"path":
+"/etc/shadow"}}` would make this application read that file and post it into a
+WhatsApp conversation. Symlinks are resolved before the check, so a link inside
+the directory pointing outside it is refused too.
+
+A **URL** is not fetched by this application at all — it is handed to OpenWA,
+which fetches it behind its own SSRF guard.
+
 ### Addressing, and why it refuses
 
 A chat is `111111111111111@lid`. That is **not derivable from a phone number**,
@@ -172,12 +214,48 @@ What sits behind that URL is your business and invisible here.
                "direction": "in", "media_kind": "", "detected_at": "…" } }
 ```
 
+When the message carried a photo or a file, a `media` object is present too —
+metadata and a path, never the bytes:
+
+```json
+{ "media": { "kind": "image", "path": "111111111111111@lid/ABC123.jpg",
+             "mimetype": "image/png", "filename": "photo.png",
+             "size": 51234, "stored": true, "error": "" } }
+```
+
+`path` is relative to `data/media/`. `stored` is false and `error` says why
+when the file was not kept — usually `OpenWA omitted the payload`, which means
+OpenWA's own size cap or timeout dropped it before it ever reached here. That
+is a setting on the gateway, not a fault on this side.
+
+The key is absent entirely for a message with no media, so an endpoint written
+before any of this existed sees exactly the payload it already understands.
+
 Answer with any of these:
 
 ```
 {"reply": "Confirmed"}   {"message": …}   {"text": …}
 {"data": {"reply": …}}   "Confirmed"      Confirmed
 ```
+
+### Answering with a photo or a file
+
+```
+{"media": {"url": "https://…/photo.jpg", "caption": "Here"}}
+{"media": {"path": "outbox/report.pdf"}}
+{"image": "https://…"}      {"document": "outbox/report.pdf"}
+{"reply": "Attached", "media": {…}}      text and file together
+```
+
+A **path is confined to `data/media/`** — put files to send in
+`data/media/outbox/`. This is the same boundary the send API enforces and it
+matters more here, because this end of it is your endpoint: without it, an
+endpoint (or anyone who has compromised one) could name any file on the server
+and have it posted into a WhatsApp chat. A **URL** is passed to OpenWA to
+fetch, so this application never makes that request itself.
+
+Naming both a `url` and a `path` is ignored rather than guessed — they are
+different bytes, and sending the wrong file is not a thing to do quietly.
 
 **An empty answer is a success.** `{}`, `204`, or an empty body all mean "seen,
 don't answer" — recorded, never retried. Most messages do not want an answer.

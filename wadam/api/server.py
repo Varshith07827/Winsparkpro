@@ -39,6 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Optional
 
 from wadam import constants
+from wadam.engine.webhook import media_from_object
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +78,7 @@ class SendApiServer:
     class knows nothing about WhatsApp, MongoDB or Qt."""
 
     def __init__(self, host: str, port: int, token: str,
-                 send: Callable[[str, str], SendResponse],
+                 send: Callable[[str, str, Any], SendResponse],
                  status: Optional[Callable[[str], SendResponse]] = None) -> None:
         self._host = host
         self._port = port
@@ -187,12 +188,22 @@ class SendApiServer:
 
         identifier = _first_string(parsed, _ID_KEYS)
         text = _first_string(parsed, _TEXT_KEYS)
+        # The same shapes an endpoint may answer with, read by the same
+        # function -- {"media": {...}}, {"image": "https://…"}, and so on.
+        media = media_from_object(parsed)
+        if media is None and isinstance(parsed.get("data"), dict):
+            media = media_from_object(parsed["data"])
+
         if not identifier:
             return SendResponse(400, {"ok": False, "code": "missing_id",
                                       "error": 'Missing "id" — the chat to send to.'})
-        if not text:
-            return SendResponse(400, {"ok": False, "code": "missing_message",
-                                      "error": 'Missing "message" — nothing to send.'})
+        if not text and media is None:
+            # Either alone is a complete request: a caption-less photo is a
+            # normal thing to send, and so is a line of text.
+            return SendResponse(400, {
+                "ok": False, "code": "missing_message",
+                "error": 'Missing "message" — send text, or "media" with a url or path.',
+            })
 
         if not self._semaphore.acquire(blocking=False):
             return SendResponse(503, {
@@ -201,7 +212,7 @@ class SendApiServer:
             })
         try:
             self._requests += 1
-            return self._send(identifier, text)
+            return self._send(identifier, text, media)
         finally:
             self._semaphore.release()
 

@@ -139,6 +139,15 @@ else
   note "no mongosh on PATH — skipping the database check"
 fi
 
+MEDIA_DIR=$(get MEDIA_FOLDER); MEDIA_DIR="${MEDIA_DIR:-data/media}"
+case "$MEDIA_DIR" in /*) ;; *) MEDIA_DIR="$APP_DIR/$MEDIA_DIR" ;; esac
+if [ -d "$MEDIA_DIR/outbox" ]; then
+  pass "media: $(find "$MEDIA_DIR" -type f 2>/dev/null | wc -l) file(s), outbox at $MEDIA_DIR/outbox"
+else
+  fail "no media directory at $MEDIA_DIR"
+  note "it is created at startup — the service may not have started yet"
+fi
+
 DEFAULT_HOOK=$(get DEFAULT_WEBHOOK)
 if [ -n "$DEFAULT_HOOK" ]; then
   pass "DEFAULT_WEBHOOK is $DEFAULT_HOOK"

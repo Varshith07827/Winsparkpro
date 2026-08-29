@@ -33,6 +33,7 @@ from wadam.engine.metrics import Metrics, MetricsSnapshot
 from wadam.engine.pipeline import MessagePipeline, Outcome
 from wadam.engine.webhook import WebhookClient
 from wadam.openwa import OpenWAClient, inbound
+from wadam.storage.media import MediaStore
 from wadam.storage.repository import Repository
 
 logger = logging.getLogger(__name__)
@@ -73,6 +74,13 @@ class AutomationService:
         self._client = OpenWAClient(
             settings.openwa_url, settings.openwa_api_key, settings.openwa_session_id,
         )
+        # Created here rather than lazily on the first photo: the outbox has to
+        # exist for someone to put a file in it before anything has ever been
+        # received, and a directory that appears only after the first inbound
+        # image is a directory nobody can find when they need it.
+        self._media = MediaStore(settings.media_folder, settings.media_max_bytes)
+        self._media.prepare()
+
         self._pipeline = MessagePipeline(
             repository=repository,
             client=self._client,
@@ -85,6 +93,7 @@ class AutomationService:
             metrics=self._metrics,
             answer_groups=settings.answer_groups,
             default_webhook=settings.default_webhook,
+            media=self._media,
         )
         self.directory = Directory(repository, self._client)
         self._server: Optional[ThreadingHTTPServer] = None
@@ -129,6 +138,12 @@ class AutomationService:
     @property
     def running(self) -> bool:
         return self._server is not None
+
+    @property
+    def media(self) -> MediaStore:
+        """The media directory. Exposed so the send API and the window read
+        and write media through the same confinement rule the pipeline does."""
+        return self._media
 
     @property
     def client(self) -> OpenWAClient:

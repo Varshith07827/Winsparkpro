@@ -53,6 +53,14 @@ def verify_signature(body: bytes, header_value: Optional[str], secret: str) -> b
     return hmac.compare_digest(expected, header_value.strip())
 
 
+def _as_int(value: Any) -> int:
+    """An int, or 0. A size arriving as the string "1024" is still a size."""
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _first(source: Mapping[str, Any], keys: Sequence[str]) -> str:
     for key in keys:
         value = source.get(key)
@@ -93,6 +101,34 @@ class InboundMessage:
 
     raw: Mapping[str, Any]
 
+    # --- the media object, when the delivery carried one ------------------
+    # Defaulted and last so every existing construction site still compiles:
+    # a message with no media is the overwhelming majority, and making callers
+    # spell out five empty fields to say "no picture" is how they get wrong.
+    #
+    # OpenWA puts the bytes IN the delivery as base64 (`media.data`), so the
+    # common case needs no second request -- which also means no race against
+    # the gateway's own retention, and nothing to get a 404 from.
+    media_mimetype: str = ""
+    media_filename: str = ""
+
+    media_base64: str = ""
+    """Base64 of the file. Empty when `media_omitted`, and when the engine sent
+    metadata without a payload."""
+
+    media_omitted: bool = False
+    """OpenWA dropped the payload itself -- its own size cap, a timeout, or
+    concurrency saturation. `media_size` is then the size it would have been.
+    Recorded as itself rather than as a missing file: it is configuration on
+    someone else's side, not a failure here, and the two want different fixes."""
+
+    media_size: int = 0
+
+    @property
+    def has_media(self) -> bool:
+        """Did this carry media, whether or not the bytes came with it?"""
+        return bool(self.media_kind or self.media_mimetype or self.media_base64)
+
 
 def parse_delivery(payload: Mapping[str, Any]) -> Optional[InboundMessage]:
     """Return the message in a webhook body, or None if there is not one.
@@ -124,6 +160,13 @@ def parse_delivery(payload: Mapping[str, Any]) -> Optional[InboundMessage]:
     chat_name = (_first(source, _NAME_KEYS) or _first(data, _NAME_KEYS)
                  or _first(contact, _NAME_KEYS) or "")
 
+    # `media` sits beside the message fields, not inside them. Read leniently
+    # like everything else here: a rename upstream should cost a missing
+    # attachment, not a delivery this cannot parse at all.
+    media = source.get("media") if isinstance(source.get("media"), Mapping) else {}
+    if not media and isinstance(data.get("media"), Mapping):
+        media = data["media"]
+
     return InboundMessage(
         chat_id=chat_id,
         chat_name=chat_name,
@@ -134,6 +177,11 @@ def parse_delivery(payload: Mapping[str, Any]) -> Optional[InboundMessage]:
         is_group=chat_id.endswith("@g.us"),
         is_outgoing=direction == "outgoing" or from_me,
         raw=source,
+        media_mimetype=_first(media, ("mimetype", "mimeType", "contentType")),
+        media_filename=_first(media, ("filename", "fileName", "name")),
+        media_base64=_first(media, ("data", "base64", "body")),
+        media_omitted=bool(media.get("omitted")),
+        media_size=_as_int(media.get("sizeBytes") or media.get("size")),
     )
 
 

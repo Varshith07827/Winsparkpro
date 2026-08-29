@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from wadam.constants import DATABASE_NAME
+from wadam.constants import DATABASE_NAME, DEFAULT_MEDIA_MAX_BYTES
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -108,6 +108,17 @@ class Settings:
     database_name: str = DATABASE_NAME
     json_backup_folder: Path = field(default_factory=lambda: app_dir() / "backup")
     json_autosave_interval: float = 15.0
+
+    #: Where received media is written, and the only directory a webhook reply
+    #: is allowed to send a file out of. Both halves matter -- see
+    #: `storage/media.py`, which explains why an unconfined path is an
+    #: exfiltration primitive handed to whoever runs your endpoint.
+    media_folder: Path = field(default_factory=lambda: app_dir() / "data" / "media")
+
+    #: Largest media file kept or sent, in bytes. WhatsApp refuses well below
+    #: this; the cap is here so a broken or hostile gateway cannot fill the
+    #: disk one message at a time.
+    media_max_bytes: int = DEFAULT_MEDIA_MAX_BYTES
 
     # --- OpenWA, the transport -------------------------------------------
     #: Where the OpenWA gateway is. This process talks to it over HTTP; there
@@ -338,6 +349,17 @@ def load_settings(env_path: Optional[Path] = None) -> Settings:
         folder = app_dir() / folder
 
     autosave = _as_float(values, "JSON_AUTOSAVE_INTERVAL", 15.0, problems, minimum=0.0)
+
+    # Both media keys are optional and both have working defaults, in keeping
+    # with getting .env down to two required lines.
+    media_raw = (values.get("MEDIA_FOLDER") or "data/media").strip() or "data/media"
+    media_folder = Path(media_raw)
+    if not media_folder.is_absolute():
+        media_folder = app_dir() / media_folder
+
+    media_max_mb = _as_float(values, "MEDIA_MAX_MB", DEFAULT_MEDIA_MAX_BYTES / (1024 * 1024),
+                             problems, minimum=0.0)
+    media_max_bytes = int(media_max_mb * 1024 * 1024)
     log_level = (values.get("LOG_LEVEL") or "INFO").strip().upper() or "INFO"
     if log_level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
         problems.append(f"LOG_LEVEL must be DEBUG, INFO, WARNING, ERROR or CRITICAL (got {log_level!r}).")
@@ -420,6 +442,8 @@ def load_settings(env_path: Optional[Path] = None) -> Settings:
         database_name=database_name,
         json_backup_folder=folder,
         json_autosave_interval=autosave,
+        media_folder=media_folder,
+        media_max_bytes=media_max_bytes,
         openwa_url=openwa_url,
         openwa_api_key=openwa_api_key,
         openwa_session_id=openwa_session_id,

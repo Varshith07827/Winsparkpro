@@ -51,6 +51,128 @@ _REPLY_KEYS = ("reply", "message", "text", "body", "answer")
 _RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 
 
+#: Keys whose name alone says what kind of media it is, so
+#: `{"image": "https://…"}` needs no second field to be understood.
+_MEDIA_KIND_KEYS = ("image", "video", "audio", "voice", "document", "file", "sticker")
+
+
+@dataclass(frozen=True)
+class MediaReply:
+    """Media an endpoint asked to have sent.
+
+    Either `url` or `path`, never both. A URL is handed to OpenWA, which
+    fetches it behind its own SSRF guard; a path is read by this process and
+    is therefore confined to the media directory — see `storage/media.py` for
+    why an unconfined one would be an exfiltration primitive handed to
+    whoever runs the endpoint.
+    """
+
+    url: str = ""
+    path: str = ""
+    kind: str = ""
+    """image | video | audio | document | sticker. Empty means "work it out
+    from the mimetype", which is what happens for a bare URL."""
+
+    caption: str = ""
+    filename: str = ""
+    mimetype: str = ""
+
+    @property
+    def empty(self) -> bool:
+        return not (self.url or self.path)
+
+
+def parse_media_reply(body: str) -> Optional[MediaReply]:
+    """The media an endpoint asked for, or None.
+
+    Lenient in the same way as `parse_reply`, and for the same reason: the
+    endpoint is somebody else's code, and a bridge that accepted exactly one
+    spelling would be a bridge you had to write an adapter for.
+
+        {"media": {"url": "https://…", "caption": "Here"}}
+        {"media": {"path": "outbox/report.pdf"}}
+        {"media": "https://…/photo.jpg"}
+        {"image": "https://…"}          {"document": "outbox/report.pdf"}
+        {"reply": "Attached", "media": {…}}     text and media together
+
+    A bare string is read as a URL when it looks like one and a path
+    otherwise, because a path is the case that must not be guessed *into* a
+    fetch: treating `outbox/x.pdf` as a URL would have OpenWA request it.
+    """
+    text = (body or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+
+    nested = parsed.get("data")
+    for source in (parsed, nested if isinstance(nested, dict) else {}):
+        found = media_from_object(source)
+        if found is not None:
+            return found
+    return None
+
+
+def media_from_object(source: dict) -> Optional[MediaReply]:
+    """The media named by an already-parsed object, or None.
+
+    Public because the send API takes the same shapes in a request body that
+    an endpoint may answer with, and one implementation of "what counts as
+    media here" is the only way those two stay the same thing.
+    """
+    raw = source.get("media")
+    kind = ""
+    if raw is None:
+        for key in _MEDIA_KIND_KEYS:
+            if source.get(key):
+                raw, kind = source[key], ("document" if key == "file" else key)
+                break
+    if raw is None:
+        return None
+
+    if isinstance(raw, str):
+        return _media_from_string(raw, kind)
+    if not isinstance(raw, dict):
+        return None
+
+    url = str(raw.get("url") or "").strip()
+    path = str(raw.get("path") or raw.get("file") or "").strip()
+    if not url and not path:
+        # A single unlabelled value inside the object, e.g. {"media": {"image": "…"}}.
+        for key in _MEDIA_KIND_KEYS:
+            if raw.get(key):
+                return _media_from_string(str(raw[key]), "document" if key == "file" else key)
+        return None
+    if url and path:
+        # Refusing beats picking: the two name different bytes, and sending the
+        # wrong file is the failure this codebase consistently declines to
+        # make quietly.
+        logger.warning("media reply gave both a url and a path; ignoring it")
+        return None
+
+    return MediaReply(
+        url=url,
+        path=path,
+        kind=str(raw.get("kind") or raw.get("type") or kind or "").strip().lower(),
+        caption=str(raw.get("caption") or raw.get("text") or "").strip(),
+        filename=str(raw.get("filename") or raw.get("name") or "").strip(),
+        mimetype=str(raw.get("mimetype") or raw.get("mimeType") or "").strip(),
+    )
+
+
+def _media_from_string(value: str, kind: str) -> Optional[MediaReply]:
+    cleaned = (value or "").strip()
+    if not cleaned:
+        return None
+    if cleaned.startswith(("http://", "https://")):
+        return MediaReply(url=cleaned, kind=kind)
+    return MediaReply(path=cleaned, kind=kind)
+
+
 @dataclass
 class WebhookOutcome:
     """What one call to an endpoint produced."""
@@ -62,10 +184,14 @@ class WebhookOutcome:
     error: str = ""
     attempts: int = 1
     duration_ms: float = 0.0
+    reply_media: Optional["MediaReply"] = None
+    """Media the endpoint asked to have sent, or None. Independent of
+    `reply_text`: an endpoint may answer with a caption and a file, either one
+    alone, or neither."""
 
     @property
     def wants_reply(self) -> bool:
-        return bool(self.reply_text.strip())
+        return bool(self.reply_text.strip()) or self.reply_media is not None
 
 
 def build_payload(chat: ChatConfig, message: StoredMessage) -> dict:
@@ -77,7 +203,7 @@ def build_payload(chat: ChatConfig, message: StoredMessage) -> dict:
     worth having: an endpoint keyed on phone number no longer has to resolve
     one itself.
     """
-    return {
+    payload = {
         "event": "message.received",
         "app": {"name": constants.APP_NAME, "version": constants.APP_VERSION},
         "chat": {
@@ -95,6 +221,25 @@ def build_payload(chat: ChatConfig, message: StoredMessage) -> dict:
             "detected_at": message.detected_at.isoformat() if message.detected_at else "",
         },
     }
+
+    # Present only when there was media, so an endpoint written before any of
+    # this existed sees a payload it already understands.
+    #
+    # Metadata and a path -- never the bytes. Base64 in the POST would inflate
+    # every delivery by a third of the file for an endpoint that mostly does
+    # not want it, and it would put the contents of someone's photos into the
+    # request log of whatever sits behind that URL.
+    if message.media_kind or message.media_path or message.media_error:
+        payload["media"] = {
+            "kind": message.media_kind,
+            "path": message.media_path,
+            "mimetype": message.media_mimetype,
+            "filename": message.media_filename,
+            "size": message.media_size,
+            "stored": bool(message.media_path),
+            "error": message.media_error,
+        }
+    return payload
 
 
 def parse_reply(body: str) -> str:
@@ -175,6 +320,7 @@ class WebhookClient:
                     ok=True,
                     status_text=f"{response.status} {response.reason}".strip(),
                     reply_text=parse_reply(raw),
+                    reply_media=parse_media_reply(raw),
                     body=raw[:1000],
                     attempts=attempt,
                 )

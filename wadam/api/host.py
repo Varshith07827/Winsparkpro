@@ -25,6 +25,7 @@ import logging
 from wadam.api.server import SendApiServer, SendResponse
 from wadam.config import Settings
 from wadam.domain.models import ChatConfig
+from wadam.engine.pipeline import MediaError
 from wadam.engine.service import AutomationService
 from wadam.openwa import SendError
 from wadam.storage.repository import Repository
@@ -71,7 +72,7 @@ class SendApiHost:
     # must agree about what a name means. Two implementations of "which chat is
     # this?" is two chances to disagree, and the disagreement would be silent.
 
-    def _send(self, identifier: str, text: str) -> SendResponse:
+    def _send(self, identifier: str, text: str, media=None) -> SendResponse:
         answer = self._service.directory.resolve(identifier)
 
         if answer.ambiguous:
@@ -97,14 +98,29 @@ class SendApiHost:
 
         chat = self._repo.get_chat(target)
 
+        recorded = text
         try:
-            self._service.client.send_text(target, text)
+            if media is not None:
+                # Through the pipeline, not the client: `send_media` is where
+                # the confinement rule for local paths lives, and routing round
+                # it here would give the API a second, weaker answer to the
+                # question of which files may leave this machine.
+                sent = self._service.pipeline.send_media(target, media, caption=text)
+                recorded = text or f"[{media.kind or 'media'}] {sent}"
+            else:
+                self._service.client.send_text(target, text)
+        except MediaError as error:
+            # Refused before OpenWA was asked, so the request is what is wrong.
+            # 502 here would send the caller to read the gateway's logs for a
+            # send it never saw.
+            logger.warning("send API refused media for %s: %s", target, error)
+            return SendResponse(400, {"ok": False, "code": "bad_media", "error": str(error)})
         except SendError as error:
             logger.error("send API could not send to %s: %s", target, error)
             return SendResponse(502, {"ok": False, "code": "send_failed", "error": str(error)})
 
         if chat is not None:
-            self._service.pipeline.record_outgoing(chat, text, origin="api")
+            self._service.pipeline.record_outgoing(chat, recorded, origin="api")
             self._service.publish()
 
         return SendResponse(200, {"ok": True, "chat": chat_name, "chatId": target})

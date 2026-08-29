@@ -84,6 +84,13 @@ JSON_LOG_LIMIT = 2000
 #: share a database with real messages.
 DATABASE_NAME = "wa_events"
 
+#: Default ceiling on a media file kept or sent, in bytes. Overridable with
+#: MEDIA_MAX_MB. WhatsApp's own limits are lower and vary by type and client;
+#: this is a floor under the disk, not an attempt to predict what WhatsApp
+#: will accept -- the gateway rejects an oversized send with an error that
+#: says so, which is a better answer than a guess made here.
+DEFAULT_MEDIA_MAX_BYTES = 32 * 1024 * 1024
+
 # There were four webhook-template constants here — a `{phone_number}`
 # placeholder, a `{chat_name}` one, an empty default and an example of the
 # shape — because every chat got its own URL derived from a global template.

@@ -20,10 +20,16 @@ from __future__ import annotations
 import json
 import logging
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+#: Ceiling on one media transfer. Separate from the MediaStore's cap: this one
+#: bounds what is held in memory while downloading, before anything has decided
+#: whether the file is worth keeping.
+_MAX_MEDIA_BYTES = 64 * 1024 * 1024
 
 
 class SendError(RuntimeError):
@@ -64,6 +70,87 @@ class OpenWAClient:
             raise SendError("refusing to send without a chat id")
 
         return self._post(self.send_url, {"chatId": chat_id, "text": text})
+
+    # ── media ─────────────────────────────────────────────────────────
+
+    #: Which send endpoint a kind of media goes to. WhatsApp treats these as
+    #: genuinely different message types — an image sent as a document renders
+    #: as a file card with no preview — so the choice is not cosmetic.
+    MEDIA_ENDPOINTS = {
+        "image": "send-image",
+        "video": "send-video",
+        "audio": "send-audio",
+        "ptt": "send-audio",
+        "voice": "send-audio",
+        "document": "send-document",
+        "sticker": "send-sticker",
+    }
+
+    @staticmethod
+    def kind_for(mimetype: str, filename: str = "") -> str:
+        """The kind of media `mimetype` should be sent as.
+
+        Document is the fallback rather than image, because it is the only kind
+        that carries an arbitrary payload without WhatsApp trying to decode it:
+        an unrecognised type sent as an image is refused or renders broken,
+        whereas anything at all can be a document.
+        """
+        major = (mimetype or "").split("/", 1)[0].strip().lower()
+        if major in ("image", "video", "audio"):
+            return major
+        return "document"
+
+    def download_media(self, chat_id: str, message_id: str) -> tuple[bytes, str]:
+        """The bytes of a message's media, and its mimetype.
+
+        Raises SendError, including for the 404 OpenWA returns when it has
+        nothing stored — which is a normal answer rather than a fault: media
+        download can be switched off on the instance, the payload may have been
+        over its cap when it arrived, and a URL-based send never stores bytes
+        at all. The caller records the reason and keeps the message.
+        """
+        if not chat_id or not message_id:
+            raise SendError("need both a chat id and a message id to fetch media")
+        return self._request_bytes(
+            f"{self._base_url}/api/sessions/{self._session_id}"
+            f"/messages/{_quote(chat_id)}/{_quote(message_id)}/media")
+
+    def send_media(self, chat_id: str, kind: str, *, url: str = "", base64_data: str = "",
+                   mimetype: str = "", filename: str = "", caption: str = "") -> dict:
+        """Send media to `chat_id`. Raises SendError if it did not go.
+
+        Exactly one of `url` or `base64_data`. OpenWA lets base64 win when both
+        are present, so passing both is not an error there — it is only a way
+        to be surprised later about which one went. This refuses instead.
+        """
+        if not chat_id:
+            raise SendError("refusing to send without a chat id")
+        if bool(url) == bool(base64_data):
+            raise SendError("send_media needs exactly one of url or base64_data")
+
+        endpoint = self.MEDIA_ENDPOINTS.get((kind or "").lower())
+        if endpoint is None:
+            raise SendError(
+                f"{kind!r} is not a kind of media this can send. One of: "
+                + ", ".join(sorted(set(self.MEDIA_ENDPOINTS))))
+
+        body: dict = {"chatId": chat_id}
+        if url:
+            body["url"] = url
+        else:
+            body["base64"] = base64_data
+        if mimetype:
+            body["mimetype"] = mimetype
+        if filename:
+            body["filename"] = filename
+        # Audio and sticker sends render no caption. WhatsApp drops it silently
+        # rather than refusing, which is the worse of the two outcomes — the
+        # caller believes they sent something that nobody will ever see.
+        if caption and endpoint not in ("send-audio", "send-sticker"):
+            body["caption"] = caption
+
+        return self._post(
+            f"{self._base_url}/api/sessions/{self._session_id}/messages/{endpoint}", body)
 
     # ── the directory ─────────────────────────────────────────────────
 
@@ -229,12 +316,47 @@ class OpenWAClient:
             # unreadable. Surfaced rather than swallowed, and never retried.
             raise SendError(f"unreadable response from OpenWA: {error}") from error
 
+    def _request_bytes(self, url: str) -> tuple[bytes, str]:
+        """GET raw bytes and the Content-Type. Used only for media.
+
+        Separate from `_request` rather than a flag on it: that one sets a JSON
+        Content-Type, decodes as UTF-8 and parses the result, and every one of
+        those steps is wrong for a JPEG. `read()` is bounded because the
+        response is written to disk and nothing upstream promises a size.
+        """
+        request = urllib.request.Request(
+            url, method="GET", headers={"x-api-key": self._api_key})
+        try:
+            with urllib.request.urlopen(request, timeout=self._timeout) as response:
+                data = response.read(_MAX_MEDIA_BYTES + 1)
+                if len(data) > _MAX_MEDIA_BYTES:
+                    raise SendError(
+                        f"media at {url} is larger than the {_MAX_MEDIA_BYTES} byte "
+                        f"transfer limit")
+                mimetype = (response.headers.get("Content-Type") or "").split(";")[0].strip()
+                return data, mimetype
+        except urllib.error.HTTPError as error:
+            detail = error.read().decode("utf-8", "replace")[:300]
+            raise SendError(f"OpenWA returned {error.code}: {detail}", status=error.code) from error
+        except urllib.error.URLError as error:
+            raise SendError(f"cannot reach OpenWA at {self._base_url}: {error.reason}") from error
+
     def _get(self, path: str):
         """GET a path relative to the base URL."""
         return self._request("GET", f"{self._base_url}{path}")
 
     def _post(self, url: str, body: dict):
         return self._request("POST", url, body)
+
+
+def _quote(value: str) -> str:
+    """One path segment, escaped.
+
+    Chat ids and WhatsApp message ids contain "@" and "+", and message ids also
+    contain "/" — which without this ends the segment early and turns a media
+    fetch into a request for a route that does not exist.
+    """
+    return urllib.parse.quote(str(value or ""), safe="")
 
 
 def _rows(payload, key: str) -> list[dict]:

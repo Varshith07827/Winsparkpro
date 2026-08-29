@@ -231,6 +231,22 @@ class StoredMessage:
     text: str = ""
     direction: str = "in"      # "in" (received) | "out" (sent by us)
     media_kind: str = ""       # image | video | audio | document | sticker | ""
+
+    # --- the media file itself, when there was one -----------------------
+    #: Path to the saved bytes, RELATIVE to the media root. Relative because
+    #: this is written to MongoDB and to the JSON mirror, and an absolute path
+    #: stops being true the moment the application moves host, is containerised
+    #: or is restored somewhere whose home directory is elsewhere.
+    media_path: str = ""
+    media_mimetype: str = ""
+    media_size: int = 0
+    media_filename: str = ""
+
+    #: Why there is a `media_kind` but no `media_path`. Kept because the two
+    #: ordinary causes -- media download disabled on the OpenWA instance, and a
+    #: payload that was over its cap when it arrived -- are configuration, not
+    #: faults, and are invisible if the failure is only a missing field.
+    media_error: str = ""
     origin: str = ""           # "reply" | "api" | ""
     detected_at: datetime = field(default_factory=utcnow)
     status: str = MessageStatus.PENDING

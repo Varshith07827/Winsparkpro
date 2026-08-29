@@ -29,12 +29,27 @@ import logging
 from dataclasses import dataclass
 from typing import Optional
 
+import base64
+import binascii
+
 from wadam.domain.models import ChatConfig, MessageStatus, StoredMessage, utcnow
 from wadam.engine.guards import Cooldown
-from wadam.engine.webhook import WebhookClient, build_payload
+from wadam.engine.webhook import MediaReply, WebhookClient, build_payload
 from wadam.openwa import InboundMessage, OpenWAClient, SendError
+from wadam.storage.media import MediaStore
 
 logger = logging.getLogger(__name__)
+
+
+class MediaError(SendError):
+    """A media send refused before it ever reached OpenWA.
+
+    A path outside the media directory, a file that will not read, a reply
+    naming neither a url nor a path. Separate from SendError so the send API
+    can answer 400 rather than 502: the request was wrong, and telling a caller
+    "the gateway refused" when it was never asked sends them to read the wrong
+    logs. Subclasses SendError so every existing handler still catches it.
+    """
 
 
 def _is_real_name(name: str, chat_id: str) -> bool:
@@ -68,7 +83,7 @@ class MessagePipeline:
 
     def __init__(self, repository, client: OpenWAClient, webhook: WebhookClient,
                  cooldown: Cooldown, metrics=None, answer_groups: bool = False,
-                 default_webhook: str = "") -> None:
+                 default_webhook: str = "", media: Optional[MediaStore] = None) -> None:
         self._repo = repository
         self._client = client
         self._webhook = webhook
@@ -76,6 +91,11 @@ class MessagePipeline:
         self._metrics = metrics
         self._answer_groups = answer_groups
         self._default_webhook = default_webhook
+        #: Optional so a pipeline can be built without one -- the tests do,
+        #: and an install that never receives media never needs it. Media is
+        #: then simply not kept, and the message says so rather than the file
+        #: silently vanishing.
+        self._media = media
 
     def process(self, msg: InboundMessage) -> Outcome:
         """Handle one inbound message. Never raises."""
@@ -87,6 +107,11 @@ class MessagePipeline:
         stored = self._store_incoming(msg, chat)
         if stored is None:
             return Outcome("skipped", "duplicate delivery", msg.chat_id)
+
+        # Before any decision about answering: a message that arrives in a
+        # switched-off chat still had a photo in it, and the point of keeping
+        # media is to have it later. Never raises, never fails the message.
+        self._capture_media(msg, stored)
 
         if self._metrics:
             self._metrics.record_received()
@@ -117,7 +142,7 @@ class MessagePipeline:
             return Outcome("webhook_failed", outcome.error, msg.chat_id)
 
         answer = outcome.reply_text
-        if not answer:
+        if not outcome.wants_reply:
             # "Seen, don't answer" is a successful outcome. Most messages in a
             # live chat do not want an answer, and an endpoint forced to invent
             # one for every message will eventually say something stupid.
@@ -132,7 +157,7 @@ class MessagePipeline:
             self._finish(stored, MessageStatus.COLLECTED)
             return Outcome("skipped", f"cooldown, {remaining:.0f}s remaining", msg.chat_id)
 
-        return self._send_reply(msg, chat, stored, answer)
+        return self._send_reply(msg, chat, stored, answer, outcome.reply_media)
 
     # ── the pieces ────────────────────────────────────────────────────
 
@@ -190,10 +215,127 @@ class MessagePipeline:
         )
         return stored if self._repo.save_message(stored) else None
 
-    def _send_reply(self, msg: InboundMessage, chat: ChatConfig,
-                    stored: StoredMessage, answer: str) -> Outcome:
+    # ── media ─────────────────────────────────────────────────────────
+
+    def _capture_media(self, msg: InboundMessage, stored: StoredMessage) -> None:
+        """Keep the file that came with a message. Never raises.
+
+        The bytes usually arrive inside the delivery itself, base64 in
+        `media.data`, so the common path makes no request at all -- which also
+        means nothing to race against OpenWA's own retention and no 404 to
+        interpret. The download is the fallback for the cases where OpenWA sent
+        metadata only.
+
+        Every failure here is recorded on the message and swallowed. Media is
+        worth having and never worth losing a message over: the text, the
+        sender and the reply all matter more than the photo, and an exception
+        on this path would cost all of them.
+        """
+        if not msg.has_media:
+            return
+        if self._media is None:
+            stored.media_error = "no media directory configured"
+            self._repo.update_message(stored)
+            return
+
+        data, mimetype, why = b"", msg.media_mimetype, ""
+
+        if msg.media_base64:
+            try:
+                data = base64.b64decode(msg.media_base64, validate=True)
+            except (binascii.Error, ValueError) as error:
+                why = f"the base64 in the delivery would not decode: {error}"
+
+        if not data and not msg.media_omitted:
+            # Metadata without a payload. Worth one request: the gateway keeps
+            # an archived copy for exactly this.
+            try:
+                data, fetched_type = self._client.download_media(
+                    msg.chat_id, msg.message_id)
+                mimetype = mimetype or fetched_type
+            except SendError as error:
+                why = why or f"OpenWA would not serve the media: {error}"
+
+        if not data:
+            if msg.media_omitted:
+                # Not a fault. OpenWA decided not to carry the bytes -- its own
+                # size cap, a timeout, or concurrency saturation -- and saying
+                # so plainly is the difference between "change a setting over
+                # there" and "something is broken here".
+                why = (f"OpenWA omitted the payload"
+                       + (f" ({msg.media_size} bytes)" if msg.media_size else ""))
+            stored.media_error = why or "no media bytes were available"
+            self._repo.update_message(stored)
+            logger.info("media for %s not kept: %s", stored.chat_name, stored.media_error)
+            return
+
+        saved = self._media.save(msg.chat_id, stored.message_key, data,
+                                 mimetype=mimetype, filename=msg.media_filename)
+        if saved is None:
+            stored.media_error = (f"could not be written to {self._media.root} "
+                                  f"(over the cap, or the disk refused it)")
+        else:
+            stored.media_path = saved.path
+            stored.media_mimetype = saved.mimetype
+            stored.media_size = saved.size
+            stored.media_filename = saved.filename
+            stored.media_error = ""
+            logger.info("kept %s (%d bytes) from %s", saved.path, saved.size, stored.chat_name)
+        self._repo.update_message(stored)
+
+    def send_media(self, chat_id: str, media: MediaReply, caption: str = "") -> str:
+        """Send `media` to `chat_id`. Raises SendError. Returns a description.
+
+        Public because the send API needs exactly this and two implementations
+        of "turn a reply into an OpenWA call" would be two chances to disagree
+        about what a path means -- and the answer to that question is a
+        security boundary, not a detail.
+        """
+        if media.empty:
+            raise MediaError("media reply named neither a url nor a path")
+
+        text = media.caption or caption
+
+        if media.url:
+            # Not fetched here. Handed to OpenWA, which does the request behind
+            # its own SSRF guard -- so a webhook cannot use this process as a
+            # proxy onto the network it happens to sit inside.
+            kind = media.kind or self._client.kind_for(media.mimetype, media.filename)
+            self._client.send_media(chat_id, kind, url=media.url,
+                                    mimetype=media.mimetype,
+                                    filename=media.filename, caption=text)
+            return media.url
+
+        if self._media is None:
+            raise MediaError("no media directory is configured, so a path cannot be sent")
+
+        # resolve_outgoing enforces the confinement rule and raises ValueError
+        # with a message naming the directory. Translated rather than leaked as
+        # itself: to the caller this is a refused send like any other.
         try:
-            self._client.send_text(msg.chat_id, answer)
+            data, guessed_type, name = self._media.read_outgoing(media.path)
+        except ValueError as error:
+            raise MediaError(str(error)) from error
+        except OSError as error:
+            raise MediaError(f"could not read {media.path!r}: {error}") from error
+
+        mimetype = media.mimetype or guessed_type
+        kind = media.kind or self._client.kind_for(mimetype, name)
+        self._client.send_media(
+            chat_id, kind, base64_data=base64.b64encode(data).decode("ascii"),
+            mimetype=mimetype, filename=media.filename or name, caption=text)
+        return name
+
+    # ── replying ──────────────────────────────────────────────────────
+
+    def _send_reply(self, msg: InboundMessage, chat: ChatConfig, stored: StoredMessage,
+                    answer: str, media: Optional[MediaReply] = None) -> Outcome:
+        try:
+            if media is not None:
+                sent = self.send_media(msg.chat_id, media, caption=answer)
+                answer = answer or f"[{media.kind or 'media'}] {sent}"
+            else:
+                self._client.send_text(msg.chat_id, answer)
         except SendError as error:
             logger.error("send to %s failed: %s", msg.chat_id, error)
             self._finish(stored, MessageStatus.FAILED, error=str(error))
