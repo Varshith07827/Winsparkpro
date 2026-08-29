@@ -81,7 +81,17 @@ else
   note "sudo systemctl start wadam && journalctl -u wadam -f"
 fi
 
-HEALTH=$(curl -sf -m 5 "http://$WEBHOOK_HOST:$WEBHOOK_PORT/health" 2>/dev/null)
+# Retried, because this is routinely run straight after `systemctl restart`
+# and startup takes a few seconds to get through the session lookup and the
+# directory sync. Sampling once reported a perfectly healthy service as three
+# failures, which is worse than saying nothing: it sends someone to debug a
+# problem that does not exist.
+HEALTH=""
+for _ in $(seq 1 15); do
+  HEALTH=$(curl -sf -m 5 "http://$WEBHOOK_HOST:$WEBHOOK_PORT/health" 2>/dev/null)
+  [ -n "$HEALTH" ] && break
+  sleep 2
+done
 if [ -n "$HEALTH" ]; then
   pass "webhook listener on $WEBHOOK_HOST:$WEBHOOK_PORT"
   printf '       %s\n' "$HEALTH"
@@ -100,10 +110,20 @@ else
 fi
 
 if [ -n "$API_PORT" ]; then
-  if curl -sf -m 5 "http://127.0.0.1:$API_PORT/health" >/dev/null 2>&1; then
+  # The send API binds LAST -- after the directory sync, which resolves a
+  # thousand contacts -- so it is the slowest thing here to appear and the
+  # one most likely to be sampled too early.
+  API_UP=""
+  for _ in $(seq 1 15); do
+    if curl -sf -m 5 "http://127.0.0.1:$API_PORT/health" >/dev/null 2>&1; then
+      API_UP=yes; break
+    fi
+    sleep 2
+  done
+  if [ -n "$API_UP" ]; then
     pass "send API on 127.0.0.1:$API_PORT"
   else
-    fail "send API not answering on 127.0.0.1:$API_PORT"
+    fail "send API not answering on 127.0.0.1:$API_PORT after 30s"
   fi
 else
   note "send API is off — no API_PORT in .env"
