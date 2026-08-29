@@ -4,6 +4,11 @@ Everything operational, in one file. Commands are given for **cmd**,
 **PowerShell** and **bash** — they differ more than they look, and the
 differences are what break first.
 
+The **bash** ones are for macOS and Linux equally, and for Git Bash or WSL on
+Windows. They use only POSIX flags, so BSD and GNU versions of `grep`, `cut`
+and `tr` all behave the same; zsh, which macOS defaults to, runs them
+unchanged. **cmd** and **PowerShell** are the Windows-only pair.
+
 - [Setup](#setup)
 - [Sending a message](#sending-a-message)
 - [Writing the endpoint](#writing-the-endpoint)
