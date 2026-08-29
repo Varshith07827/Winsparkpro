@@ -45,8 +45,7 @@ if ! docker info >/dev/null 2>&1; then
   elif ! systemctl is-active --quiet docker 2>/dev/null; then
     die "the docker daemon is not running:  sudo systemctl enable --now docker"
   else
-    die "cannot talk to docker: $(echo "$DOCKER_ERR" | head -2 | tr '
-' ' ')"
+    die "cannot talk to docker: $(echo "$DOCKER_ERR" | head -2 | paste -sd' ' -)"
   fi
 fi
 ok "Docker"
@@ -56,7 +55,14 @@ if docker compose version >/dev/null 2>&1; then
 elif command -v docker-compose >/dev/null; then
   COMPOSE="docker-compose"
 else
-  die "docker compose plugin missing:  sudo apt install -y docker-compose-plugin"
+  die "docker compose is missing. Install it and re-run:
+
+          sudo apt update && sudo apt install -y docker-compose-plugin
+
+        If apt cannot find that, Docker came from the distro rather than
+        Docker's own repo — use  sudo apt install -y docker-compose  instead;
+        either is accepted. Re-run with  sg docker -c 'bash $0'  if this shell
+        does not have the docker group yet."
 fi
 ok "$COMPOSE"
 
