@@ -85,6 +85,16 @@ HEALTH=$(curl -sf -m 5 "http://$WEBHOOK_HOST:$WEBHOOK_PORT/health" 2>/dev/null)
 if [ -n "$HEALTH" ]; then
   pass "webhook listener on $WEBHOOK_HOST:$WEBHOOK_PORT"
   printf '       %s\n' "$HEALTH"
+  # The listener answering says nothing about the store behind it. The
+  # repository catches MongoDB failures and keeps going on its in-memory
+  # dicts and the JSON mirror, so a database that refuses every write still
+  # looks perfectly healthy from out here. The payload is the only place it
+  # shows, so it is checked rather than printed and left to the reader.
+  if ! printf '%s' "$HEALTH" | grep -q '"mongo": *"connected"'; then
+    fail "the app cannot write to MongoDB — see the mongo field above"
+    note "sending still works, and resolution is in memory, but nothing"
+    note "is persisted except to the capped JSON mirror in data/"
+  fi
 else
   fail "nothing answering on $WEBHOOK_HOST:$WEBHOOK_PORT"
 fi
@@ -105,15 +115,26 @@ if command -v mongosh >/dev/null; then MONGO=mongosh
 elif command -v mongo >/dev/null; then MONGO=mongo
 else MONGO=""; fi
 if [ -n "$MONGO" ]; then
-  COUNTS=$($MONGO --quiet "$DB_NAME" --eval 'print(db.chat_configs.countDocuments({}) + " chats, " + db.chat_configs.countDocuments({automation_enabled:true}) + " switched on, " + db.contacts.countDocuments({}) + " contacts, " + db.messages.countDocuments({}) + " messages")' 2>/dev/null)
-  if [ -n "$COUNTS" ]; then
-    pass "$DB_NAME: $COUNTS"
-    case "$COUNTS" in
-      "0 chats"*) note "empty — the first sync happens a few seconds after the service starts" ;;
-    esac
-  else
-    fail "cannot query MongoDB database '$DB_NAME'"
-  fi
+  # stderr is kept: "cannot query" covers a refused connection, a missing
+  # database and an unauthenticated one, and only the first is about mongod
+  # being down. Saying which saves an hour.
+  MONGO_ERR=$($MONGO --quiet "$DB_NAME" --eval 'print(db.chat_configs.countDocuments({}) + " chats, " + db.chat_configs.countDocuments({automation_enabled:true}) + " switched on, " + db.contacts.countDocuments({}) + " contacts, " + db.messages.countDocuments({}) + " messages")' 2>&1)
+  case "$MONGO_ERR" in
+    *chats*)
+      pass "$DB_NAME: $MONGO_ERR"
+      case "$MONGO_ERR" in
+        "0 chats"*) note "empty — the first sync lands a few seconds after the service starts" ;;
+      esac ;;
+    *"requires authentication"*|*Unauthorized*|*"not authorized"*)
+      fail "MongoDB requires authentication and the URI has no credentials"
+      note "MONGODB_URI in $APP_DIR/.env needs a user, then: sudo systemctl restart wadam" ;;
+    *"ECONNREFUSED"*|*"connect failed"*|*"Could not connect"*)
+      fail "MongoDB is not accepting connections — is mongod running?"
+      note "sudo systemctl status mongod" ;;
+    *)
+      fail "cannot query MongoDB database '$DB_NAME'"
+      note "$(printf '%s' "$MONGO_ERR" | head -1)" ;;
+  esac
 else
   note "no mongosh on PATH — skipping the database check"
 fi
