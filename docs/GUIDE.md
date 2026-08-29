@@ -53,6 +53,17 @@ SSRF_ALLOWED_HOSTS=host.docker.internal
 Without it registration fails, the log says so, and inbound messages never
 arrive — sending still works.
 
+**On Docker for Linux, one more line.** `host.docker.internal` is a Docker
+Desktop convenience that Windows and macOS resolve automatically; the Linux
+daemon does not. Give OpenWA's container:
+
+```yaml
+extra_hosts:
+  - "host.docker.internal:host-gateway"
+```
+
+or set `WEBHOOK_PUBLIC_URL` to an address the container can reach.
+
 ### Everything else has a default
 
 | | |
@@ -468,6 +479,25 @@ MongoDB is primary, with a readable JSON mirror beside it.
 Message statuses: `pending` → `collected` (stored, deliberately unanswered),
 `replied`, `failed`, or `sent` (originated here). A message resting at
 `pending` is a bug.
+
+---
+
+## Platforms
+
+Nothing here is Windows-only any more. The dependencies are pure Python plus
+Qt, `os.replace` does the atomic writes, and no module imports `win32`,
+`winreg` or anything like them — the last Windows-specific code went with the
+UI-Automation transport, which needed the desktop app running in a visible
+window.
+
+Two things to know when running somewhere other than a Windows desktop:
+
+**A server does not need Qt.** `run_headless.py` reaches seventeen modules and
+none of them import PySide6, so install `requirements-headless.txt` instead and
+save yourself ~150MB and an X dependency. `run.py` needs a display; nothing
+else does.
+
+**`host.docker.internal` is Docker Desktop's.** See the note under Setup.
 
 ---
 

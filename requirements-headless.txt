@@ -1,0 +1,10 @@
+# Server install — no window, no Qt.
+#
+# run_headless.py reaches 17 modules and none of them import PySide6, so a
+# machine that will never draw the window has no reason to carry ~150MB of Qt.
+# Use requirements.txt instead if you want run.py.
+
+pymongo>=4.7
+dnspython>=2.6
+certifi
+python-dotenv>=1.0

@@ -111,6 +111,11 @@ def prepare(settings: Settings, repository: Repository,
     client = client_for(session_id)
 
     if settings.register_webhook:
+        # `host.docker.internal` is a Docker Desktop convenience — Windows and
+        # macOS resolve it to the host automatically. The Linux daemon does
+        # NOT, so a container there needs
+        #     extra_hosts: ["host.docker.internal:host-gateway"]
+        # or WEBHOOK_PUBLIC_URL pointing at an address it can reach.
         url = settings.webhook_public_url or (
             f"http://host.docker.internal:{settings.webhook_port}/hook")
         try:
@@ -123,9 +128,14 @@ def prepare(settings: Settings, repository: Repository,
             # the usual cause is OpenWA's SSRF guard, which needs a change on
             # OpenWA's side that this process cannot make.
             logger.error(
-                "could not register the webhook with OpenWA (%s). Inbound messages "
-                "will not arrive until this is fixed — if OpenWA refused a private "
-                "address, add SSRF_ALLOWED_HOSTS=host.docker.internal to its .env.",
-                error)
+                "could not register the webhook at %s with OpenWA (%s). Inbound "
+                "messages will not arrive until this is fixed. Two usual causes: "
+                "OpenWA refused a private address, which needs "
+                "SSRF_ALLOWED_HOSTS=host.docker.internal in its own .env; or "
+                "OpenWA runs on Docker for Linux, where host.docker.internal does "
+                "not resolve unless the container has "
+                "extra_hosts: [\"host.docker.internal:host-gateway\"] — set "
+                "WEBHOOK_PUBLIC_URL if it should reach this machine another way.",
+                url, error)
 
     return effective, client

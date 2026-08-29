@@ -23,8 +23,12 @@ dnspython>=2.6
 # incomplete. Used when present, skipped when not.
 certifi
 
-# The desktop UI. 6.5 is the floor: QStyleHints.colorScheme(), which the
-# light/dark theme follows, arrived in that release.
+# The desktop UI, and the only reason any of this needs a display. 6.5 is the
+# floor: QStyleHints.colorScheme(), which the light/dark theme follows, arrived
+# in that release.
+#
+# Nothing on the headless path imports it — see requirements-headless.txt for a
+# server install that leaves it out.
 PySide6>=6.5
 
 # .env loading. The parser in wadam/config.py is used if this is absent, so a
