@@ -156,12 +156,22 @@ printf '\n'
 curl -sf -m 5 http://127.0.0.1:2785/api/health >/dev/null   || die "OpenWA did not come up — check:  docker logs --tail 40 $OPENWA_NAME"
 ok "OpenWA healthy"
 
+# Read from inside the container, not through the bind mount. OpenWA writes
+# .api-key as its own user with restrictive permissions, so the host account
+# usually cannot read it — and which uid that is depends on the image, so
+# chowning the directory would be guesswork. `docker exec cat` needs no sudo
+# and makes no assumption about uid mapping.
+OPENWA_KEY=""
 for _ in $(seq 1 30); do
-  [ -f "$OPENWA_DIR/data/.api-key" ] && break
+  if [ -r "$OPENWA_DIR/data/.api-key" ]; then
+    OPENWA_KEY=$(tr -d '[:space:]' < "$OPENWA_DIR/data/.api-key")
+  else
+    OPENWA_KEY=$(docker exec "$OPENWA_NAME" cat /app/data/.api-key 2>/dev/null | tr -d '[:space:]' || true)
+  fi
+  [ -n "$OPENWA_KEY" ] && break
   sleep 2
 done
-[ -f "$OPENWA_DIR/data/.api-key" ] || die "OpenWA never wrote data/.api-key"
-OPENWA_KEY=$(tr -d '\r\n' < "$OPENWA_DIR/data/.api-key")
+[ -n "$OPENWA_KEY" ] || die "could not read OpenWA's API key. Try:  docker exec $OPENWA_NAME cat /app/data/.api-key"
 ok "read the API key"
 
 # ── 3. wadam ────────────────────────────────────────────────────────────
