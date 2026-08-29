@@ -122,7 +122,13 @@ def test_an_unknown_chat_is_registered_with_automation_off(repo):
 
 def test_a_renamed_contact_stays_the_same_chat(repo):
     """The id comes from OpenWA and is durable. winSpark hashed the display
-    name, so a rename silently created a second chat with its own settings."""
+    name, so a rename silently created a second chat with its own settings —
+    and its automation setting was lost with it.
+
+    Renaming the chat is the directory sync's job, not a delivery's: OpenWA's
+    chat list knows a saved contact's name, and a delivery carries at most a
+    push name. What matters here is that it is still ONE chat, still switched
+    on."""
     pipeline, _ = build(repo)
     pipeline.process(message(message_id="m1"))
     enable(repo)
@@ -132,8 +138,64 @@ def test_a_renamed_contact_stays_the_same_chat(repo):
     pipeline.process(renamed)
 
     assert len(repo.list_chats()) == 1
-    assert repo.get_chat(CHAT_ID).chat_name == "Alice Cooper"
     assert repo.get_chat(CHAT_ID).automation_enabled is True
+
+
+def test_a_nameless_delivery_does_not_overwrite_a_synced_name(repo):
+    """The bug that put raw @lid ids in the chat list. The directory sync knows
+    a saved contact's name; a delivery carries at most a push name. When a
+    delivery had none, the parser handed back the chat id and the pipeline
+    wrote that over the good name — so a chat was right after a sync and wrong
+    again after the next message."""
+    from wadam.domain.models import ChatConfig
+    repo.save_chat(ChatConfig(chat_id=CHAT_ID, chat_name="Passenger princess",
+                              automation_enabled=True))
+    pipeline, _ = build(repo)
+
+    nameless = message("hi", message_id="m1")
+    object.__setattr__(nameless, "chat_name", "")
+    pipeline.process(nameless)
+
+    assert repo.get_chat(CHAT_ID).chat_name == "Passenger princess"
+
+
+def test_a_delivery_naming_the_chat_after_its_own_id_is_ignored(repo):
+    """Belt and braces: even if something hands back the id as the name."""
+    from wadam.domain.models import ChatConfig
+    repo.save_chat(ChatConfig(chat_id=CHAT_ID, chat_name="Priya Menon",
+                              automation_enabled=True))
+    pipeline, _ = build(repo)
+
+    echoing = message("hi", message_id="m1")
+    object.__setattr__(echoing, "chat_name", CHAT_ID)
+    pipeline.process(echoing)
+
+    assert repo.get_chat(CHAT_ID).chat_name == "Priya Menon"
+
+
+def test_a_push_name_fills_a_chat_that_has_none(repo):
+    """Still useful when there is nothing better — a chat registered from a
+    delivery before any sync has run."""
+    pipeline, _ = build(repo)
+
+    named = message("hi", message_id="m1")
+    object.__setattr__(named, "chat_name", "Alice")
+    pipeline.process(named)
+
+    assert repo.get_chat(CHAT_ID).chat_name == "Alice"
+
+
+def test_a_chat_registered_from_a_nameless_delivery_has_no_name(repo):
+    """Empty, not the id — so display_name can fall back properly and a later
+    sync has something to fill in."""
+    pipeline, _ = build(repo)
+
+    nameless = message("hi", message_id="m1")
+    object.__setattr__(nameless, "chat_name", "")
+    pipeline.process(nameless)
+
+    assert repo.get_chat(CHAT_ID).chat_name == ""
+    assert repo.get_chat(CHAT_ID).display_name == CHAT_ID
 
 
 # ── the message is stored before anything is decided ──────────────────

@@ -70,6 +70,15 @@ class InboundMessage:
     name-derived hash — renaming a contact no longer produces a new chat."""
 
     chat_name: str
+    """The sender's push name, or "" when the delivery carried none.
+
+    Deliberately NOT falling back to the chat id. It used to, and the caller
+    could then not tell "this delivery named the chat" from "there was no name,
+    here is the id again" — so a message with no push name overwrote a good
+    name, synced from OpenWA's chat list, with a raw `…@lid`. The chat would be
+    correct after a sync and wrong again after the next message.
+    """
+
     message_id: str
     """WhatsApp's own id. Replaces the content-hash `message_key`, which
     existed only because re-reading the same visible bubble every three
@@ -117,7 +126,7 @@ def parse_delivery(payload: Mapping[str, Any]) -> Optional[InboundMessage]:
 
     return InboundMessage(
         chat_id=chat_id,
-        chat_name=chat_name or chat_id,
+        chat_name=chat_name,
         message_id=_first(source, _ID_KEYS) or _first(data, _ID_KEYS),
         text=_first(source, _TEXT_KEYS),
         sender=_first(source, ("from", "author", "sender")),

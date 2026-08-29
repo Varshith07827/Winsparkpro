@@ -126,15 +126,18 @@ def test_a_top_level_name_still_wins():
     assert inbound.parse_delivery(payload).chat_name == "From the top"
 
 
-def test_a_nameless_delivery_falls_back_to_the_chat_id():
-    assert inbound.parse_delivery(json.loads(body_for())).chat_name == "111111111111111@lid"
+def test_a_nameless_delivery_reports_no_name(): 
+    """Not the chat id. The caller has to be able to tell "this named the chat"
+    from "there was no name" — conflating them let a nameless message overwrite
+    a good name with a raw @lid."""
+    assert inbound.parse_delivery(json.loads(body_for())).chat_name == ""
 
 
 def test_a_contact_that_is_not_an_object_is_survived():
     payload = json.loads(body_for())
     payload["data"]["contact"] = "not an object"
 
-    assert inbound.parse_delivery(payload).chat_name == "111111111111111@lid"
+    assert inbound.parse_delivery(payload).chat_name == ""
 
 
 def test_a_payload_with_no_chat_yields_nothing():

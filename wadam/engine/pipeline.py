@@ -36,6 +36,12 @@ from wadam.openwa import InboundMessage, OpenWAClient, SendError
 
 logger = logging.getLogger(__name__)
 
+
+def _is_real_name(name: str, chat_id: str) -> bool:
+    """A name someone could read, rather than the identifier repeated back."""
+    cleaned = (name or "").strip()
+    return bool(cleaned) and cleaned != chat_id
+
 @dataclass
 class Outcome:
     """What the pipeline did, for the HTTP response and the metrics."""
@@ -146,18 +152,23 @@ class MessagePipeline:
         """
         chat = self._repo.get_chat(msg.chat_id)
         if chat is not None:
-            if msg.chat_name and chat.chat_name != msg.chat_name:
+            # Only a name worth having, and only when there is nothing better.
+            # The directory sync reads OpenWA's chat list, which knows a saved
+            # contact's name; a delivery carries at most the sender's push
+            # name. Letting the delivery win meant a chat called "Passenger
+            # princess" reverted to its raw id on the next message.
+            if _is_real_name(msg.chat_name, msg.chat_id) and not chat.chat_name:
                 chat.chat_name = msg.chat_name
                 self._repo.save_chat(chat)
             return chat
 
         chat = ChatConfig(
             chat_id=msg.chat_id,
-            chat_name=msg.chat_name or msg.chat_id,
+            chat_name=msg.chat_name if _is_real_name(msg.chat_name, msg.chat_id) else "",
             automation_enabled=False,
         )
         self._repo.save_chat(chat)
-        logger.info("registered new chat %s (%s), automation off", chat.chat_name, chat.chat_id)
+        logger.info("registered new chat %s, automation off", chat.display_name)
         return chat
 
     def _store_incoming(self, msg: InboundMessage, chat: ChatConfig) -> Optional[StoredMessage]:
@@ -170,7 +181,7 @@ class MessagePipeline:
         stored = StoredMessage(
             message_key=msg.message_id or f"in:{msg.chat_id}:{utcnow().timestamp()}",
             chat_id=msg.chat_id,
-            chat_name=chat.chat_name,
+            chat_name=chat.display_name,
             sender=msg.sender,
             text=msg.text,
             direction="in",
@@ -207,7 +218,7 @@ class MessagePipeline:
         self._repo.save_message(StoredMessage(
             message_key=f"out:{chat.chat_id}:{utcnow().timestamp()}",
             chat_id=chat.chat_id,
-            chat_name=chat.chat_name,
+            chat_name=chat.display_name,
             text=text,
             direction="out",
             origin=origin,
