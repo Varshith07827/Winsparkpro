@@ -420,6 +420,17 @@ phone, so an unattended box can sit disconnected until someone notices — check
 
 ## When something is wrong
 
+### On a Linux server, check everything at once
+
+```bash
+bash ~/wadam/scripts/check-linux.sh
+```
+
+It checks the container, the session, the webhook registration, the service,
+both listeners, the database and what is exposed to the network — and annotates
+anything that fails with the command that fixes it. It is read-only: it starts
+nothing and sends nothing.
+
 ### Health
 
 **bash / cmd**
